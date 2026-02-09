@@ -1,4 +1,4 @@
-working_path: "/cs/student/project_msc/2025/csml/rhautier"
+working_path: "/cs/student/project_msc/2025/csml/gmaralla"
 vae_folder: "vae"
 data_path: "datasets/cluttr_envs_20k.npy"
 checkpoint_dir: "checkpoints"

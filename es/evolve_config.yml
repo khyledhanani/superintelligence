@@ -1,0 +1,18 @@
+# Evolution Strategy Configuration for CLUTTR Environment Generation
+# Uses CMA-ES in the VAE latent space (64-dim continuous).
+
+es_strategy: "CMA_ES"
+pop_size: 32
+num_generations: 200
+sigma_init: 1.0
+seed: 42
+warm_start: true
+
+# Placeholder fitness weights (structural complexity)
+w_obstacles: 0.4
+w_distance: 0.4
+w_validity: 0.2
+
+# Logging and output
+log_freq: 10
+output_subdir: "evolved"
