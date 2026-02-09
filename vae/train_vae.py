@@ -32,20 +32,26 @@ class HighwayStage(nn.Module):
 
 class CluttrVAE(nn.Module):
     @nn.compact
-    def __call__(self, x, z_rng):
+    def __call__(self, x, z_rng, train: bool = True):
         # Encoder
         x = nn.Embed(CONFIG["vocab_size"], CONFIG["embed_dim"])(x)
+        x = nn.Dropout(rate = 0.1, deterministic= not train)(x)
         x = HighwayStage(CONFIG["embed_dim"])(x)
         x = HighwayStage(CONFIG["embed_dim"])(x)
         outputs = nn.Bidirectional(
             nn.RNN(nn.LSTMCell(300)), 
             nn.RNN(nn.LSTMCell(300))
             )(x)
-        h = outputs[:, -1, :] 
+        outputs = nn.Dropout(rate=0.1, deterministic=not train)(outputs)
+
+        fwd_out = outputs[:, :, :300]
+        bwd_out = outputs[:, :, 300:]
+        h = jnp.concatenate([fwd_out[:, -1, :], bwd_out[:, 0, :]], axis = -1)
         
         # Bottleneck
-        stats = nn.Dense(CONFIG["latent_dim"] * 2)(h)
-        mean, logvar = jnp.split(stats, 2, axis=-1)
+        mean = nn.Dense(CONFIG['latent_dim'], name="mean_layer")(h)
+        logvar = nn.Dense(CONFIG["latent_dim"], name = "logvar_layer")(h)
+        #mean, logvar = jnp.split(stats, 2, axis=-1)
         mean = jnp.tanh(mean) * 4.0 # Standard Objective Scaling
         
         std = jnp.exp(0.5 * logvar)
@@ -68,12 +74,16 @@ def get_kl_weight(step):
 
 @jax.jit
 def train_step(state, batch, z_rng, kl_weight):
+
+    z_key, dropout_key = jax.random.split(z_rng)
+
     def loss_fn(params):
-        logits, mean, logvar = CluttrVAE().apply({'params': params}, batch, z_rng)
+        logits, mean, logvar = CluttrVAE().apply({'params': params}, batch, z_key, train =True, rngs={'dropout': dropout_key})
         labels_onehot = jax.nn.one_hot(batch, num_classes=CONFIG["vocab_size"])
         recon_loss = optax.softmax_cross_entropy(logits, labels_onehot).mean()
         kl_loss = -0.5 * jnp.mean(jnp.sum(1 + logvar - jnp.square(mean) - jnp.exp(logvar), axis=-1))
-        total_loss = recon_loss + (kl_weight * kl_loss)
+        weighted_reconstruction_loss = CONFIG["recon_weight"] * recon_loss
+        total_loss = weighted_reconstruction_loss + (kl_weight * kl_loss)
         return total_loss, (recon_loss, kl_loss)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -122,7 +132,7 @@ def run_training():
         params, start_step = load_checkpoint(CONFIG["resume_path"])
         print(f"Resuming from step {start_step}")
     else:
-        params = model.init(init_key, jnp.zeros((1, 52), dtype=jnp.int32), z_key)['params']
+        params = model.init(init_key, jnp.zeros((1, 52), dtype=jnp.int32), z_key, train=False)['params']
 
     state = train_state.TrainState.create(
         apply_fn=model.apply, 
