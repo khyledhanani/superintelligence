@@ -5,6 +5,7 @@ import pickle
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+import io
 
 
 def _to_plain_config(config: Any) -> Dict[str, Any]:
@@ -89,8 +90,20 @@ def _load_orbax(path: Path) -> Tuple[Any, Dict[str, Any]]:
 
 
 def _load_pickle(path: Path) -> Tuple[Any, Dict[str, Any]]:
+    class _CompatUnpickler(pickle.Unpickler):
+        # Handle pickles produced with different NumPy internal module paths.
+        def find_class(self, module: str, name: str):
+            if module.startswith("numpy._core"):
+                module = module.replace("numpy._core", "numpy.core", 1)
+            return super().find_class(module, name)
+
     with path.open("rb") as file:
-        payload = pickle.load(file)
+        raw = file.read()
+
+    try:
+        payload = pickle.loads(raw)
+    except ModuleNotFoundError:
+        payload = _CompatUnpickler(io.BytesIO(raw)).load()
 
     if isinstance(payload, dict) and "params" in payload:
         step = payload.get("step")
