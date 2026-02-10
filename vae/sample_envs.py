@@ -42,9 +42,8 @@ def main():
     parser.add_argument("--max_obs", type=int, default=50, help="Maximum number of obstacles.")
     parser.add_argument("--inner_dim", type=int, default=13, help="Dimension of the inner grid (e.g., 13 for a 15x15 total grid).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    #parser.add_argument("--output_dir", type=str, default="./datasets", help="Directory to save the generated .npy file.")
-    parser.add_argument("--filename", type=str, default="cluttr_envs.npy", help="Name of the output file.")
-    
+    parser.add_argument("--filename", type=str, default="sample_envs.npy", help="Environments file.")
+
     args = parser.parse_args()
     
     # Open the config file
@@ -80,7 +79,8 @@ def main():
 
     # Concatenate and save
     final_data = np.concatenate(all_sequences, axis=0)
-    save_path = os.path.join(output_dir, CONFIG["data_path"])
+    #save_path = os.path.join(output_dir, CONFIG["data_path"])
+    save_path = os.path.join(output_dir, 'datasets', )
     np.save(save_path, final_data)
 
     print(f"\nSuccess! Saved dataset of shape {final_data.shape} to {save_path}")

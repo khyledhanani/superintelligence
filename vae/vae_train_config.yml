@@ -3,7 +3,7 @@ vae_folder: "vae"
 data_path: "datasets/cluttr_envs_20k.npy"
 checkpoint_dir: "checkpoints"
 resume_path: null
-num_steps: 1000000
+num_steps: 500000
 batch_size: 32
 learning_rate: 0.00005
 recon_weight: 500
