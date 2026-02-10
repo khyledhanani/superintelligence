@@ -11,6 +11,8 @@ import jax
 import jax.numpy as jnp
 import matplotlib
 import numpy as np
+from flax.core.frozen_dict import freeze, unfreeze
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -67,6 +69,101 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_obs_tokens", type=int, default=50)
 
     return parser.parse_args()
+
+
+def _unwrap_params(params):
+    current = params
+    while isinstance(current, dict) and "params" in current and len(current) == 1:
+        current = current["params"]
+    return current
+
+
+def _leaf_signature(x) -> Tuple[Tuple[int, ...], str]:
+    arr = np.asarray(x)
+    return tuple(arr.shape), str(arr.dtype)
+
+
+def _coerce_params_to_model(model: CluttrVAE, params, cfg: VAEConfig):
+    """Best-effort conversion of loaded checkpoint params to this model's tree."""
+    params = _unwrap_params(params)
+
+    # Fast path: already compatible.
+    try:
+        _ = model.apply(
+            {"params": params},
+            jnp.zeros((1, cfg.seq_len), dtype=jnp.int32),
+            jax.random.PRNGKey(0),
+            train=False,
+        )
+        return params
+    except Exception:
+        pass
+
+    expected_vars = model.init(
+        {"params": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)},
+        jnp.zeros((1, cfg.seq_len), dtype=jnp.int32),
+        jax.random.PRNGKey(3),
+        train=False,
+    )
+    expected = unfreeze(expected_vars["params"])
+    loaded = unfreeze(params) if hasattr(params, "keys") else params
+
+    exp_flat = flatten_dict(expected)
+    got_flat = flatten_dict(loaded)
+
+    # Path mismatch only: same leaf order and same leaf signatures.
+    exp_items = list(exp_flat.items())
+    got_items = list(got_flat.items())
+    if len(exp_items) == len(got_items):
+        same_order_signatures = all(
+            _leaf_signature(ev) == _leaf_signature(gv)
+            for (_, ev), (_, gv) in zip(exp_items, got_items)
+        )
+        if same_order_signatures:
+            remapped = {ek: gv for (ek, _), (_, gv) in zip(exp_items, got_items)}
+            candidate = freeze(unflatten_dict(remapped))
+            try:
+                _ = model.apply(
+                    {"params": candidate},
+                    jnp.zeros((1, cfg.seq_len), dtype=jnp.int32),
+                    jax.random.PRNGKey(0),
+                    train=False,
+                )
+                return candidate
+            except Exception:
+                pass
+
+    # Signature-based greedy matching fallback.
+    sig_to_indices: Dict[Tuple[Tuple[int, ...], str], List[int]] = defaultdict(list)
+    for idx, (_, gv) in enumerate(got_items):
+        sig_to_indices[_leaf_signature(gv)].append(idx)
+
+    used = set()
+    remapped = {}
+    for ek, ev in exp_items:
+        sig = _leaf_signature(ev)
+        candidates = sig_to_indices.get(sig, [])
+        pick = None
+        for cidx in candidates:
+            if cidx not in used:
+                pick = cidx
+                break
+        if pick is None:
+            raise RuntimeError(
+                "Checkpoint params are incompatible with current model. "
+                f"Missing compatible leaf for key {ek} with signature {sig}."
+            )
+        used.add(pick)
+        remapped[ek] = got_items[pick][1]
+
+    candidate = freeze(unflatten_dict(remapped))
+    _ = model.apply(
+        {"params": candidate},
+        jnp.zeros((1, cfg.seq_len), dtype=jnp.int32),
+        jax.random.PRNGKey(0),
+        train=False,
+    )
+    return candidate
 
 
 def save_rows_csv(path: Path, rows: List[Dict[str, object]]) -> None:
@@ -327,6 +424,7 @@ def main() -> None:
     model = CluttrVAE(cfg)
 
     params, ckpt_meta = load_model_params(args.checkpoint_path)
+    params = _coerce_params_to_model(model, params, cfg)
 
     rng = np.random.default_rng(args.seed)
     key = jax.random.PRNGKey(args.seed)

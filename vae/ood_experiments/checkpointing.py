@@ -6,6 +6,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 import io
+from collections.abc import Mapping
 
 
 def _to_plain_config(config: Any) -> Dict[str, Any]:
@@ -27,6 +28,14 @@ def _find_params(tree: Any) -> Optional[Any]:
             if nested is not None:
                 return nested
     return None
+
+
+def _unwrap_params_tree(params: Any) -> Any:
+    """Unwrap nested {'params': ...} wrappers introduced by some checkpoints."""
+    current = params
+    while isinstance(current, Mapping) and "params" in current and len(current) == 1:
+        current = current["params"]
+    return current
 
 
 def _is_orbax_checkpoint_dir(path: Path) -> bool:
@@ -58,7 +67,7 @@ def _load_orbax(path: Path) -> Tuple[Any, Dict[str, Any]]:
                 params = restored
             if params is None:
                 raise RuntimeError("Could not locate `params` in Orbax checkpoint tree.")
-            return params, {"backend": "orbax", "mode": "manager", "step": int(step)}
+            return _unwrap_params_tree(params), {"backend": "orbax", "mode": "manager", "step": int(step)}
     except Exception as exc:  # pragma: no cover - version/runtime dependent
         errors.append(f"manager restore failed: {exc}")
 
@@ -79,7 +88,7 @@ def _load_orbax(path: Path) -> Tuple[Any, Dict[str, Any]]:
                 params = restored
             if params is None:
                 raise RuntimeError("Could not locate `params` in Orbax checkpoint tree.")
-            return params, {"backend": "orbax", "mode": "direct", "step": None}
+            return _unwrap_params_tree(params), {"backend": "orbax", "mode": "direct", "step": None}
         except Exception as exc:  # pragma: no cover - version/runtime dependent
             errors.append(f"direct restore failed: {exc}")
 
@@ -107,14 +116,14 @@ def _load_pickle(path: Path) -> Tuple[Any, Dict[str, Any]]:
 
     if isinstance(payload, dict) and "params" in payload:
         step = payload.get("step")
-        return payload["params"], {"backend": "pickle", "step": step}
+        return _unwrap_params_tree(payload["params"]), {"backend": "pickle", "step": step}
 
     if isinstance(payload, dict):
         params = _find_params(payload)
         if params is not None:
-            return params, {"backend": "pickle", "step": payload.get("step")}
+            return _unwrap_params_tree(params), {"backend": "pickle", "step": payload.get("step")}
 
-    return payload, {"backend": "pickle", "step": None}
+    return _unwrap_params_tree(payload), {"backend": "pickle", "step": None}
 
 
 def load_model_params(checkpoint_path: str) -> Tuple[Any, Dict[str, Any]]:
