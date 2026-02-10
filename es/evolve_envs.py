@@ -258,7 +258,7 @@ if __name__ == "__main__":
 
     # Checkpoint path: VAE model in vae/model directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    checkpoint_path = os.path.join(script_dir, "..", "vae", "model", "checkpoint_final.pkl")
+    checkpoint_path = os.path.join(script_dir, "..", "vae", "model", "checkpoint_330000.pkl")
 
     # Output directory
     output_subdir = evolve_defaults.get("output_subdir", "evolved")

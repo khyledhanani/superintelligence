@@ -59,8 +59,8 @@ def extract_decoder_params(full_params):
     """Extract decoder parameters from the full VAE checkpoint.
 
     The full VAE param tree has flat keys:
-        Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, Dense_0
-        Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_1
+        Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, mean_layer, logvar_layer
+        Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_0
 
     The standalone CluttrDecoder uses nn.compact and numbers its modules
     starting from 0, so we remap:
@@ -68,14 +68,14 @@ def extract_decoder_params(full_params):
         LSTMCell_3 -> LSTMCell_1
         LSTMCell_4 -> LSTMCell_2
         LSTMCell_5 -> LSTMCell_3
-        Dense_1    -> Dense_0
+        Dense_0    -> Dense_0
     """
     key_map = {
         'LSTMCell_2': 'LSTMCell_0',
         'LSTMCell_3': 'LSTMCell_1',
         'LSTMCell_4': 'LSTMCell_2',
         'LSTMCell_5': 'LSTMCell_3',
-        'Dense_1': 'Dense_0',
+        'Dense_0': 'Dense_0',
     }
     return {key_map[k]: v for k, v in full_params.items() if k in key_map}
 
