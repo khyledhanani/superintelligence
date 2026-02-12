@@ -6,13 +6,29 @@ pop_size: 32
 num_generations: 200
 sigma_init: 1.0
 seed: 42
-warm_start: true
 
-# Placeholder fitness weights (structural complexity)
+# Fitness mode: "placeholder" (structural complexity) or "regret" (agent-based)
+fitness_mode: "placeholder"
+
+# Placeholder fitness weights (only used if fitness_mode = "placeholder")
 w_obstacles: 0.4
 w_distance: 0.4
 w_validity: 0.2
 
+# Agent configuration (only used if fitness_mode = "regret")
+agent_checkpoint_dir: "agent_folder"  # orbax checkpoint root (step 119 auto-detected)
+rollout_steps: 256                         # steps per rollout (ACCEL default)
+eval_policy_mode: "deterministic"          # "deterministic" (argmax) or "stochastic" (sample)
+
+# Warm-start: disabled by default in regret mode (cwd config loading issue)
+# Set to true for placeholder mode if desired.
+warm_start: false
+
 # Logging and output
 log_freq: 10
 output_subdir: "evolved"
+
+# Future hooks (not yet implemented)
+# llm_injection_freq: 100     # inject LLM-generated envs every N generations
+# llm_injection_count: 4      # how many LLM envs to inject
+# qd_archive_size: 1000       # MAP-Elites archive capacity

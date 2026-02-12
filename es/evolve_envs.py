@@ -1,16 +1,16 @@
 """
 Evolve CLUTTR gridworld environments using CMA-ES in the VAE latent space.
 
-Approach:
-    1. Load trained VAE decoder to map 64-dim latent vectors -> 52-element CLUTTR sequences.
-    2. Use CMA-ES (evosax) to search the continuous latent space.
-    3. Evaluate decoded environments with a fitness function (placeholder: structural complexity).
-    4. Save evolved environments as .npy files.
+Supports two fitness modes:
+    - "placeholder": structural complexity (obstacle density + distance + validity)
+    - "regret": ACCEL-inspired MaxMC regret from a frozen RL agent
 
 Usage:
-    cd /path/to/superintelligence/vae
-    python evolve_envs.py
-    python evolve_envs.py --num_generations 50 --pop_size 16 --no_warm_start
+    # Placeholder fitness (no agent needed)
+    python evolve_envs.py --fitness_mode placeholder
+
+    # Regret fitness (requires agent checkpoint)
+    python evolve_envs.py --fitness_mode regret --agent_checkpoint_dir agent_folder/119
 """
 
 import jax
@@ -20,7 +20,7 @@ import yaml
 import os
 import argparse
 import sys
-from functools import partial
+import time
 
 # Add parent directory to path to import from vae folder
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -47,9 +47,6 @@ def placeholder_fitness(sequences, inner_dim=13, w_obstacles=0.4, w_distance=0.4
     Combines obstacle density, agent-goal distance, and structural validity.
     Returns NEGATED scores because evosax MINIMIZES.
 
-    This function is designed to be swapped for RL-based evaluation later.
-    Future signature: (key, sequences, train_state, env, env_params) -> scores.
-
     Args:
         sequences: Decoded integer sequences, shape (pop_size, 52).
         inner_dim: Grid inner dimension (default 13 for 13x13).
@@ -64,19 +61,16 @@ def placeholder_fitness(sequences, inner_dim=13, w_obstacles=0.4, w_distance=0.4
     goal_idx = sequences[:, 50]
     agent_idx = sequences[:, 51]
 
-    # Obstacle density (0 to 1)
     obs_count = jnp.sum(obstacles > 0, axis=1).astype(jnp.float32)
     obs_score = obs_count / 50.0
 
-    # Manhattan distance between agent and goal (normalized)
     agent_row = (agent_idx - 1) // inner_dim
     agent_col = (agent_idx - 1) % inner_dim
     goal_row = (goal_idx - 1) // inner_dim
     goal_col = (goal_idx - 1) % inner_dim
     manhattan = (jnp.abs(agent_row - goal_row) + jnp.abs(agent_col - goal_col)).astype(jnp.float32)
-    dist_score = manhattan / (2.0 * (inner_dim - 1))  # max Manhattan = 2*(dim-1)
+    dist_score = manhattan / (2.0 * (inner_dim - 1))
 
-    # Validity: goal and agent in [1, 169] and distinct
     valid = (
         (goal_idx >= 1) & (goal_idx <= inner_dim**2) &
         (agent_idx >= 1) & (agent_idx <= inner_dim**2) &
@@ -84,7 +78,7 @@ def placeholder_fitness(sequences, inner_dim=13, w_obstacles=0.4, w_distance=0.4
     ).astype(jnp.float32)
 
     fitness = w_obstacles * obs_score + w_distance * dist_score + w_validity * valid
-    return -fitness  # negate: evosax minimizes
+    return -fitness
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +103,7 @@ def compute_warm_start_mean(key, full_vae_params, pop_size, max_obs=50, inner_di
     key, envs = generate_cluttr_batch_jax(key, pop_size, max_obs, inner_dim)
     z_rng = jax.random.PRNGKey(0)
     _, means, _ = CluttrVAE().apply({'params': full_vae_params}, envs, z_rng)
-    return means.mean(axis=0)  # centroid of encoded environments
+    return means.mean(axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -123,20 +117,46 @@ def run_evolution(config):
         config: Dictionary with evolution and VAE configuration.
     """
     key = jax.random.PRNGKey(config["seed"])
+    fitness_mode = config.get("fitness_mode", "placeholder")
 
     # 1. Load VAE
     print("Loading VAE checkpoint...")
     full_vae_params = load_vae_params(config["checkpoint_path"])
     decoder_params = extract_decoder_params(full_vae_params)
 
-    # 2. Initialize CMA-ES
+    # 2. Load agent + env if using regret fitness
+    agent_params = None
+    network = None
+    wrapped_env = None
+    env_params = None
+
+    if fitness_mode == "regret":
+        from agent_loader import load_agent, verify_agent_contract, ActorCritic
+        from regret_fitness import regret_fitness
+        from jaxued.environments.maze import Maze
+        from jaxued.wrappers import AutoReplayWrapper
+
+        agent_checkpoint_dir = config.get("agent_checkpoint_dir")
+        if not agent_checkpoint_dir:
+            raise ValueError("--agent_checkpoint_dir required for regret fitness mode")
+
+        print(f"Loading agent from {agent_checkpoint_dir}...")
+        agent_params, network = load_agent(agent_checkpoint_dir, action_dim=7)
+        verify_agent_contract(agent_params, network)
+
+        maze_env = Maze(max_height=13, max_width=13, agent_view_size=5, normalize_obs=True)
+        wrapped_env = AutoReplayWrapper(maze_env)
+        env_params = wrapped_env.default_params
+        print("Agent and Maze environment initialized.")
+
+    # 3. Initialize CMA-ES
     latent_dim = config["latent_dim"]
     dummy_solution = jnp.zeros(latent_dim)
     es = CMA_ES(population_size=config["pop_size"], solution=dummy_solution)
     es_params = es.default_params
 
-    # Warm-start: use VAE-encoded random environments as initial mean
-    if config.get("warm_start", True):
+    # Warm-start (disabled by default in regret mode to avoid cwd config loading issues)
+    if config.get("warm_start", False):
         print("Computing warm-start mean from random environments...")
         key, ws_key = jax.random.split(key)
         init_mean = compute_warm_start_mean(ws_key, full_vae_params, config["pop_size"])
@@ -146,66 +166,106 @@ def run_evolution(config):
     key, init_key = jax.random.split(key)
     es_state = es.init(init_key, init_mean, es_params)
 
-    # 3. JIT-compile decode + fitness
-    @jax.jit
-    def evaluate_population(population):
-        sequences = decode_latent_to_env(decoder_params, population)
-        sequences = jax.vmap(repair_cluttr_sequence)(sequences)
-        fitness = placeholder_fitness(
-            sequences,
-            inner_dim=config.get("inner_dim", 13),
-            w_obstacles=config.get("w_obstacles", 0.4),
-            w_distance=config.get("w_distance", 0.4),
-            w_validity=config.get("w_validity", 0.2),
-        )
-        return fitness, sequences
+    # 4. JIT-compile decode + fitness
+    deterministic = config.get("eval_policy_mode", "deterministic") == "deterministic"
+    rollout_steps = config.get("rollout_steps", 256)
 
-    # 4. Evolution loop
+    if fitness_mode == "regret":
+        @jax.jit
+        def evaluate_population(eval_key, population):
+            sequences = decode_latent_to_env(decoder_params, population)
+            sequences = jax.vmap(repair_cluttr_sequence)(sequences)
+            fitness, info = regret_fitness(
+                eval_key, sequences, agent_params, network, wrapped_env, env_params,
+                num_steps=rollout_steps, deterministic=deterministic,
+            )
+            return fitness, sequences, info
+    else:
+        @jax.jit
+        def evaluate_population(eval_key, population):
+            sequences = decode_latent_to_env(decoder_params, population)
+            sequences = jax.vmap(repair_cluttr_sequence)(sequences)
+            fitness = placeholder_fitness(
+                sequences,
+                inner_dim=config.get("inner_dim", 13),
+                w_obstacles=config.get("w_obstacles", 0.4),
+                w_distance=config.get("w_distance", 0.4),
+                w_validity=config.get("w_validity", 0.2),
+            )
+            return fitness, sequences, {}
+
+    # 5. Evolution loop
+    num_gens = config["num_generations"]
+    log_freq = config.get("log_freq", 10)
+
+    # Metrics tracking
+    if fitness_mode == "regret":
+        from metrics import EvolutionMetrics, compute_generation_metrics
+        evo_metrics = EvolutionMetrics()
     best_fitness_history = []
     mean_fitness_history = []
-    num_gens = config["num_generations"]
 
-    print(f"Starting CMA-ES evolution: {num_gens} generations, pop_size={config['pop_size']}, latent_dim={latent_dim}")
-    print("-" * 70)
+    print(f"Starting CMA-ES evolution: {num_gens} generations, pop_size={config['pop_size']}, "
+          f"latent_dim={latent_dim}, fitness_mode={fitness_mode}")
+    print("-" * 80)
 
     for gen in range(num_gens):
-        key, ask_key, tell_key = jax.random.split(key, 3)
+        t_start = time.time()
+        key, ask_key, tell_key, eval_key = jax.random.split(key, 4)
 
         # Ask
         population, es_state = es.ask(ask_key, es_state, es_params)
 
         # Evaluate
-        fitness, sequences = evaluate_population(population)
+        fitness, sequences, info = evaluate_population(eval_key, population)
 
         # Tell
-        es_state, metrics = es.tell(tell_key, population, fitness, es_state, es_params)
+        es_state, es_metrics = es.tell(tell_key, population, fitness, es_state, es_params)
 
-        # Track (negate back since we negated for minimization)
+        t_end = time.time()
+        gen_time = t_end - t_start
+
+        # Track fitness (negate back since we negated for minimization)
         best_idx = jnp.argmin(fitness)
         best_fit = float(-fitness[best_idx])
         mean_fit = float(-fitness.mean())
         best_fitness_history.append(best_fit)
         mean_fitness_history.append(mean_fit)
 
-        if gen % config.get("log_freq", 10) == 0:
-            std_val = float(es_state.std) if es_state.std.ndim == 0 else float(es_state.std.mean())
-            print(
-                f"Gen {gen:4d} | "
-                f"Best: {best_fit:.4f} | "
-                f"Mean: {mean_fit:.4f} | "
-                f"Std: {std_val:.4f}"
-            )
+        # Track regret-specific metrics
+        if fitness_mode == "regret" and info:
+            gen_data = compute_generation_metrics(info, population, sequences, es_state, gen_time)
+            gen_data['best_fitness'] = best_fit
+            gen_data['mean_fitness'] = mean_fit
+            evo_metrics.record(gen_data)
 
-    print("-" * 70)
+            if gen % log_freq == 0:
+                print(
+                    f"Gen {gen:4d} | "
+                    f"Regret: best={gen_data['best_regret']:.4f} mean={gen_data['mean_regret']:.4f} | "
+                    f"Solvable: {gen_data['solvability_rate']:.0%} | "
+                    f"Div(L2): {gen_data['latent_diversity']:.3f} | "
+                    f"sigma: {gen_data['cma_sigma']:.4f} | "
+                    f"Time: {gen_time:.2f}s"
+                )
+        else:
+            if gen % log_freq == 0:
+                std_val = float(es_state.std) if es_state.std.ndim == 0 else float(es_state.std.mean())
+                print(
+                    f"Gen {gen:4d} | "
+                    f"Best: {best_fit:.4f} | "
+                    f"Mean: {mean_fit:.4f} | "
+                    f"Std: {std_val:.4f}"
+                )
+
+    print("-" * 80)
     print("Evolution complete.")
 
-    # 5. Extract and save results
-    # Decode the final population
+    # 6. Extract and save results
     key, final_key = jax.random.split(key)
     final_pop, _ = es.ask(final_key, es_state, es_params)
-    _, final_sequences = evaluate_population(final_pop)
+    _, final_sequences, _ = evaluate_population(eval_key, final_pop)
 
-    # Decode the best solution
     best_z = es_state.best_solution[None, :]
     best_seq = decode_latent_to_env(decoder_params, best_z)
     best_seq = jax.vmap(repair_cluttr_sequence)(best_seq)
@@ -215,8 +275,12 @@ def run_evolution(config):
 
     np.save(os.path.join(output_dir, "evolved_envs.npy"), np.array(final_sequences))
     np.save(os.path.join(output_dir, "best_env.npy"), np.array(best_seq))
-    np.save(os.path.join(output_dir, "fitness_history.npy"), np.array(best_fitness_history))
+    np.save(os.path.join(output_dir, "fitness_history.npy"),
+            np.column_stack([best_fitness_history, mean_fitness_history]))
     np.save(os.path.join(output_dir, "best_latent.npy"), np.array(es_state.best_solution))
+
+    if fitness_mode == "regret":
+        evo_metrics.save(output_dir)
 
     print(f"Saved {config['pop_size']} evolved environments to {output_dir}/")
     print(f"Best fitness: {best_fitness_history[-1]:.4f}")
@@ -239,9 +303,28 @@ if __name__ == "__main__":
     parser.add_argument("--no_warm_start", action="store_true",
                         help="Disable warm-start (use zero mean instead)")
     parser.add_argument("--log_freq", type=int, default=10)
+
+    # Placeholder fitness weights
     parser.add_argument("--w_obstacles", type=float, default=0.4)
     parser.add_argument("--w_distance", type=float, default=0.4)
     parser.add_argument("--w_validity", type=float, default=0.2)
+
+    # Fitness mode
+    parser.add_argument("--fitness_mode", type=str, default="placeholder",
+                        choices=["placeholder", "regret"],
+                        help="Fitness function: 'placeholder' (structural) or 'regret' (agent-based)")
+    parser.add_argument("--agent_checkpoint_dir", type=str, default=None,
+                        help="Path to orbax agent checkpoint directory (required for regret mode)")
+    parser.add_argument("--rollout_steps", type=int, default=256,
+                        help="Steps per rollout for regret evaluation")
+    parser.add_argument("--eval_policy_mode", type=str, default="deterministic",
+                        choices=["deterministic", "stochastic"],
+                        help="Agent policy during eval: argmax (deterministic) or sample (stochastic)")
+
+    # Output
+    parser.add_argument("--output_subdir", type=str, default=None,
+                        help="Output subdirectory (default: 'evolved' or 'evolved_regret')")
+
     args = parser.parse_args()
 
     # Load VAE config for model dimensions and paths
@@ -254,20 +337,27 @@ if __name__ == "__main__":
     evolve_defaults = {}
     if os.path.exists(evolve_config_path):
         with open(evolve_config_path, 'r') as f:
-            evolve_defaults = yaml.safe_load(f)
+            evolve_defaults = yaml.safe_load(f) or {}
 
     # Checkpoint path: VAE model in vae/model directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    checkpoint_path = os.path.join(script_dir, "..", "vae", "model", "checkpoint_330000.pkl")
+    checkpoint_path = os.path.join(script_dir, "..", "vae", "model", "checkpoint_420000.pkl")
 
     # Output directory
-    output_subdir = evolve_defaults.get("output_subdir", "evolved")
+    default_subdir = "evolved_regret" if args.fitness_mode == "regret" else "evolved"
+    output_subdir = args.output_subdir or evolve_defaults.get("output_subdir", default_subdir)
     output_dir = os.path.join(script_dir, output_subdir)
+
+    # Warm-start: disabled by default in regret mode (cwd config loading trap)
+    if args.fitness_mode == "regret" and not args.no_warm_start:
+        warm_start = evolve_defaults.get("warm_start", False)
+    else:
+        warm_start = not args.no_warm_start
 
     config = {
         **evolve_defaults,
         **vars(args),
-        "warm_start": not args.no_warm_start,
+        "warm_start": warm_start,
         "latent_dim": vae_config["latent_dim"],
         "inner_dim": 13,
         "checkpoint_path": checkpoint_path,
