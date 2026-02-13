@@ -5,7 +5,8 @@ Tests:
     1. env_bridge: CLUTTR sequence -> Maze Level (golden comparison with visualize_envs.py)
     2. flood_fill_solvable: known solvable/unsolvable cases
     3. agent_loader: checkpoint loading + contract test
-    4. Small end-to-end run (placeholder fitness, 2 gens) to verify wiring
+    4. decoder/regret unit checks for new sampling + complexity gating
+    5. Small end-to-end run (placeholder fitness, 2 gens) to verify wiring
 
 Run:
     python es/test_integration.py
@@ -241,7 +242,61 @@ def test_agent_forward_pass_batched():
     assert value.shape == (1, batch_size), f"Expected (1, {batch_size}), got {value.shape}"
 
 
-# ── Test 4: Small integration (placeholder, 2 gens) ─────────────────────
+# ── Test 4: Decoder + complexity checks ──────────────────────────────────
+def test_decoder_backward_compatible_none_rng():
+    """decode_latent_to_env(..., rng_key=None) should match legacy argmax path."""
+    from vae_decoder import load_vae_params, extract_decoder_params, decode_latent_to_env
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    checkpoint_path = os.path.join(script_dir, '..', 'vae', 'model', 'checkpoint_420000.pkl')
+    full_params = load_vae_params(checkpoint_path)
+    decoder_params = extract_decoder_params(full_params)
+
+    z = jnp.zeros((3, 64), dtype=jnp.float32)
+    seq_legacy = decode_latent_to_env(decoder_params, z)
+    seq_none_rng = decode_latent_to_env(decoder_params, z, rng_key=None, temperature=1.0)
+    assert jnp.array_equal(seq_legacy, seq_none_rng), "rng_key=None path changed legacy decode behavior"
+
+
+def test_decoder_sampling_executes():
+    """Sampling path should run and return valid token ranges/shapes."""
+    from vae_decoder import load_vae_params, extract_decoder_params, decode_latent_to_env
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    checkpoint_path = os.path.join(script_dir, '..', 'vae', 'model', 'checkpoint_420000.pkl')
+    full_params = load_vae_params(checkpoint_path)
+    decoder_params = extract_decoder_params(full_params)
+
+    z = jnp.zeros((4, 64), dtype=jnp.float32)
+    seq = decode_latent_to_env(
+        decoder_params, z, rng_key=jax.random.PRNGKey(0), temperature=1.0
+    )
+    assert seq.shape == (4, 52), f"Unexpected sampled decode shape: {seq.shape}"
+    assert jnp.all((seq >= 0) & (seq <= 169)), "Sampled tokens out of expected [0,169] range"
+
+
+def test_complexity_mask_filters_trivial():
+    """Complexity mask should reject trivial envs and keep sufficiently complex ones."""
+    from regret_fitness import compute_complexity_mask
+
+    # Trivial: no obstacles, adjacent goal/agent.
+    trivial = np.zeros(52, dtype=np.int32)
+    trivial[50] = 1
+    trivial[51] = 2
+
+    # Complex enough: >= 5 obstacles and large agent-goal distance.
+    complex_seq = np.zeros(52, dtype=np.int32)
+    complex_seq[:6] = np.array([10, 20, 30, 40, 50, 60], dtype=np.int32)
+    complex_seq[50] = 169
+    complex_seq[51] = 1
+
+    seqs = jnp.array(np.stack([trivial, complex_seq], axis=0))
+    mask = compute_complexity_mask(seqs, min_obstacles=5, min_distance=3, inner_dim=13)
+    assert bool(mask[0]) is False, "Trivial sequence should fail complexity mask"
+    assert bool(mask[1]) is True, "Complex sequence should pass complexity mask"
+
+
+# ── Test 5: Small integration (placeholder, 2 gens) ─────────────────────
 def test_small_placeholder_run():
     """Run 2 generations of placeholder fitness to verify the full loop."""
     import yaml
@@ -309,7 +364,12 @@ if __name__ == "__main__":
     results.append(run_test("agent load + contract test", test_agent_load_and_contract))
     results.append(run_test("agent batched forward pass", test_agent_forward_pass_batched))
 
-    print("\n[4] Small Integration Run (placeholder, 2 gens)")
+    print("\n[4] Decoder + Complexity Tests")
+    results.append(run_test("decoder backward compatibility", test_decoder_backward_compatible_none_rng))
+    results.append(run_test("decoder sampling path", test_decoder_sampling_executes))
+    results.append(run_test("complexity mask filtering", test_complexity_mask_filters_trivial))
+
+    print("\n[5] Small Integration Run (placeholder, 2 gens)")
     results.append(run_test("placeholder evolution loop", test_small_placeholder_run))
 
     # Summary

@@ -66,6 +66,7 @@ class EvolutionMetrics:
     sequence_diversity: List[float] = field(default_factory=list)
     cma_sigma: List[float] = field(default_factory=list)
     eval_return_mean: List[float] = field(default_factory=list)
+    complexity_pass_rate: List[float] = field(default_factory=list)
     best_fitness: List[float] = field(default_factory=list)
     mean_fitness: List[float] = field(default_factory=list)
     gen_time_seconds: List[float] = field(default_factory=list)
@@ -74,7 +75,7 @@ class EvolutionMetrics:
         """Record metrics for one generation."""
         for key in [
             'best_regret', 'mean_regret', 'solvability_rate', 'unsolvable_rate',
-            'latent_diversity', 'sequence_diversity', 'cma_sigma',
+            'latent_diversity', 'sequence_diversity', 'cma_sigma', 'complexity_pass_rate',
             'eval_return_mean', 'best_fitness', 'mean_fitness', 'gen_time_seconds',
         ]:
             getattr(self, key).append(float(gen_data.get(key, 0.0)))
@@ -84,7 +85,7 @@ class EvolutionMetrics:
         os.makedirs(output_dir, exist_ok=True)
         for name in [
             'best_regret', 'mean_regret', 'solvability_rate', 'unsolvable_rate',
-            'latent_diversity', 'sequence_diversity', 'cma_sigma',
+            'latent_diversity', 'sequence_diversity', 'cma_sigma', 'complexity_pass_rate',
             'eval_return_mean', 'best_fitness', 'mean_fitness', 'gen_time_seconds',
         ]:
             arr = np.array(getattr(self, name))
@@ -119,18 +120,22 @@ def compute_generation_metrics(info, population, sequences, es_state, gen_time):
     regret = info['regret']
     solvable = info['solvable']
     max_returns = info['max_returns']
+    complex_enough = info.get('complex_enough', solvable)
+    valid = info.get('valid', solvable)
     any_solvable = info['any_solvable']
+    any_valid = info.get('any_valid', any_solvable)
 
     solv_rate = float(solvable.mean())
-    num_solvable = float(solvable.sum())
+    complexity_rate = float(complex_enough.mean())
+    num_valid = float(valid.sum())
 
-    # Regret stats (only over solvable envs)
-    if any_solvable:
-        solvable_regret = jnp.where(solvable, regret, -jnp.inf)
-        best_reg = float(jnp.max(solvable_regret))
-        mean_reg = float(jnp.where(solvable, regret, 0.0).sum() / jnp.maximum(num_solvable, 1))
-        solvable_returns = jnp.where(solvable, max_returns, 0.0)
-        return_mean = float(solvable_returns.sum() / jnp.maximum(num_solvable, 1))
+    # Regret stats (over fitness-valid envs if available).
+    if any_valid:
+        valid_regret = jnp.where(valid, regret, -jnp.inf)
+        best_reg = float(jnp.max(valid_regret))
+        mean_reg = float(jnp.where(valid, regret, 0.0).sum() / jnp.maximum(num_valid, 1))
+        valid_returns = jnp.where(valid, max_returns, 0.0)
+        return_mean = float(valid_returns.sum() / jnp.maximum(num_valid, 1))
     else:
         best_reg = 0.0
         mean_reg = 0.0
@@ -150,6 +155,7 @@ def compute_generation_metrics(info, population, sequences, es_state, gen_time):
         'latent_diversity': float(compute_latent_diversity(population)),
         'sequence_diversity': float(compute_sequence_diversity(sequences)),
         'cma_sigma': sigma,
+        'complexity_pass_rate': complexity_rate,
         'eval_return_mean': return_mean,
         'gen_time_seconds': gen_time,
     }

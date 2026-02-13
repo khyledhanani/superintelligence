@@ -1,90 +1,228 @@
-# ES Regret Pipeline Quickstart
+# ES Environment Generation Pipeline
 
-This folder supports two evolution modes in `evolve_envs.py`:
+Evolves diverse CLUTTR maze environments in a 64-dim VAE latent space, scored by **MaxMC regret** from a frozen ACCEL agent.   search strategy is **MAP-Elites**, maintaining a grid of elite environments binned by behavior descriptors, guaranteeing structural diversity by construction.
 
-- `placeholder`: structural fitness only (no RL agent).
-- `regret`: ACCEL-inspired regret proxy fitness (`max_mc`) using a frozen agent checkpoint.
-
-## Requirements
-
-- Activate `jax_env` (or equivalent env with `jax`, `evosax`, `flax`, `orbax`, `jaxued`).
-- Run from `es/`:
+##  Start
 
 ```bash
-cd /cs/student/msc/csml/2025/gmaralla/superintelligence/es
+# Full MAP-Elites run (2000 iterations, ~1 min on GPU)
+cd es/
+python map_elites.py \
+  --agent_checkpoint_dir agent_folder \
+  --num_iterations 2000 \
+  --batch_size 32 \
+  --output_subdir _me_run1
+
+#  test
+python map_elites.py \
+  --agent_checkpoint_dir agent_folder \
+  --num_iterations 100 \
+  --batch_size 16 \
+  --init_pop 64 \
+  --output_subdir _me_smoke
 ```
 
+**Requirements**: Conda env with `jax`, `flax`, `jaxued`, `distrax`, `matplotlib`, `pyyaml`. Agent checkpoint at `agent_folder/agent_params.pkl`. VAE checkpoint at `../vae/model/checkpoint_420000.pkl`.
 
-## Run
+---
+
+## Architecture
+
+```
+                    MAP-Elites Loop
+                    ┌─────────────┐
+                    │ Sample parent│
+                    │ from archive │
+                    └──────┬──────┘
+                           │ z_parent
+                           ▼
+                    ┌─────────────┐
+                    │   Mutate    │  z_child = z_parent + σ·N(0,I)
+                    └──────┬──────┘
+                           │ z_child (64-dim)
+                           ▼
+              ┌────────────────────────┐
+              │  VAE Decoder           │  vae_decoder.py
+              │  Gumbel-max sampling   │  temperature-controlled
+              └────────────┬───────────┘
+                           │ raw sequence (52)
+                           ▼
+              ┌────────────────────────┐
+              │  Repair                │  vae_decoder.py
+              │  Enforce CLUTTR rules  │  valid obstacle/agent/goal
+              └────────────┬───────────┘
+                           │ valid sequence (52)
+                           ▼
+              ┌────────────────────────┐
+              │  Regret Fitness        │  regret_fitness.py
+              │  CLUTTR → Maze Level   │  env_bridge.py
+              │  Solvability check     │  flood_fill
+              │  Complexity filter     │  min_obstacles, min_distance
+              │  Agent rollout         │  agent_loader.py
+              │  MaxMC regret          │  max_return - V(s_t)
+              └────────────┬───────────┘
+                           │ regret score + behavior descriptors
+                           ▼
+              ┌────────────────────────┐
+              │  Archive Insert        │  map_elites.py
+              │  If cell empty OR      │
+              │  regret > existing     │
+              │  → store in grid       │
+              └────────────────────────┘
+```
+
+**Behavior descriptors** (2D grid, 8×6 = 48 cells):
+- Axis 1: **num_obstacles** — bins: [5-10), [10-15), ..., [40-50]
+- Axis 2: **manhattan_distance** (agent↔goal) — bins: [3-6), [6-9), ..., [18-24]
+
+Each cell stores the highest-regret environment with those characteristics.
+
+---
+
+## MAP-Elites (Primary)
+
+Based on Mouret & Clune (2015), "Illuminating search spaces by mapping elites."
+
+### Algorithm
+
+1. **Initialize**: Generate `init_pop` random latent vectors → decode → evaluate → insert valid ones into archive
+2. **Loop** (each iteration):
+   - Sample `batch_size` parents uniformly from occupied archive cells
+   - Mutate: `z_child = z_parent + sigma * N(0, I)` in 64-dim latent space
+   - Decode → repair → evaluate regret + compute behavior descriptors
+   - Insert into archive if cell is empty or new regret > existing
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--agent_checkpoint_dir` | (required) | Path to agent checkpoint dir |
+| `--num_iterations` | 2000 | Main loop iterations |
+| `--batch_size` | 32 | Children per iteration |
+| `--mutation_sigma` | 0.5 | Gaussian mutation std in latent space |
+| `--decode_temperature` | 0.25 | Gumbel-max sampling temperature |
+| `--rollout_steps` | 256 | Agent rollout length per environment |
+| `--init_pop` | 256 | Random seeds for archive initialization |
+| `--min_obstacles` | 5 | Complexity filter: min non-zero obstacles |
+| `--min_distance` | 3 | Complexity filter: min agent-goal Manhattan dist |
+| `--seed` | 42 | Random seed |
+| `--log_freq` | 100 | Print progress every N iterations |
+| `--output_subdir` | `_map_elites_run1` | Output directory name |
+
+### Outputs
+
+Each run writes to `es/<output_subdir>/`:
+
+| File | Shape | Description |
+|------|-------|-------------|
+| `archive_envs.npy` | (N, 52) | CLUTTR sequences from filled cells |
+| `archive_latents.npy` | (N, 64) | Latent vectors |
+| `archive_fitness.npy` | (N,) | Regret values |
+| `archive_descriptors.npy` | (N, 2) | [num_obstacles, manhattan_dist] per cell |
+| `archive_heatmap.png` | — | 2D regret heatmap across behavior grid |
+| `archive_gallery.png` | — | Top-12 environments visualized as grids |
+
+### Results (2000 iterations, frozen ACCEL agent)
+
+- **48/48 cells filled** (100% coverage)
+- Regret range: 0.196 – 0.262 (mean 0.237)
+- Obstacle counts: 5 – 48 across bins
+- Manhattan distances: 4 – 19 across bins
+- Visually diverse environments (sparse ↔ dense, short ↔ long paths)
+
+---
+
+## CMA-ES (Old... don't bother)
+
+`evolve_envs.py` implements CMA-ES in the same latent space. Kept for reference **not recommended for diversity**: CMA-ES converges to a single max after ~200 generations (all environments become the same pattern).
 
 ```bash
 python evolve_envs.py \
   --fitness_mode regret \
   --agent_checkpoint_dir agent_folder \
-  --num_generations 50 \
-  --pop_size 16 \
-  --rollout_steps 256 \
-  --no_warm_start \
-  --eval_policy_mode deterministic \
-  --log_freq 1 \
-  --output_subdir _regret_g50_p16
+  --num_generations 200 \
+  --pop_size 32 \
+  --decode_temperature 0.25 \
+  --output_subdir _cma_run
 ```
 
-## Key parameters
+See `evolve_config.yml` for full configuration options.
 
-- `--rollout_steps`:
-  - Number of environment steps used to evaluate each candidate level.
-  - Higher values give a more reliable regret estimate (agent has more time/episodes), but increase runtime per generation.
-  - Typical start: `64` for smoke tests, `256` for real runs.
+---
 
-- `--num_generations`:
-  - Number of CMA-ES optimization iterations.
-  - More generations means longer search and typically better best-found regret, but more total compute.
+## Shared Components
 
-- `--eval_policy_mode`:
-  - Controls how agent actions are chosen during fitness evaluation.
-  - Affects fitness noise and therefore ES stability.
+### regret_fitness.py
+- `regret_fitness(rng, sequences, agent_params, network, env, env_params, ...)` → (fitness, info)
+- `compute_complexity_mask(sequences, min_obstacles, min_distance)` → boolean mask
+- MaxMC regret: time-averaged `max_return - V(s_t)` from agent rollouts
+- Invalid environments (unsolvable or too simple) get adaptive penalty
 
-- `deterministic` vs `stochastic`:
-  - `deterministic`: uses `argmax(logits)` at each step.
-  - `stochastic`: samples from the policy distribution.
-  - `deterministic` is usually better for optimization stability (lower variance fitness signal).
-  - `stochastic` can better reflect exploration behavior, but produces noisier fitness estimates.
-  - Practical workflow: optimize with `deterministic`, then optionally compare against `stochastic` in an ablation.
+### vae_decoder.py
+- `decode_latent_to_env(decoder_params, z, rng_key, temperature)` → (batch, 52) sequences
+- `repair_cluttr_sequence(seq)` → enforces CLUTTR structural constraints
+- Temperature-controlled Gumbel-max sampling: `argmax(logits/T + gumbel_noise)`
 
-## Outputs
+### agent_loader.py
+- `load_agent(checkpoint_dir, action_dim)` → (params, network)
+- Pickle-first loading (portable), orbax fallback
+- `verify_agent_contract(params, network)` — sanity check obs(5,5,3) → 7 actions
 
-Each run writes to `es/<output_subdir>/`, including:
+### env_bridge.py
+- `cluttr_sequence_to_level(sequence, dir_key)` → jaxued Maze Level
+- `flood_fill_solvable(wall_map, agent_pos, goal_pos)` → bool
 
-- `evolved_envs.npy`: final population sequences.
-- `best_env.npy`: best sequence by fitness.
-- `fitness_history.npy`: `[best_fitness, mean_fitness]` per generation.
-- `best_latent.npy`: best latent vector.
-- `best_regret.npy`, `mean_regret.npy`, `solvability_rate.npy`, `latent_diversity.npy`, `sequence_diversity.npy`, `cma_sigma.npy`, `metrics_summary.json`.
+### visualize_envs.py
+- `sequence_to_grid(seq)` → 13×13 grid with walls/agent/goal
+- `visualize_grid(ax, grid, title)` — matplotlib rendering
+- `compute_stats(seq)` → {num_obstacles, manhattan_dist, valid}
 
-## Quick checks
+### metrics.py
+- `compute_latent_diversity(latents)` — mean pairwise L2
+- `compute_sequence_diversity(sequences)` — mean pairwise Hamming
 
-```bash
-ls -lh _regret_g10_p8
-python - <<'PY'
-import numpy as np
-d = "_regret_g10_p8"
-print("best_regret:", np.load(f"{d}/best_regret.npy"))
-print("mean_regret:", np.load(f"{d}/mean_regret.npy"))
-print("solvability:", np.load(f"{d}/solvability_rate.npy"))
-PY
+---
+
+
+
+---
+
+## Key Findings
+
+1. **CMA-ES diversity collapse**: After ~200 generations, CMA-ES converges to one environment type. All environments share the same structure (agent top-left, goal middle-right, dist=18). Sigma drops, sequence diversity collapses.
+
+2. **MAP-Elites solves this**: 100% archive coverage across all 48 behavior cells. Environments range from sparse (5 obstacles, short paths) to dense (48 obstacles, long paths).
+
+3. **Regret ceiling with frozen agent**: Max regret plateaus at ~0.26. This is not a bug — regret measures how wrong the frozen agent's value predictions are. The agent can only be "so confused." For open-ended improvement, the agent must be in the training loop (co-evolution).
+
+4. **Temperature matters**: T=0.25 produces the most structured environments. T=1.0 is too noisy, T=0.5 is a reasonable middle ground.
+
+---
+
+## Requirements
+
+### Conda Environment
+
+```
+jax, jaxlib (CPU or CUDA)
+flax, optax
+jaxued
+distrax
+evosax (CMA-ES only)
+matplotlib, pyyaml, numpy
 ```
 
-## Visualize environments
+### Agent Checkpoint
 
-Preview final population:
+Place `agent_params.pkl` in `agent_folder/`. 
 
-```bash
-python visualize_envs.py --evolved _regret_g10_p8/evolved_envs.npy --num_envs 8 --output _regret_g10_p8/evolved_preview.png
-```
+### VAE Checkpoint
 
-## Notes
+Trained VAE at `../vae/model/checkpoint_420000.pkl` 
 
-- Regret mode uses a frozen agent from `agent_folder` (no retraining during ES).
-- `--no_warm_start` is recommended in regret mode.
-- `deterministic` policy mode (`argmax`) gives a more stable ES fitness signal than stochastic sampling.
+### GPU Notes
+
+- **cream** (GLIBC 2.34, Quadro RTX 6000): works with JAX CUDA
+- **blaze** (CentOS 7, GLIBC 2.17): cuDNN 9 incompatible — use CPU only or switch machine
+
+

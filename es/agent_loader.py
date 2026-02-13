@@ -12,12 +12,12 @@ Usage:
 
 from typing import Sequence
 import numpy as np
+import pickle
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from flax.linen.initializers import constant, orthogonal
 import distrax
-import orbax.checkpoint as ocp
 import os
 import sys
 
@@ -96,12 +96,16 @@ class ActorCritic(nn.Module):
 # ---------------------------------------------------------------------------
 
 def load_agent_params(checkpoint_dir, step=None):
-    """Load agent parameters from an orbax checkpoint.
+    """Load agent parameters from a pickle file or orbax checkpoint.
+
+    Tries to load from a pickle file (agent_params.pkl) first for portability
+    across machines with different GLIBC versions. Falls back to orbax if no
+    pickle file is found.
 
     Args:
-        checkpoint_dir: Path to the orbax checkpoint directory
-                        (e.g. "agent_folder/119/default" or "agent_folder/119").
-        step: Specific checkpoint step to load. None = latest.
+        checkpoint_dir: Path to the checkpoint directory
+                        (e.g. "agent_folder" or "agent_folder/119/default").
+        step: Specific checkpoint step to load (orbax only). None = latest.
 
     Returns:
         params: Frozen parameter dict for ActorCritic.
@@ -113,6 +117,18 @@ def load_agent_params(checkpoint_dir, step=None):
         )
     checkpoint_dir = os.path.abspath(checkpoint_dir)
 
+    # Try pickle first (portable, no tensorstore/orbax dependency)
+    pkl_path = os.path.join(checkpoint_dir, 'agent_params.pkl')
+    if os.path.exists(pkl_path):
+        print(f"Loading agent params from pickle: {pkl_path}")
+        with open(pkl_path, 'rb') as f:
+            params = pickle.load(f)
+        # Convert numpy arrays to jax arrays
+        params = jax.tree_util.tree_map(jnp.asarray, params)
+        return params
+
+    # Fall back to orbax checkpoint
+    import orbax.checkpoint as ocp
     mgr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers=ocp.StandardCheckpointHandler(),

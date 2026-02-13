@@ -19,6 +19,9 @@ w_validity: 0.2
 agent_checkpoint_dir: "agent_folder"  # orbax checkpoint root (step 119 auto-detected)
 rollout_steps: 256                         # steps per rollout (ACCEL default)
 eval_policy_mode: "deterministic"          # "deterministic" (argmax) or "stochastic" (sample)
+decode_temperature: 1.0                    # >0 enables Gumbel sampling, <=0 uses argmax decode
+min_obstacles: 5                           # complexity gate: minimum non-zero obstacle tokens
+min_distance: 3                            # complexity gate: minimum agent-goal Manhattan distance
 
 # Warm-start: disabled by default in regret mode (cwd config loading issue)
 # Set to true for placeholder mode if desired.

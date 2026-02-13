@@ -80,18 +80,30 @@ def extract_decoder_params(full_params):
     return {key_map[k]: v for k, v in full_params.items() if k in key_map}
 
 
-def decode_latent_to_env(decoder_params, z):
+def decode_latent_to_env(decoder_params, z, rng_key=None, temperature=1.0):
     """Decode a batch of latent vectors to CLUTTR environment sequences.
 
     Args:
         decoder_params: Extracted decoder parameters (remapped keys).
         z: Latent vectors, shape (batch_size, 64).
+        rng_key: Optional PRNG key. If provided, use Gumbel-max sampling.
+                 If None, use deterministic argmax (backward compatible).
+        temperature: Sampling temperature for logits when rng_key is provided.
+                     Lower values approach argmax; must be > 0 for sampling.
 
     Returns:
         Integer sequences, shape (batch_size, 52), values in [0, 169].
     """
     logits = CluttrDecoder().apply({'params': decoder_params}, z)
-    sequences = jnp.argmax(logits, axis=-1)  # (batch, 52)
+    if rng_key is None or temperature <= 0:
+        sequences = jnp.argmax(logits, axis=-1)  # (batch, 52)
+        return sequences
+
+    # Gumbel-max: argmax(logits / T + gumbel) samples from softmax(logits / T).
+    temp = jnp.asarray(temperature, dtype=logits.dtype)
+    u = jax.random.uniform(rng_key, logits.shape, minval=1e-6, maxval=1.0 - 1e-6)
+    gumbel = -jnp.log(-jnp.log(u))
+    sequences = jnp.argmax((logits / temp) + gumbel, axis=-1)
     return sequences
 
 

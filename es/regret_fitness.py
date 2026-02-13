@@ -26,6 +26,33 @@ from agent_loader import ActorCritic
 
 
 # ---------------------------------------------------------------------------
+# Complexity filter
+# ---------------------------------------------------------------------------
+
+def compute_complexity_mask(sequences, min_obstacles=5, min_distance=3, inner_dim=13):
+    """Mask out trivially simple environments.
+
+    Args:
+        sequences: (pop_size, 52) CLUTTR sequences.
+        min_obstacles: Minimum number of non-zero obstacle tokens.
+        min_distance: Minimum Manhattan distance between agent and goal.
+        inner_dim: Grid width/height (13 for CLUTTR).
+
+    Returns:
+        Boolean mask, shape (pop_size,). True = complex enough.
+    """
+    obs_count = jnp.sum(sequences[:, :50] > 0, axis=1)
+    goal_idx = sequences[:, 50]
+    agent_idx = sequences[:, 51]
+    goal_row = (goal_idx - 1) // inner_dim
+    goal_col = (goal_idx - 1) % inner_dim
+    agent_row = (agent_idx - 1) // inner_dim
+    agent_col = (agent_idx - 1) % inner_dim
+    manhattan = jnp.abs(goal_row - agent_row) + jnp.abs(goal_col - agent_col)
+    return (obs_count >= min_obstacles) & (manhattan >= min_distance)
+
+
+# ---------------------------------------------------------------------------
 # Agent rollout on a batch of levels
 # ---------------------------------------------------------------------------
 
@@ -100,7 +127,8 @@ def rollout_agent_on_levels(rng, env, env_params, agent_params, network, levels,
 # ---------------------------------------------------------------------------
 
 def regret_fitness(rng, sequences, agent_params, network, env, env_params,
-                   num_steps=256, deterministic=True):
+                   num_steps=256, deterministic=True,
+                   min_obstacles=5, min_distance=3, inner_dim=13):
     """Compute MaxMC regret-based fitness for a batch of CLUTTR sequences.
 
     Returns NEGATED regret because evosax MINIMIZES (we want to MAXIMIZE regret).
@@ -118,10 +146,13 @@ def regret_fitness(rng, sequences, agent_params, network, env, env_params,
         env_params: EnvParams.
         num_steps: Rollout length per level.
         deterministic: If True, use argmax policy for stable fitness signal.
+        min_obstacles: Complexity threshold (minimum non-zero obstacle tokens).
+        min_distance: Complexity threshold (minimum agent-goal Manhattan distance).
+        inner_dim: Grid width/height (13 for CLUTTR).
 
     Returns:
         fitness: (pop_size,) — negated regret (lower = better for CMA-ES).
-        info: Dict with 'regret', 'solvable', 'max_returns', 'any_solvable'.
+        info: Dict with regret/validity diagnostics.
     """
     pop_size = sequences.shape[0]
 
@@ -134,6 +165,10 @@ def regret_fitness(rng, sequences, agent_params, network, env, env_params,
     solvable = jax.vmap(flood_fill_solvable)(
         levels.wall_map, levels.agent_pos, levels.goal_pos
     )
+    complex_enough = compute_complexity_mask(
+        sequences, min_obstacles=min_obstacles, min_distance=min_distance, inner_dim=inner_dim
+    )
+    valid = solvable & complex_enough
 
     # 3. Rollout ALL levels (unsolvable ones produce zero reward; no significant waste)
     rng, rng_roll = jax.random.split(rng)
@@ -146,22 +181,26 @@ def regret_fitness(rng, sequences, agent_params, network, env, env_params,
     max_returns = compute_max_returns(dones, rewards)
     regret = max_mc(dones, values, max_returns, incomplete_value=0.0)
 
-    # 5. Adaptive penalty with edge-case guard for all-unsolvable generations
+    # 5. Adaptive penalty with edge-case guard for all-invalid generations
     any_solvable = solvable.sum() > 0
+    any_valid = valid.sum() > 0
     max_observed = jnp.where(
-        any_solvable,
-        jnp.max(jnp.where(solvable, regret, -jnp.inf)),
-        1.0,  # default if all unsolvable
+        any_valid,
+        jnp.max(jnp.where(valid, regret, -jnp.inf)),
+        jnp.max(regret),  # fallback when all are filtered out
     )
     penalty = max_observed + 1.0
 
-    # Negate regret for solvable (CMA-ES minimizes), penalize unsolvable
-    fitness = jnp.where(solvable, -regret, penalty)
+    # Negate regret for valid envs (CMA-ES minimizes), penalize filtered envs.
+    fitness = jnp.where(valid, -regret, penalty)
 
     info = {
         'regret': regret,
         'solvable': solvable,
+        'complex_enough': complex_enough,
+        'valid': valid,
         'max_returns': max_returns,
         'any_solvable': any_solvable,
+        'any_valid': any_valid,
     }
     return fitness, info

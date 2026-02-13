@@ -32,7 +32,6 @@ from vae_decoder import (
     extract_decoder_params,
     decode_latent_to_env,
     repair_cluttr_sequence,
-    CluttrDecoder,
 )
 from vae.sample_envs import generate_cluttr_batch_jax
 
@@ -131,7 +130,7 @@ def run_evolution(config):
     env_params = None
 
     if fitness_mode == "regret":
-        from agent_loader import load_agent, verify_agent_contract, ActorCritic
+        from agent_loader import load_agent, verify_agent_contract
         from regret_fitness import regret_fitness
         from jaxued.environments.maze import Maze
         from jaxued.wrappers import AutoReplayWrapper
@@ -169,21 +168,37 @@ def run_evolution(config):
     # 4. JIT-compile decode + fitness
     deterministic = config.get("eval_policy_mode", "deterministic") == "deterministic"
     rollout_steps = config.get("rollout_steps", 256)
+    decode_temperature = float(config.get("decode_temperature", 0.0))
+    min_obstacles = int(config.get("min_obstacles", 0))
+    min_distance = int(config.get("min_distance", 0))
+    inner_dim = int(config.get("inner_dim", 13))
 
     if fitness_mode == "regret":
         @jax.jit
         def evaluate_population(eval_key, population):
-            sequences = decode_latent_to_env(decoder_params, population)
+            decode_key, regret_key = jax.random.split(eval_key)
+            if decode_temperature > 0:
+                sequences = decode_latent_to_env(
+                    decoder_params, population, rng_key=decode_key, temperature=decode_temperature
+                )
+            else:
+                sequences = decode_latent_to_env(decoder_params, population)
             sequences = jax.vmap(repair_cluttr_sequence)(sequences)
             fitness, info = regret_fitness(
-                eval_key, sequences, agent_params, network, wrapped_env, env_params,
+                regret_key, sequences, agent_params, network, wrapped_env, env_params,
                 num_steps=rollout_steps, deterministic=deterministic,
+                min_obstacles=min_obstacles, min_distance=min_distance, inner_dim=inner_dim,
             )
             return fitness, sequences, info
     else:
         @jax.jit
         def evaluate_population(eval_key, population):
-            sequences = decode_latent_to_env(decoder_params, population)
+            if decode_temperature > 0:
+                sequences = decode_latent_to_env(
+                    decoder_params, population, rng_key=eval_key, temperature=decode_temperature
+                )
+            else:
+                sequences = decode_latent_to_env(decoder_params, population)
             sequences = jax.vmap(repair_cluttr_sequence)(sequences)
             fitness = placeholder_fitness(
                 sequences,
@@ -244,6 +259,7 @@ def run_evolution(config):
                     f"Gen {gen:4d} | "
                     f"Regret: best={gen_data['best_regret']:.4f} mean={gen_data['mean_regret']:.4f} | "
                     f"Solvable: {gen_data['solvability_rate']:.0%} | "
+                    f"Complex: {gen_data['complexity_pass_rate']:.0%} | "
                     f"Div(L2): {gen_data['latent_diversity']:.3f} | "
                     f"sigma: {gen_data['cma_sigma']:.4f} | "
                     f"Time: {gen_time:.2f}s"
@@ -262,12 +278,13 @@ def run_evolution(config):
     print("Evolution complete.")
 
     # 6. Extract and save results
-    key, final_key = jax.random.split(key)
+    key, final_key, final_eval_key = jax.random.split(key, 3)
     final_pop, _ = es.ask(final_key, es_state, es_params)
-    _, final_sequences, _ = evaluate_population(eval_key, final_pop)
+    _, final_sequences, _ = evaluate_population(final_eval_key, final_pop)
 
     best_z = es_state.best_solution[None, :]
-    best_seq = decode_latent_to_env(decoder_params, best_z)
+    # Keep final "best env" decode deterministic for interpretability.
+    best_seq = decode_latent_to_env(decoder_params, best_z, rng_key=None)
     best_seq = jax.vmap(repair_cluttr_sequence)(best_seq)
 
     output_dir = config["output_dir"]
@@ -320,6 +337,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval_policy_mode", type=str, default="deterministic",
                         choices=["deterministic", "stochastic"],
                         help="Agent policy during eval: argmax (deterministic) or sample (stochastic)")
+    parser.add_argument("--decode_temperature", type=float, default=None,
+                        help="Decoder sampling temperature. <=0 disables sampling (argmax decode).")
+    parser.add_argument("--min_obstacles", type=int, default=None,
+                        help="Complexity gate: minimum non-zero obstacle tokens (regret mode).")
+    parser.add_argument("--min_distance", type=int, default=None,
+                        help="Complexity gate: minimum Manhattan distance agent-goal (regret mode).")
 
     # Output
     parser.add_argument("--output_subdir", type=str, default=None,
@@ -354,10 +377,30 @@ if __name__ == "__main__":
     else:
         warm_start = not args.no_warm_start
 
+    # Resolve defaults after mode is known.
+    if args.decode_temperature is None:
+        if args.fitness_mode == "regret":
+            decode_temperature = evolve_defaults.get("decode_temperature", 1.0)
+        else:
+            decode_temperature = 0.0
+    else:
+        decode_temperature = args.decode_temperature
+    if args.min_obstacles is None:
+        min_obstacles = evolve_defaults.get("min_obstacles", 5)
+    else:
+        min_obstacles = args.min_obstacles
+    if args.min_distance is None:
+        min_distance = evolve_defaults.get("min_distance", 3)
+    else:
+        min_distance = args.min_distance
+
     config = {
         **evolve_defaults,
         **vars(args),
         "warm_start": warm_start,
+        "decode_temperature": decode_temperature,
+        "min_obstacles": min_obstacles,
+        "min_distance": min_distance,
         "latent_dim": vae_config["latent_dim"],
         "inner_dim": 13,
         "checkpoint_path": checkpoint_path,
