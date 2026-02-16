@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import os
 import yaml
+from utils import is_reachable_bfs
 
 def generate_cluttr_batch_jax(key, batch_size, max_obs=50, inner_dim=13):
     total_cells = inner_dim ** 2  # 169
@@ -63,24 +64,45 @@ def main():
     num_batches = args.num_envs // args.batch_size
     remainder = args.num_envs % args.batch_size
     
-    all_sequences = []
-
+    #all_sequences = []
+    valid_sequences = []
+    total_generated = 0
     print(f"Generating {args.num_envs} environments...")
 
-    for i in range(num_batches):
+    #for i in range(num_batches):
+    
+    while len(valid_sequences) < args.num_envs:
         key, batch = generate_cluttr_batch_jax(key, args.batch_size, args.max_obs, args.inner_dim)
-        all_sequences.append(np.array(batch))
-        if (i + 1) % 5 == 0:
-            print(f"Generated {(i + 1) * args.batch_size} sequences...")
+        #all_sequences.append(np.array(batch))
+        
+        batch_np = np.array(batch)
+        total_generated += len(batch_np)
 
-    if remainder > 0:
-        key, batch = generate_cluttr_batch_jax(key, remainder, args.max_obs, args.inner_dim)
-        all_sequences.append(np.array(batch))
+        batch_valid = []
+        for seq in batch_np:
+
+            walls = seq[:-2]
+            goal = seq[-2]
+            agent = seq[-1]
+
+            if is_reachable_bfs(grid_size=args.inner_dim, walls=walls, start_idx=agent, goal_idx=goal):
+                batch_valid.append(seq)
+
+
+        if batch_valid:
+            valid_sequences.extend(batch_valid)
+
+            print(f'{len(valid_sequences)}/{args.num_envs}')
+
+    #if remainder > 0:
+        #key, batch = generate_cluttr_batch_jax(key, remainder, args.max_obs, args.inner_dim)
+        #all_sequences.append(np.array(batch))
 
     # Concatenate and save
-    final_data = np.concatenate(all_sequences, axis=0)
+    final_data = np.array(valid_sequences[:args.num_envs])
+    #final_data = np.concatenate(all_sequences, axis=0)
     #save_path = os.path.join(output_dir, CONFIG["data_path"])
-    save_path = os.path.join(output_dir, 'datasets', )
+    save_path = os.path.join(output_dir, 'datasets', args.filename)
     np.save(save_path, final_data)
 
     print(f"\nSuccess! Saved dataset of shape {final_data.shape} to {save_path}")
