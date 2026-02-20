@@ -1,0 +1,29 @@
+name: superintelligence
+channels:
+  - conda-forge
+variables:
+  PIP_NO_CACHE_DIR: "1"
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - pyyaml
+  - tqdm
+  - pillow
+  - imageio
+  - moviepy
+  - ffmpeg
+  - pip:
+      - "jax[cpu]"
+      - flax
+      - chex
+      - gymnax
+      - optax
+      - distrax
+      - orbax-checkpoint==0.5.3
+      - orbax
+      - wandb
+      - evosax
+      - "-e ."
