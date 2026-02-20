@@ -11,6 +11,7 @@ from flax.linen.initializers import constant, orthogonal
 import optax
 import distrax
 import os
+import sys
 import orbax.checkpoint as ocp
 import wandb
 from jaxued.environments.underspecified_env import EnvParams, EnvState, Observation, UnderspecifiedEnv
@@ -23,12 +24,26 @@ from jaxued.wrappers import AutoReplayWrapper
 import chex
 from enum import IntEnum
 
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from es.vae_decoder import load_vae_params, extract_decoder_params
+from es.map_elites_mutation_service import (
+    MapElitesArchive,
+    init_map_elites_archive,
+    map_elites_mutate_levels,
+    map_elites_insert_batch,
+    map_elites_stats,
+)
+
 class UpdateState(IntEnum):
     DR = 0
     REPLAY = 1
 
 class TrainState(BaseTrainState):
     sampler: core.FrozenDict[str, chex.ArrayTree] = struct.field(pytree_node=True)
+    me_archive: MapElitesArchive = struct.field(pytree_node=True)
     update_state: UpdateState = struct.field(pytree_node=True)
     # === Below is used for logging ===
     num_dr_updates: int
@@ -356,7 +371,9 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
     return checkpoint_manager
 #endregion
 
-def train_state_to_log_dict(train_state: TrainState, level_sampler: LevelSampler) -> dict:
+def train_state_to_log_dict(
+    train_state: TrainState, level_sampler: LevelSampler, use_map_elites: bool = False
+) -> dict:
     """To prevent the entire (large) train_state to be copied to the CPU when doing logging, this function returns all of the important information in a dictionary format.
 
         Anything in the `log` key will be logged to wandb.
@@ -371,19 +388,32 @@ def train_state_to_log_dict(train_state: TrainState, level_sampler: LevelSampler
     sampler = train_state.sampler
     idx = jnp.arange(level_sampler.capacity) < sampler["size"]
     s = jnp.maximum(idx.sum(), 1)
+    log = {
+        "level_sampler/size": sampler["size"],
+        "level_sampler/episode_count": sampler["episode_count"],
+        "level_sampler/max_score": sampler["scores"].max(),
+        "level_sampler/weighted_score": (sampler["scores"] * level_sampler.level_weights(sampler)).sum(),
+        "level_sampler/mean_score": (sampler["scores"] * idx).sum() / s,
+    }
+
+    if use_map_elites:
+        me = map_elites_stats(train_state.me_archive)
+        log.update(
+            {
+                "map_elites/occupied_cells": me["occupied_cells"],
+                "map_elites/coverage": me["coverage"],
+                "map_elites/best_fitness": me["best_fitness"],
+                "map_elites/mean_fitness": me["mean_fitness"],
+            }
+        )
+
     return {
-        "log":{
-            "level_sampler/size": sampler["size"],
-            "level_sampler/episode_count": sampler["episode_count"],
-            "level_sampler/max_score": sampler["scores"].max(),
-            "level_sampler/weighted_score": (sampler["scores"] * level_sampler.level_weights(sampler)).sum(),
-            "level_sampler/mean_score": (sampler["scores"] * idx).sum() / s,
-        },
+        "log": log,
         "info": {
             "num_dr_updates": train_state.num_dr_updates,
             "num_replay_updates": train_state.num_replay_updates,
             "num_mutation_updates": train_state.num_mutation_updates,
-        }
+        },
     }
 
 def compute_score(config, dones, values, max_returns, advantages):
@@ -402,6 +432,8 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("ACCEL")
     else:
         tags.append("PLR")
+    if config["use_map_elites_mutation"]:
+        tags.append("MAP_ELITES_MUT")
     run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
     config = wandb.config
     
@@ -451,6 +483,26 @@ def main(config=None, project="JAXUED_TEST"):
             log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
         
         wandb.log(log_dict)
+
+    decoder_params = None
+    me_latent_dim = int(config["me_latent_dim"])
+    if config["use_map_elites_mutation"] and config["mode"] == "train":
+        if not config["use_accel"]:
+            raise ValueError("--use_map_elites_mutation requires --use_accel")
+
+        me_checkpoint_path = config["me_vae_checkpoint"]
+        if me_checkpoint_path is None:
+            me_checkpoint_path = os.path.join(ROOT_DIR, "vae", "model", "checkpoint_420000.pkl")
+        elif not os.path.isabs(me_checkpoint_path):
+            me_checkpoint_path = os.path.abspath(os.path.join(os.getcwd(), me_checkpoint_path))
+
+        print(f"Loading MAP-Elites decoder from {me_checkpoint_path}...")
+        full_vae_params = load_vae_params(me_checkpoint_path)
+        decoder_params = extract_decoder_params(full_vae_params)
+        print(
+            f"MAP-Elites mutation enabled: latent_dim={me_latent_dim}, "
+            f"sigma={config['me_mutation_sigma']}, temp={config['me_decode_temperature']}"
+        )
     
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
@@ -471,6 +523,10 @@ def main(config=None, project="JAXUED_TEST"):
         prioritization_params={"temperature": config["temperature"], "k": config['topk_k']},
         duplicate_check=config['buffer_duplicate_check'],
     )
+
+    me_update_period = max(int(config["me_update_period"]), 1)
+    me_min_obstacles = int(config["me_min_obstacles"])
+    me_min_distance = int(config["me_min_distance"])
     
     @jax.jit
     def create_train_state(rng) -> TrainState:
@@ -497,12 +553,14 @@ def main(config=None, project="JAXUED_TEST"):
         )
         pholder_level = sample_random_level(jax.random.PRNGKey(0))
         sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
+        me_archive = init_map_elites_archive(me_latent_dim)
         pholder_level_batch = jax.tree_util.tree_map(lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0), pholder_level)
         return TrainState.create(
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
             sampler=sampler,
+            me_archive=me_archive,
             update_state=0,
             num_dr_updates=0,
             num_replay_updates=0,
@@ -566,6 +624,7 @@ def main(config=None, project="JAXUED_TEST"):
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
+                "me_insertions": jnp.array(0, dtype=jnp.int32),
             }
             
             train_state = train_state.replace(
@@ -624,6 +683,7 @@ def main(config=None, project="JAXUED_TEST"):
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
+                "me_insertions": jnp.array(0, dtype=jnp.int32),
             }
             
             train_state = train_state.replace(
@@ -640,11 +700,30 @@ def main(config=None, project="JAXUED_TEST"):
                 This also updates the policy iff `config["exploratory_grad_updates"]` is True.
             """
             sampler = train_state.sampler
+            me_archive = train_state.me_archive
             rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
             
             # mutate
-            parent_levels = train_state.replay_last_level_batch
-            child_levels = jax.vmap(mutate_level, (0, 0, None))(jax.random.split(rng_mutate, config["num_train_envs"]), parent_levels, config["num_edits"])
+            if config["use_map_elites_mutation"]:
+                child_levels, child_latents, child_sequences = map_elites_mutate_levels(
+                    rng_mutate,
+                    me_archive,
+                    decoder_params=decoder_params,
+                    batch_size=config["num_train_envs"],
+                    latent_sigma=config["me_mutation_sigma"],
+                    decode_temperature=config["me_decode_temperature"],
+                    uniform_fraction=config["me_uniform_parent_fraction"],
+                    softmax_temperature=config["me_fitness_softmax_temp"],
+                )
+            else:
+                parent_levels = train_state.replay_last_level_batch
+                child_levels = jax.vmap(mutate_level, (0, 0, None))(
+                    jax.random.split(rng_mutate, config["num_train_envs"]),
+                    parent_levels,
+                    config["num_edits"],
+                )
+                child_latents = None
+                child_sequences = None
             init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), child_levels, env_params)
 
             # rollout
@@ -666,6 +745,28 @@ def main(config=None, project="JAXUED_TEST"):
             max_returns = compute_max_returns(dones, rewards)
             scores = compute_score(config, dones, values, max_returns, advantages)
             sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+
+            if config["use_map_elites_mutation"]:
+                should_update_archive = (train_state.num_mutation_updates % me_update_period) == 0
+
+                def _update_archive(archive):
+                    return map_elites_insert_batch(
+                        archive,
+                        child_latents,
+                        child_sequences,
+                        scores,
+                        min_obstacles=me_min_obstacles,
+                        min_distance=me_min_distance,
+                    )
+
+                me_archive, me_insertions = jax.lax.cond(
+                    should_update_archive,
+                    _update_archive,
+                    lambda archive: (archive, jnp.array(0, dtype=jnp.int32)),
+                    me_archive,
+                )
+            else:
+                me_insertions = jnp.array(0, dtype=jnp.int32)
             
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -686,10 +787,12 @@ def main(config=None, project="JAXUED_TEST"):
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
+                "me_insertions": me_insertions,
             }
             
             train_state = train_state.replace(
                 sampler=sampler,
+                me_archive=me_archive,
                 update_state=UpdateState.DR,
                 num_mutation_updates=train_state.num_mutation_updates + 1,
                 mutation_last_level_batch=child_levels,
@@ -822,7 +925,14 @@ def main(config=None, project="JAXUED_TEST"):
         runner_state, metrics = train_and_eval_step(runner_state, None)
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
-        log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
+        log_eval(
+            metrics,
+            train_state_to_log_dict(
+                runner_state[1],
+                level_sampler,
+                use_map_elites=config["use_map_elites_mutation"],
+            ),
+        )
         if config["checkpoint_save_interval"] > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
@@ -885,6 +995,16 @@ if __name__=="__main__":
     # === ACCEL ===
     group.add_argument("--use_accel", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--num_edits", type=int, default=5)
+    group.add_argument("--use_map_elites_mutation", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument("--me_vae_checkpoint", type=str, default=None)
+    group.add_argument("--me_latent_dim", type=int, default=64)
+    group.add_argument("--me_mutation_sigma", type=float, default=0.5)
+    group.add_argument("--me_decode_temperature", type=float, default=0.25)
+    group.add_argument("--me_uniform_parent_fraction", type=float, default=0.5)
+    group.add_argument("--me_fitness_softmax_temp", type=float, default=0.5)
+    group.add_argument("--me_update_period", type=int, default=1)
+    group.add_argument("--me_min_obstacles", type=int, default=5)
+    group.add_argument("--me_min_distance", type=int, default=3)
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
