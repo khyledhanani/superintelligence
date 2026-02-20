@@ -23,7 +23,6 @@ dependencies:
       - optax
       - distrax
       - orbax-checkpoint==0.5.3
-      - orbax
       - wandb
       - evosax
       - "-e ."
