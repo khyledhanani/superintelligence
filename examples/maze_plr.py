@@ -31,6 +31,10 @@ if ROOT_DIR not in sys.path:
 from es.vae_decoder import load_vae_params, extract_decoder_params
 from es.map_elites_mutation_service import (
     MapElitesArchive,
+    OBS_BINS,
+    DIST_BINS,
+    num_cells,
+    make_latent_projections,
     init_map_elites_archive,
     map_elites_mutate_levels,
     map_elites_insert_batch,
@@ -486,6 +490,41 @@ def main(config=None, project="JAXUED_TEST"):
 
     decoder_params = None
     me_latent_dim = int(config["me_latent_dim"])
+    me_descriptor_mode = str(config["me_descriptor_mode"]).lower()
+    if me_descriptor_mode not in ("behavior", "latent", "hybrid"):
+        raise ValueError(
+            f"Invalid --me_descriptor_mode={config['me_descriptor_mode']}. "
+            "Choose from: behavior, latent, hybrid."
+        )
+
+    me_latent_bin_count = int(config["me_latent_bin_count"])
+    if me_latent_bin_count < 2:
+        raise ValueError("--me_latent_bin_count must be >= 2.")
+    me_latent_bins = jnp.linspace(
+        float(config["me_latent_bin_min"]),
+        float(config["me_latent_bin_max"]),
+        me_latent_bin_count + 1,
+        dtype=jnp.float32,
+    )
+    me_latent_projections = make_latent_projections(
+        me_latent_dim, seed=int(config["me_latent_descriptor_seed"])
+    )
+
+    if me_descriptor_mode == "behavior":
+        me_axis1_bins = OBS_BINS.astype(jnp.float32)
+        me_axis2_bins = DIST_BINS.astype(jnp.float32)
+        me_insert_latent_projections = None
+    elif me_descriptor_mode == "latent":
+        me_axis1_bins = me_latent_bins
+        me_axis2_bins = me_latent_bins
+        me_insert_latent_projections = me_latent_projections
+    else:
+        # Hybrid: behaviorally meaningful distance axis + latent geometry axis.
+        me_axis1_bins = DIST_BINS.astype(jnp.float32)
+        me_axis2_bins = me_latent_bins
+        me_insert_latent_projections = me_latent_projections
+    me_archive_cells = num_cells(me_axis1_bins, me_axis2_bins)
+
     if config["use_map_elites_mutation"] and config["mode"] == "train":
         if not config["use_accel"]:
             raise ValueError("--use_map_elites_mutation requires --use_accel")
@@ -501,7 +540,8 @@ def main(config=None, project="JAXUED_TEST"):
         decoder_params = extract_decoder_params(full_vae_params)
         print(
             f"MAP-Elites mutation enabled: latent_dim={me_latent_dim}, "
-            f"sigma={config['me_mutation_sigma']}, temp={config['me_decode_temperature']}"
+            f"sigma={config['me_mutation_sigma']}, temp={config['me_decode_temperature']}, "
+            f"descriptor_mode={me_descriptor_mode}, cells={me_archive_cells}"
         )
     
     # Setup the environment
@@ -553,7 +593,7 @@ def main(config=None, project="JAXUED_TEST"):
         )
         pholder_level = sample_random_level(jax.random.PRNGKey(0))
         sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
-        me_archive = init_map_elites_archive(me_latent_dim)
+        me_archive = init_map_elites_archive(me_latent_dim, cells=me_archive_cells)
         pholder_level_batch = jax.tree_util.tree_map(lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0), pholder_level)
         return TrainState.create(
             apply_fn=network.apply,
@@ -755,6 +795,10 @@ def main(config=None, project="JAXUED_TEST"):
                         child_latents,
                         child_sequences,
                         scores,
+                        descriptor_mode=me_descriptor_mode,
+                        axis1_bins=me_axis1_bins,
+                        axis2_bins=me_axis2_bins,
+                        latent_projections=me_insert_latent_projections,
                         min_obstacles=me_min_obstacles,
                         min_distance=me_min_distance,
                     )
@@ -1002,6 +1046,11 @@ if __name__=="__main__":
     group.add_argument("--me_decode_temperature", type=float, default=0.25)
     group.add_argument("--me_uniform_parent_fraction", type=float, default=0.5)
     group.add_argument("--me_fitness_softmax_temp", type=float, default=0.5)
+    group.add_argument("--me_descriptor_mode", type=str, default="hybrid", choices=["behavior", "latent", "hybrid"])
+    group.add_argument("--me_latent_descriptor_seed", type=int, default=0)
+    group.add_argument("--me_latent_bin_min", type=float, default=-3.0)
+    group.add_argument("--me_latent_bin_max", type=float, default=3.0)
+    group.add_argument("--me_latent_bin_count", type=int, default=12)
     group.add_argument("--me_update_period", type=int, default=1)
     group.add_argument("--me_min_obstacles", type=int, default=5)
     group.add_argument("--me_min_distance", type=int, default=3)

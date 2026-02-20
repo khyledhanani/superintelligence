@@ -22,6 +22,7 @@ from es.env_bridge import cluttr_sequence_to_level
 # Behavior descriptor bins (match es/map_elites.py defaults)
 OBS_BINS = jnp.array([5, 10, 15, 20, 25, 30, 35, 40, 50], dtype=jnp.int32)
 DIST_BINS = jnp.array([3, 6, 9, 12, 15, 18, 24], dtype=jnp.int32)
+DEFAULT_LATENT_BINS = jnp.linspace(-3.0, 3.0, 13, dtype=jnp.float32)
 
 
 @struct.dataclass
@@ -32,13 +33,15 @@ class MapElitesArchive:
     occupied: chex.Array     # (num_cells,)
 
 
-def num_cells(obs_bins=OBS_BINS, dist_bins=DIST_BINS):
-    return int((obs_bins.shape[0] - 1) * (dist_bins.shape[0] - 1))
+def num_cells(axis1_bins=OBS_BINS, axis2_bins=DIST_BINS):
+    return int((axis1_bins.shape[0] - 1) * (axis2_bins.shape[0] - 1))
 
 
-def init_map_elites_archive(latent_dim: int, seq_len: int = 52) -> MapElitesArchive:
+def init_map_elites_archive(
+    latent_dim: int, seq_len: int = 52, cells: int | None = None
+) -> MapElitesArchive:
     """Initialize an empty fixed-size MAP-Elites archive."""
-    cells = num_cells()
+    cells = int(cells) if cells is not None else num_cells()
     return MapElitesArchive(
         latents=jnp.zeros((cells, latent_dim), dtype=jnp.float32),
         sequences=jnp.zeros((cells, seq_len), dtype=jnp.int32),
@@ -60,19 +63,29 @@ def compute_behavior_descriptors(sequences: chex.Array, inner_dim: int = 13):
     return obs_count, manhattan
 
 
-def descriptor_to_cell(obs_count, manhattan, obs_bins=OBS_BINS, dist_bins=DIST_BINS):
+def descriptor_to_cell(axis1_values, axis2_values, axis1_bins=OBS_BINS, axis2_bins=DIST_BINS):
     """Map descriptors to flattened MAP-Elites cell ids."""
-    n_dist_bins = dist_bins.shape[0] - 1
-    row = jnp.searchsorted(obs_bins, obs_count, side="right") - 1
-    col = jnp.searchsorted(dist_bins, manhattan, side="right") - 1
+    n_axis2_bins = axis2_bins.shape[0] - 1
+    row = jnp.searchsorted(axis1_bins, axis1_values, side="right") - 1
+    col = jnp.searchsorted(axis2_bins, axis2_values, side="right") - 1
     in_bounds = (
         (row >= 0)
-        & (row < (obs_bins.shape[0] - 1))
+        & (row < (axis1_bins.shape[0] - 1))
         & (col >= 0)
-        & (col < n_dist_bins)
+        & (col < n_axis2_bins)
     )
-    cell = row * n_dist_bins + col
+    cell = row * n_axis2_bins + col
     return jnp.where(in_bounds, cell, -1), in_bounds
+
+
+def make_latent_projections(latent_dim: int, seed: int = 0):
+    """Build two deterministic unit projection vectors for latent descriptors."""
+    key = jax.random.PRNGKey(seed)
+    vecs = jax.random.normal(key, (2, latent_dim), dtype=jnp.float32)
+    p1 = vecs[0] / jnp.maximum(jnp.linalg.norm(vecs[0]), 1e-8)
+    v2 = vecs[1] - jnp.dot(vecs[1], p1) * p1
+    p2 = v2 / jnp.maximum(jnp.linalg.norm(v2), 1e-8)
+    return jnp.stack([p1, p2], axis=0)
 
 
 def _sample_parent_latents(
@@ -158,12 +171,36 @@ def map_elites_insert_batch(
     latents: chex.Array,
     sequences: chex.Array,
     fitness: chex.Array,
+    descriptor_mode: str = "behavior",
+    axis1_bins: chex.Array = OBS_BINS,
+    axis2_bins: chex.Array = DIST_BINS,
+    latent_projections: chex.Array | None = None,
     min_obstacles: int = 5,
     min_distance: int = 3,
 ):
     """Insert a batch into the archive using elitist replacement per descriptor cell."""
     obs_count, manhattan = compute_behavior_descriptors(sequences)
-    cells, in_bounds = descriptor_to_cell(obs_count, manhattan)
+
+    if descriptor_mode == "behavior":
+        axis1_values = obs_count.astype(jnp.float32)
+        axis2_values = manhattan.astype(jnp.float32)
+    elif descriptor_mode == "latent":
+        if latent_projections is None:
+            raise ValueError("latent_projections must be provided for descriptor_mode='latent'.")
+        axis1_values = jnp.dot(latents, latent_projections[0])
+        axis2_values = jnp.dot(latents, latent_projections[1])
+    elif descriptor_mode == "hybrid":
+        if latent_projections is None:
+            raise ValueError("latent_projections must be provided for descriptor_mode='hybrid'.")
+        # Hybrid: keep task-relevant structure (distance) while diversifying along latent geometry.
+        axis1_values = manhattan.astype(jnp.float32)
+        axis2_values = jnp.dot(latents, latent_projections[0])
+    else:
+        raise ValueError(f"Unknown descriptor_mode: {descriptor_mode}")
+
+    cells, in_bounds = descriptor_to_cell(
+        axis1_values, axis2_values, axis1_bins=axis1_bins, axis2_bins=axis2_bins
+    )
     complex_enough = (obs_count >= min_obstacles) & (manhattan >= min_distance)
     valid = in_bounds & complex_enough
 
