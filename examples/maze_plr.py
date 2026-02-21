@@ -33,6 +33,8 @@ from es.map_elites_mutation_service import (
     MapElitesArchive,
     OBS_BINS,
     DIST_BINS,
+    BFS_PATH_BINS,
+    DENSE_OBS_BINS,
     num_cells,
     make_latent_projections,
     init_map_elites_archive,
@@ -401,7 +403,10 @@ def train_state_to_log_dict(
     }
 
     if use_map_elites:
-        me = map_elites_stats(train_state.me_archive)
+        me = map_elites_stats(
+            train_state.me_archive,
+            current_step=train_state.num_mutation_updates,
+        )
         log.update(
             {
                 "map_elites/occupied_cells": me["occupied_cells"],
@@ -410,6 +415,8 @@ def train_state_to_log_dict(
                 "map_elites/mean_fitness": me["mean_fitness"],
             }
         )
+        if "mean_staleness" in me:
+            log["map_elites/mean_staleness"] = me["mean_staleness"]
 
     return {
         "log": log,
@@ -491,10 +498,10 @@ def main(config=None, project="JAXUED_TEST"):
     decoder_params = None
     me_latent_dim = int(config["me_latent_dim"])
     me_descriptor_mode = str(config["me_descriptor_mode"]).lower()
-    if me_descriptor_mode not in ("behavior", "latent", "hybrid"):
+    if me_descriptor_mode not in ("behavior", "latent", "hybrid", "bfs"):
         raise ValueError(
             f"Invalid --me_descriptor_mode={config['me_descriptor_mode']}. "
-            "Choose from: behavior, latent, hybrid."
+            "Choose from: behavior, latent, hybrid, bfs."
         )
 
     me_latent_bin_count = int(config["me_latent_bin_count"])
@@ -518,12 +525,19 @@ def main(config=None, project="JAXUED_TEST"):
         me_axis1_bins = me_latent_bins
         me_axis2_bins = me_latent_bins
         me_insert_latent_projections = me_latent_projections
-    else:
+    elif me_descriptor_mode == "hybrid":
         # Hybrid: behaviorally meaningful distance axis + latent geometry axis.
         me_axis1_bins = DIST_BINS.astype(jnp.float32)
         me_axis2_bins = me_latent_bins
         me_insert_latent_projections = me_latent_projections
+    else:
+        # "bfs": BFS path-length × obstacle-count — fully structural, no latent projection.
+        # 8 × 8 = 64 cells; every cell corresponds to a distinct difficulty region.
+        me_axis1_bins = BFS_PATH_BINS.astype(jnp.float32)
+        me_axis2_bins = DENSE_OBS_BINS.astype(jnp.float32)
+        me_insert_latent_projections = None
     me_archive_cells = num_cells(me_axis1_bins, me_axis2_bins)
+    me_staleness_decay_rate = float(config["me_staleness_decay_rate"])
 
     if config["use_map_elites_mutation"] and config["mode"] == "train":
         if not config["use_accel"]:
@@ -754,6 +768,8 @@ def main(config=None, project="JAXUED_TEST"):
                     decode_temperature=config["me_decode_temperature"],
                     uniform_fraction=config["me_uniform_parent_fraction"],
                     softmax_temperature=config["me_fitness_softmax_temp"],
+                    current_step=train_state.num_mutation_updates,
+                    staleness_decay_rate=me_staleness_decay_rate,
                 )
             else:
                 parent_levels = train_state.replay_last_level_batch
@@ -801,6 +817,7 @@ def main(config=None, project="JAXUED_TEST"):
                         latent_projections=me_insert_latent_projections,
                         min_obstacles=me_min_obstacles,
                         min_distance=me_min_distance,
+                        current_step=train_state.num_mutation_updates,
                     )
 
                 me_archive, me_insertions = jax.lax.cond(
@@ -1046,11 +1063,14 @@ if __name__=="__main__":
     group.add_argument("--me_decode_temperature", type=float, default=0.25)
     group.add_argument("--me_uniform_parent_fraction", type=float, default=0.5)
     group.add_argument("--me_fitness_softmax_temp", type=float, default=0.5)
-    group.add_argument("--me_descriptor_mode", type=str, default="hybrid", choices=["behavior", "latent", "hybrid"])
+    group.add_argument("--me_descriptor_mode", type=str, default="bfs", choices=["behavior", "latent", "hybrid", "bfs"])
     group.add_argument("--me_latent_descriptor_seed", type=int, default=0)
-    group.add_argument("--me_latent_bin_min", type=float, default=-3.0)
-    group.add_argument("--me_latent_bin_max", type=float, default=3.0)
-    group.add_argument("--me_latent_bin_count", type=int, default=12)
+    group.add_argument("--me_latent_bin_min", type=float, default=-4.0)
+    group.add_argument("--me_latent_bin_max", type=float, default=4.0)
+    group.add_argument("--me_latent_bin_count", type=int, default=8)
+    group.add_argument("--me_staleness_decay_rate", type=float, default=2e-5,
+                       help="Staleness decay rate for archive fitness (0 = disabled). "
+                            "Half-life = ln(2)/rate. Default 2e-5 → half-life ~35k mutation steps.")
     group.add_argument("--me_update_period", type=int, default=1)
     group.add_argument("--me_min_obstacles", type=int, default=5)
     group.add_argument("--me_min_distance", type=int, default=3)

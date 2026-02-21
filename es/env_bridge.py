@@ -115,3 +115,35 @@ def flood_fill_solvable(wall_map, agent_pos, goal_pos):
 
     reachable = jax.lax.fori_loop(0, H * W, expand, reachable)
     return reachable[goal_pos[1], goal_pos[0]]
+
+
+def bfs_path_length(wall_map, agent_pos, goal_pos):
+    """Compute the shortest navigable path length from agent to goal.
+
+    Uses a BFS-style distance relaxation via fori_loop so it is vmap and
+    JIT compatible. Returns H*W (= 169 for a 13x13 grid) when the goal is
+    unreachable, which acts as a sentinel value.
+
+    Args:
+        wall_map: (H, W) boolean array. True = wall.
+        agent_pos: [x, y] = [col, row] (Level convention).
+        goal_pos:  [x, y] = [col, row] (Level convention).
+
+    Returns:
+        Integer scalar: shortest path length in steps, or H*W if unreachable.
+    """
+    H, W = wall_map.shape
+    INF = H * W
+    dist = jnp.full((H, W), INF, dtype=jnp.int32)
+    dist = dist.at[agent_pos[1], agent_pos[0]].set(0)
+
+    def relax(_, dist):
+        up    = jnp.roll(dist, -1, axis=0).at[-1, :].set(INF)
+        down  = jnp.roll(dist,  1, axis=0).at[ 0, :].set(INF)
+        left  = jnp.roll(dist, -1, axis=1).at[:, -1].set(INF)
+        right = jnp.roll(dist,  1, axis=1).at[:,  0].set(INF)
+        nbr_min = jnp.minimum(jnp.minimum(up, down), jnp.minimum(left, right)) + 1
+        return jnp.where(wall_map, INF, jnp.minimum(dist, nbr_min))
+
+    dist = jax.lax.fori_loop(0, H * W, relax, dist)
+    return dist[goal_pos[1], goal_pos[0]]
