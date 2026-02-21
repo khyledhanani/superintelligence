@@ -146,8 +146,7 @@ def compute_bfs_descriptors(sequences: chex.Array, inner_dim: int = 13):
         agent_pos = jnp.array([agent_col, agent_row], dtype=jnp.uint32)
         goal_pos  = jnp.array([goal_col,  goal_row],  dtype=jnp.uint32)
 
-        return bfs_path_length(wall_map, agent_pos, goal_pos,
-                               H=inner_dim, W=inner_dim)
+        return bfs_path_length(wall_map, agent_pos, goal_pos)
 
     bfs_lengths = jax.vmap(_single_bfs)(sequences)
     return bfs_lengths, obs_count
