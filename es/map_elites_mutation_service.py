@@ -43,13 +43,18 @@ OBS_BINS = jnp.array([5, 10, 15, 20, 25, 30, 35, 40, 50], dtype=jnp.int32)
 # Manhattan-distance bins
 DIST_BINS = jnp.array([3, 6, 9, 12, 15, 18, 24], dtype=jnp.int32)
 
-# BFS path-length bins — logarithmically spaced to give finer resolution
-# where short-path mazes (hardest to discover, easiest to learn) cluster.
-BFS_PATH_BINS = jnp.array([3, 5, 8, 12, 18, 28, 45, 80, 169], dtype=jnp.int32)
+# BFS path-length bins — calibrated to the range the VAE actually generates.
+# VAE-decoded environments typically have BFS paths of 5–40 steps; bins above
+# that are structurally unreachable from the learned latent space. Using 5 bins
+# that all fill reliably gives better diversity pressure than 8 bins where the
+# top 2–3 stay permanently empty.
+#   [5,10) short   [10,18) medium-short  [18,30) medium
+#   [30,50) medium-long   [50,169) long+unreachable (catch-all)
+BFS_PATH_BINS = jnp.array([5, 10, 18, 30, 50, 169], dtype=jnp.int32)
 
-# Denser obstacle-count bins for the BFS mode's second axis; more resolution
-# in the 5-22 range where the target difficulty band (20-80% solve rate) lives.
-DENSE_OBS_BINS = jnp.array([5, 8, 12, 17, 22, 28, 35, 42, 50], dtype=jnp.int32)
+# Obstacle-count bins for the BFS mode's second axis. Centred on the 10–35
+# range where most VAE outputs cluster; [35,50) is a wide catch-all bucket.
+DENSE_OBS_BINS = jnp.array([5, 10, 18, 28, 38, 50], dtype=jnp.int32)
 
 # Default latent projection bins (used by "latent" and "hybrid" modes)
 DEFAULT_LATENT_BINS = jnp.linspace(-4.0, 4.0, 13, dtype=jnp.float32)
