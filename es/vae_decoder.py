@@ -9,6 +9,10 @@ Decoder architecture (mirrors train_vae.py lines 55-59):
     -> BiLSTM(400) -> BiLSTM(400) -> Dense(170)
     -> argmax -> integer sequence (batch, 52)
 
+Full VAE param tree (flat top-level keys):
+    Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, Dense_0 (600->128 mean+logvar)
+    Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_1 (800->170)
+
 Checkpoint param mapping (full VAE -> standalone decoder):
     LSTMCell_2 -> LSTMCell_0  (decoder BiLSTM 1 forward, 400 hidden)
     LSTMCell_3 -> LSTMCell_1  (decoder BiLSTM 1 backward, 400 hidden)
@@ -58,9 +62,9 @@ def load_vae_params(checkpoint_path):
 def extract_decoder_params(full_params):
     """Extract decoder parameters from the full VAE checkpoint.
 
-    The full VAE param tree has flat keys:
-        Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, mean_layer, logvar_layer
-        Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_0
+    The full VAE param tree has flat top-level keys:
+        Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, Dense_0 (600->128)
+        Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_1 (800->170)
 
     The standalone CluttrDecoder uses nn.compact and numbers its modules
     starting from 0, so we remap:
@@ -68,14 +72,14 @@ def extract_decoder_params(full_params):
         LSTMCell_3 -> LSTMCell_1
         LSTMCell_4 -> LSTMCell_2
         LSTMCell_5 -> LSTMCell_3
-        Dense_0    -> Dense_0
+        Dense_1    -> Dense_0     (decoder output, 800->170 vocab logits)
     """
     key_map = {
         'LSTMCell_2': 'LSTMCell_0',
         'LSTMCell_3': 'LSTMCell_1',
         'LSTMCell_4': 'LSTMCell_2',
         'LSTMCell_5': 'LSTMCell_3',
-        'Dense_0': 'Dense_0',
+        'Dense_1': 'Dense_0',
     }
     return {key_map[k]: v for k, v in full_params.items() if k in key_map}
 

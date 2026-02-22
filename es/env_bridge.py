@@ -20,6 +20,51 @@ from jaxued.environments.maze.level import Level
 
 
 # ---------------------------------------------------------------------------
+# Maze Level -> CLUTTR sequence
+# ---------------------------------------------------------------------------
+
+def level_to_cluttr_sequence(wall_map, goal_pos, agent_pos, height=13, width=13):
+    """Convert a Maze Level to a 52-element CLUTTR integer sequence.
+
+    JIT and vmap compatible. For batch conversion use:
+        jax.vmap(level_to_cluttr_sequence)(wall_maps, goal_positions, agent_positions)
+
+    Args:
+        wall_map: (H, W) boolean array. True = wall.
+        goal_pos: [x, y] = [col, row] (Level convention). Shape (2,).
+        agent_pos: [x, y] = [col, row] (Level convention). Shape (2,).
+        height: Grid height (default 13).
+        width: Grid width (default 13).
+
+    Returns:
+        (52,) int32 array: [obstacles(50), goal_linear(1), agent_linear(1)].
+        Obstacle slots use 1-indexed linear positions (row*W + col + 1).
+        Unused obstacle slots are 0 (padding). Up to 50 walls encoded.
+    """
+    # Flatten wall map and assign 1-indexed positions to walls, 0 to free cells
+    flat_wall = wall_map.reshape(-1)                               # (H*W,)
+    all_positions = jnp.arange(1, height * width + 1, dtype=jnp.int32)
+    wall_positions = jnp.where(flat_wall, all_positions, 0)        # (H*W,)
+
+    # Sort ascending: zeros (free cells) come first, wall positions at the end
+    sorted_positions = jnp.sort(wall_positions)                    # (H*W,)
+
+    # Take the last 50 entries — these are up to 50 wall 1-indexed positions
+    # (with zeros if fewer than 50 walls exist)
+    obstacles = sorted_positions[-50:]                             # (50,)
+
+    # Goal and agent: Level uses [x=col, y=row]; linear idx = row*W + col + 1
+    goal_linear = (goal_pos[1] * width + goal_pos[0] + 1).astype(jnp.int32)
+    agent_linear = (agent_pos[1] * width + agent_pos[0] + 1).astype(jnp.int32)
+
+    # Zero out any obstacle that coincides with goal or agent
+    obstacles = jnp.where(obstacles == goal_linear, 0, obstacles)
+    obstacles = jnp.where(obstacles == agent_linear, 0, obstacles)
+
+    return jnp.concatenate([obstacles, jnp.array([goal_linear, agent_linear], dtype=jnp.int32)])
+
+
+# ---------------------------------------------------------------------------
 # CLUTTR sequence -> Maze Level
 # ---------------------------------------------------------------------------
 

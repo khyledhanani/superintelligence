@@ -28,7 +28,9 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from es.vae_decoder import load_vae_params, extract_decoder_params
+from es.vae_decoder import load_vae_params, extract_decoder_params, decode_latent_to_env, repair_cluttr_sequence
+from es.cluttr_encoder import extract_encoder_params, encode_levels_to_latents
+from es.env_bridge import level_to_cluttr_sequence, cluttr_sequence_to_level
 from es.map_elites_mutation_service import (
     MapElitesArchive,
     OBS_BINS,
@@ -378,7 +380,8 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
 #endregion
 
 def train_state_to_log_dict(
-    train_state: TrainState, level_sampler: LevelSampler, use_map_elites: bool = False
+    train_state: TrainState, level_sampler: LevelSampler, use_map_elites: bool = False,
+    use_plwm: bool = False,
 ) -> dict:
     """To prevent the entire (large) train_state to be copied to the CPU when doing logging, this function returns all of the important information in a dictionary format.
 
@@ -418,6 +421,9 @@ def train_state_to_log_dict(
         if "mean_staleness" in me:
             log["map_elites/mean_staleness"] = me["mean_staleness"]
 
+    if use_plwm:
+        log["plwm/num_mutations"] = train_state.num_mutation_updates
+
     return {
         "log": log,
         "info": {
@@ -445,6 +451,8 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("PLR")
     if config["use_map_elites_mutation"]:
         tags.append("MAP_ELITES_MUT")
+    if config["use_plwm_mutation"]:
+        tags.append("PLWM_MUT")
     run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
     config = wandb.config
     
@@ -496,6 +504,7 @@ def main(config=None, project="JAXUED_TEST"):
         wandb.log(log_dict)
 
     decoder_params = None
+    encoder_params = None
     me_latent_dim = int(config["me_latent_dim"])
     me_descriptor_mode = str(config["me_descriptor_mode"]).lower()
     if me_descriptor_mode not in ("behavior", "latent", "hybrid", "bfs"):
@@ -557,7 +566,28 @@ def main(config=None, project="JAXUED_TEST"):
             f"sigma={config['me_mutation_sigma']}, temp={config['me_decode_temperature']}, "
             f"descriptor_mode={me_descriptor_mode}, cells={me_archive_cells}"
         )
-    
+
+    if config["use_plwm_mutation"] and config["mode"] == "train":
+        if not config["use_accel"]:
+            raise ValueError("--use_plwm_mutation requires --use_accel")
+        if config["use_map_elites_mutation"]:
+            raise ValueError("--use_plwm_mutation and --use_map_elites_mutation are mutually exclusive")
+
+        plwm_checkpoint_path = config["me_vae_checkpoint"]
+        if plwm_checkpoint_path is None:
+            plwm_checkpoint_path = os.path.join(ROOT_DIR, "vae", "model", "checkpoint_420000.pkl")
+        elif not os.path.isabs(plwm_checkpoint_path):
+            plwm_checkpoint_path = os.path.abspath(os.path.join(os.getcwd(), plwm_checkpoint_path))
+
+        print(f"Loading PLWM encoder+decoder from {plwm_checkpoint_path}...")
+        full_vae_params = load_vae_params(plwm_checkpoint_path)
+        encoder_params = extract_encoder_params(full_vae_params)
+        decoder_params = extract_decoder_params(full_vae_params)
+        print(
+            f"PLWM mutation enabled: latent_dim={me_latent_dim}, "
+            f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
+        )
+
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
@@ -771,6 +801,41 @@ def main(config=None, project="JAXUED_TEST"):
                     current_step=train_state.num_mutation_updates,
                     staleness_decay_rate=me_staleness_decay_rate,
                 )
+            elif config["use_plwm_mutation"]:
+                # PLR-Weighted Latent Mutation:
+                #   1. Use last replay batch as PLR-weighted parents (already
+                #      sampled by PLR's score-weighted replay mechanism).
+                #   2. Encode parents -> latents via CluttrEncoder.
+                #   3. Perturb in latent space: z' = z + sigma * noise.
+                #   4. Decode z' -> sequences -> repair -> Levels.
+                parent_levels = train_state.replay_last_level_batch
+                rng_mutate, rng_encode, rng_decode, rng_levels_key = jax.random.split(rng_mutate, 4)
+
+                # Convert parent Levels -> CLUTTR sequences
+                parent_seqs = jax.vmap(level_to_cluttr_sequence)(
+                    parent_levels.wall_map,
+                    parent_levels.goal_pos,
+                    parent_levels.agent_pos,
+                )  # (batch, 52)
+
+                # Encode to latent space
+                parent_latents = encode_levels_to_latents(encoder_params, parent_seqs)  # (batch, 64)
+
+                # Perturb
+                noise = jax.random.normal(rng_encode, parent_latents.shape)
+                child_latents = parent_latents + float(config["plwm_sigma"]) * noise  # (batch, 64)
+
+                # Decode -> repair -> convert to Levels
+                child_sequences = decode_latent_to_env(
+                    decoder_params, child_latents,
+                    rng_key=rng_decode,
+                    temperature=float(config["plwm_decode_temperature"]),
+                )  # (batch, 52)
+                child_sequences = jax.vmap(repair_cluttr_sequence)(child_sequences)
+                child_levels = jax.vmap(cluttr_sequence_to_level)(
+                    child_sequences,
+                    jax.random.split(rng_levels_key, config["num_train_envs"]),
+                )
             else:
                 parent_levels = train_state.replay_last_level_batch
                 child_levels = jax.vmap(mutate_level, (0, 0, None))(
@@ -827,6 +892,7 @@ def main(config=None, project="JAXUED_TEST"):
                     me_archive,
                 )
             else:
+                # PLWM and minimax mutation do not use the ME archive
                 me_insertions = jnp.array(0, dtype=jnp.int32)
             
             # Update: train_state only modified if exploratory_grad_updates is on
@@ -992,6 +1058,7 @@ def main(config=None, project="JAXUED_TEST"):
                 runner_state[1],
                 level_sampler,
                 use_map_elites=config["use_map_elites_mutation"],
+                use_plwm=config["use_plwm_mutation"],
             ),
         )
         if config["checkpoint_save_interval"] > 0:
@@ -1074,6 +1141,17 @@ if __name__=="__main__":
     group.add_argument("--me_update_period", type=int, default=1)
     group.add_argument("--me_min_obstacles", type=int, default=5)
     group.add_argument("--me_min_distance", type=int, default=3)
+    # === PLWM (PLR-Weighted Latent Mutation) ===
+    group.add_argument("--use_plwm_mutation", action=argparse.BooleanOptionalAction, default=False,
+                       help="Enable PLR-Weighted Latent Mutation: encode replay parents to VAE "
+                            "latents, perturb, decode, and insert back into PLR. Requires "
+                            "--use_accel. Mutually exclusive with --use_map_elites_mutation.")
+    group.add_argument("--plwm_sigma", type=float, default=0.5,
+                       help="Std-dev of Gaussian noise added in latent space for PLWM. "
+                            "Lower values = smaller mutations. Default 0.5.")
+    group.add_argument("--plwm_decode_temperature", type=float, default=0.25,
+                       help="Gumbel-max sampling temperature for PLWM decoder. "
+                            "Lower = more deterministic. Default 0.25.")
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===

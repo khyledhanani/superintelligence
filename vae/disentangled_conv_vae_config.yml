@@ -6,7 +6,7 @@
 #
 # Paths (relative to working_path/vae_folder)
 
-working_path: "/Users/khyledhanani/Documents/openend/superintelligence"
+working_path: "/cs/student/project_msc/2025/csml/kdhanani/superintelligence"
 vae_folder: "vae"
 dataset_path: "datasets/plr_pvl_dataset.npz"
 checkpoint_dir: "model_disentangled"
