@@ -1,0 +1,60 @@
+# Disentangled Structured Conv VAE — trained on PLR buffer with PVL labels.
+#
+# Architecture: CNN encoder → z (latent_dim dims, tanh*4 scaled)
+#   z_diff = z[:n_diff_dims]  — supervised on rank-normalised PVL score
+#   z_style = z[n_diff_dims:] — free reconstruction latent
+#
+# Paths (relative to working_path/vae_folder)
+
+working_path: "/Users/khyledhanani/Documents/openend/superintelligence"
+vae_folder: "vae"
+dataset_path: "datasets/plr_pvl_dataset.npz"
+checkpoint_dir: "model_disentangled"
+resume_path: null
+
+# Training
+seed: 42
+num_steps: 30000
+batch_size: 512
+learning_rate: 0.0003
+val_fraction: 0.05
+val_eval_size: 1024
+plot_freq: 200
+save_freq: 5000
+anneal_steps: 20000
+
+# Model
+latent_dim: 32       # total latent dims (smaller than CLUTTR VAE's 64 — PLR data is less diverse)
+n_diff_dims: 4       # first 4 dims supervised on PVL difficulty
+
+# Reconstruction loss weights
+wall_pos_weight: 3.0          # upweight wall positives (walls are minority cells)
+wall_bce_weight: 1.0
+wall_dice_weight: 1.0
+wall_tversky_weight: 0.5
+wall_tversky_alpha: 0.3       # penalise false negatives (missed walls) more
+wall_tversky_beta: 0.7
+wall_count_weight: 0.2
+goal_ce_weight: 1.0
+agent_ce_weight: 1.0
+overlap_penalty_weight: 0.5   # penalise goal/agent landing on same cell
+
+# Disentanglement losses
+diff_loss_weight: 5.0         # MSE(sigmoid(z_diff → pred), rank_norm_pvl)
+mi_penalty_weight: 0.1        # ||cov(z_diff, z_style)||_F^2  decorrelation
+
+# KL schedule — cyclical to prevent posterior collapse
+kl_schedule: "cyclical"
+beta_max: 0.05
+kl_free_bits_per_dim: 0.01
+kl_cycle_steps: 7500          # ~4 cycles over 30k steps
+kl_warmup_frac: 0.5
+ae_pretrain_steps: 1000       # pure reconstruction for first 1k steps
+
+# Wall focus phase — learn walls first, then add entity supervision
+wall_focus_steps: 2000
+wall_focus_entity_scale: 0.1  # reduce goal/agent loss during wall focus
+wall_focus_kl_scale: 0.0      # no KL during wall focus (pure AE)
+
+wall_threshold: 0.5
+dice_eps: 1.0e-6

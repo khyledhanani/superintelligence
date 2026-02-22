@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
 
 class StructuredConvGridVAE(nn.Module):
     latent_dim: int
+    n_diff_dims: int = 0  # 0 = disabled (plain VAE). >0 = disentangled mode.
 
     @nn.compact
     def __call__(self, x, z_rng):
@@ -63,6 +64,17 @@ class StructuredConvGridVAE(nn.Module):
         eps = jax.random.normal(z_rng, mean.shape)
         z = mean + eps * std
 
+        # Difficulty prediction head (only when n_diff_dims > 0)
+        # Operates on z_diff = z[:, :n_diff_dims] which is forced to encode
+        # curriculum difficulty via a supervised regression loss during training.
+        if self.n_diff_dims > 0:
+            z_diff = z[:, : self.n_diff_dims]
+            dh = nn.Dense(32, name="diff_h1")(z_diff)
+            dh = nn.relu(dh)
+            diff_pred = nn.Dense(1, name="diff_out")(dh)[..., 0]  # (B,) logit
+        else:
+            diff_pred = jnp.zeros(z.shape[0])
+
         # Decoder trunk
         d = nn.Dense(4 * 4 * 128)(z)
         d = nn.relu(d)
@@ -81,7 +93,7 @@ class StructuredConvGridVAE(nn.Module):
         goal_logits_map = nn.Conv(1, (1, 1), padding="SAME", name="goal_head")(d)[..., 0]
         agent_logits_map = nn.Conv(1, (1, 1), padding="SAME", name="agent_head")(d)[..., 0]
 
-        return wall_logits, goal_logits_map, agent_logits_map, mean, logvar
+        return wall_logits, goal_logits_map, agent_logits_map, mean, logvar, diff_pred
 
 
 def save_checkpoint(ckpt_dir: Path, state: train_state.TrainState, step):
@@ -186,6 +198,25 @@ def run_training(config: dict):
     if x.ndim != 4 or x.shape[1:] != (13, 13, 3):
         raise ValueError(f"Unexpected grid shape {x.shape}, expected [N,13,13,3]")
 
+    # Difficulty scores — present in PLR datasets, optional for random-maze datasets.
+    n_diff_dims = int(config.get("n_diff_dims", 0))
+    has_scores = "scores" in npz and n_diff_dims > 0
+    if has_scores:
+        raw_scores = npz["scores"].astype(np.float32)
+        # Rank-normalise to [0,1] so all difficulty levels are equally represented.
+        # This avoids the heavy right-skew of raw PVL scores (mean≈0.03, max≈0.6).
+        order = raw_scores.argsort()
+        norm_scores = np.empty_like(raw_scores)
+        norm_scores[order] = np.linspace(0.0, 1.0, len(raw_scores))
+        print(f"Scores loaded and rank-normalised. raw range: "
+              f"[{raw_scores.min():.4f}, {raw_scores.max():.4f}]")
+    else:
+        norm_scores = np.zeros(len(x), dtype=np.float32)
+        if n_diff_dims > 0:
+            print("WARNING: n_diff_dims > 0 but no 'scores' key in dataset — "
+                  "difficulty supervision disabled.")
+            n_diff_dims = 0
+
     n = len(x)
     rng_np = np.random.default_rng(config["seed"])
     perm = rng_np.permutation(n)
@@ -194,14 +225,20 @@ def run_training(config: dict):
     train_idx = perm[n_val:]
     x_train = x[train_idx]
     x_val = x[val_idx]
+    s_train = norm_scores[train_idx]
+    s_val = norm_scores[val_idx]
 
     print(f"Loaded dataset: {x.shape}")
     print(f"Train/Val split: {x_train.shape} / {x_val.shape}")
 
     wall_pos_rate = float(x_train[..., 0].mean())
     print(f"Wall positive rate: {wall_pos_rate:.4f}")
+    print(f"Disentangled dims (n_diff_dims): {n_diff_dims}")
 
-    model = StructuredConvGridVAE(latent_dim=int(config["latent_dim"]))
+    model = StructuredConvGridVAE(
+        latent_dim=int(config["latent_dim"]),
+        n_diff_dims=n_diff_dims,
+    )
     key = jax.random.PRNGKey(int(config["seed"]))
     key, init_key, z_key = jax.random.split(key, 3)
 
@@ -231,6 +268,9 @@ def run_training(config: dict):
     goal_ce_weight = float(config.get("goal_ce_weight", 1.0))
     agent_ce_weight = float(config.get("agent_ce_weight", 1.0))
     overlap_penalty_weight = float(config.get("overlap_penalty_weight", 0.0))
+    # Disentanglement loss weights (only active when n_diff_dims > 0)
+    diff_loss_weight = float(config.get("diff_loss_weight", 0.0)) if n_diff_dims > 0 else 0.0
+    mi_penalty_weight = float(config.get("mi_penalty_weight", 0.0)) if n_diff_dims > 0 else 0.0
     wall_focus_steps = int(config.get("wall_focus_steps", 0))
     wall_focus_entity_scale = float(config.get("wall_focus_entity_scale", 1.0))
     wall_focus_kl_scale = float(config.get("wall_focus_kl_scale", 1.0))
@@ -258,11 +298,13 @@ def run_training(config: dict):
         f"KL schedule={kl_schedule}, beta_max={beta_max}, free_bits/dim={kl_free_bits}, "
         f"cycle_steps={cycle_steps}, warmup_frac={warmup_frac}, ae_pretrain_steps={ae_pretrain_steps}"
     )
+    if n_diff_dims > 0:
+        print(f"Disentanglement: diff_loss_weight={diff_loss_weight}, mi_penalty_weight={mi_penalty_weight}")
 
     @jax.jit
-    def train_step(state, batch, z_rng, kl_weight, entity_scale):
+    def train_step(state, batch, scores, z_rng, kl_weight, entity_scale):
         def loss_fn(params):
-            wall_logits, goal_logits_map, agent_logits_map, mean, logvar = model.apply({"params": params}, batch, z_rng)
+            wall_logits, goal_logits_map, agent_logits_map, mean, logvar, diff_pred = model.apply({"params": params}, batch, z_rng)
 
             wall_true, goal_idx, agent_idx, wall_mask = prepare_targets(batch)
             goal_logits = goal_logits_map.reshape((batch.shape[0], -1))
@@ -309,7 +351,29 @@ def run_training(config: dict):
             kl_per_dim = -0.5 * (1 + logvar - jnp.square(mean) - jnp.exp(logvar))
             kl_per_dim = jnp.maximum(kl_per_dim, kl_free_bits)
             kl = jnp.mean(jnp.sum(kl_per_dim, axis=-1))
-            total = recon + kl_weight * kl
+
+            # Difficulty regression loss: MSE between sigmoid(diff_pred) and
+            # rank-normalised PVL score. Active only when n_diff_dims > 0.
+            diff_loss = jnp.mean(jnp.square(jax.nn.sigmoid(diff_pred) - scores))
+
+            # MI decorrelation: penalise covariance between z_diff and z_style.
+            # Uses the posterior mean (not the sample) for a stable estimate.
+            if n_diff_dims > 0 and n_diff_dims < mean.shape[-1]:
+                z_diff_m = mean[:, :n_diff_dims]
+                z_style_m = mean[:, n_diff_dims:]
+                z_diff_c = z_diff_m - z_diff_m.mean(0)
+                z_style_c = z_style_m - z_style_m.mean(0)
+                cov = jnp.einsum("bi,bj->ij", z_diff_c, z_style_c) / (mean.shape[0] - 1)
+                mi_penalty = jnp.sum(jnp.square(cov))
+            else:
+                mi_penalty = jnp.array(0.0)
+
+            total = (
+                recon
+                + kl_weight * kl
+                + diff_loss_weight * diff_loss
+                + mi_penalty_weight * mi_penalty
+            )
 
             goal_pred = jnp.argmax(goal_logits_m, axis=-1)
             agent_pred = jnp.argmax(agent_logits_m, axis=-1)
@@ -319,6 +383,8 @@ def run_training(config: dict):
             wall_iou = wall_iou_from_logits(wall_logits, wall_true, wall_threshold)
             mu_abs = jnp.mean(jnp.abs(mean))
             logvar_mean = jnp.mean(logvar)
+            diff_pred_prob = jax.nn.sigmoid(diff_pred)
+            diff_mae = jnp.mean(jnp.abs(diff_pred_prob - scores))
 
             aux = (
                 recon,
@@ -336,6 +402,9 @@ def run_training(config: dict):
                 same_cell_rate,
                 mu_abs,
                 logvar_mean,
+                diff_loss,
+                diff_mae,
+                mi_penalty,
             )
             return total, aux
 
@@ -345,8 +414,8 @@ def run_training(config: dict):
         return new_state, loss, aux
 
     @jax.jit
-    def eval_step(params, batch, z_rng):
-        wall_logits, goal_logits_map, agent_logits_map, mean, logvar = model.apply({"params": params}, batch, z_rng)
+    def eval_step(params, batch, scores, z_rng):
+        wall_logits, goal_logits_map, agent_logits_map, mean, logvar, diff_pred = model.apply({"params": params}, batch, z_rng)
 
         wall_true, goal_idx, agent_idx, wall_mask = prepare_targets(batch)
         goal_logits = goal_logits_map.reshape((batch.shape[0], -1))
@@ -388,6 +457,10 @@ def run_training(config: dict):
         kl_per_dim = jnp.maximum(kl_per_dim, kl_free_bits)
         kl = jnp.mean(jnp.sum(kl_per_dim, axis=-1))
 
+        diff_pred_prob = jax.nn.sigmoid(diff_pred)
+        diff_loss = jnp.mean(jnp.square(diff_pred_prob - scores))
+        diff_mae = jnp.mean(jnp.abs(diff_pred_prob - scores))
+
         goal_pred = jnp.argmax(goal_logits_m, axis=-1)
         agent_pred = jnp.argmax(agent_logits_m, axis=-1)
         goal_acc = jnp.mean((goal_pred == goal_idx).astype(jnp.float32))
@@ -413,6 +486,8 @@ def run_training(config: dict):
             same_cell_rate,
             mu_abs,
             logvar_mean,
+            diff_loss,
+            diff_mae,
         )
 
     ckpt_dir = work / vae_folder / config["checkpoint_dir"]
@@ -430,6 +505,9 @@ def run_training(config: dict):
         "goal_acc": [],
         "agent_acc": [],
         "same_cell_rate": [],
+        "diff_loss": [],
+        "diff_mae": [],
+        "mi_penalty": [],
         "val_recon": [],
         "val_kl": [],
         "val_wall_iou": [],
@@ -440,6 +518,8 @@ def run_training(config: dict):
         "val_goal_acc": [],
         "val_agent_acc": [],
         "val_same_cell_rate": [],
+        "val_diff_loss": [],
+        "val_diff_mae": [],
     }
 
     fig, axes = plt.subplots(2, 1, figsize=(11, 8))
@@ -448,7 +528,9 @@ def run_training(config: dict):
     for step in progress:
         key, sub = jax.random.split(key)
         idx = jax.random.randint(sub, (int(config["batch_size"]),), 0, len(x_train))
-        batch = x_train[np.array(idx)]
+        idx_np = np.array(idx)
+        batch = x_train[idx_np]
+        scores_batch = s_train[idx_np]
 
         key, z_rng = jax.random.split(key)
         beta = get_beta(
@@ -466,7 +548,7 @@ def run_training(config: dict):
         else:
             entity_scale = jnp.array(1.0, dtype=jnp.float32)
 
-        state, _loss, aux = train_step(state, jnp.array(batch), z_rng, beta, entity_scale)
+        state, _loss, aux = train_step(state, jnp.array(batch), jnp.array(scores_batch), z_rng, beta, entity_scale)
         (
             recon,
             kl,
@@ -483,6 +565,9 @@ def run_training(config: dict):
             same_cell_rate,
             mu_abs,
             logvar_mean,
+            diff_loss,
+            diff_mae,
+            mi_penalty,
         ) = aux
 
         history["recon"].append(float(recon))
@@ -495,12 +580,16 @@ def run_training(config: dict):
         history["goal_acc"].append(float(goal_acc))
         history["agent_acc"].append(float(agent_acc))
         history["same_cell_rate"].append(float(same_cell_rate))
+        history["diff_loss"].append(float(diff_loss))
+        history["diff_mae"].append(float(diff_mae))
+        history["mi_penalty"].append(float(mi_penalty))
 
         if step % int(config["plot_freq"]) == 0:
             key, ev = jax.random.split(key)
             vbs = min(int(config["val_eval_size"]), len(x_val))
             vsel = rng_np.choice(len(x_val), size=vbs, replace=False)
             vbatch = jnp.array(x_val[vsel])
+            vscores = jnp.array(s_val[vsel])
             (
                 v_recon,
                 v_kl,
@@ -517,7 +606,9 @@ def run_training(config: dict):
                 v_same_cell_rate,
                 v_mu_abs,
                 v_logvar_mean,
-            ) = eval_step(state.params, vbatch, ev)
+                v_diff_loss,
+                v_diff_mae,
+            ) = eval_step(state.params, vbatch, vscores, ev)
 
             history["val_recon"].append(float(v_recon))
             history["val_kl"].append(float(v_kl))
@@ -529,29 +620,34 @@ def run_training(config: dict):
             history["val_goal_acc"].append(float(v_goal_acc))
             history["val_agent_acc"].append(float(v_agent_acc))
             history["val_same_cell_rate"].append(float(v_same_cell_rate))
+            history["val_diff_loss"].append(float(v_diff_loss))
+            history["val_diff_mae"].append(float(v_diff_mae))
 
-            progress.set_postfix(
-                {
-                    "Recon": f"{float(recon):.4f}",
-                    "KL": f"{float(kl):.4f}",
-                    "WallIoU": f"{float(wall_iou):.3f}",
-                    "GoalAcc": f"{float(goal_acc):.3f}",
-                    "AgentAcc": f"{float(agent_acc):.3f}",
-                    "ValRecon": f"{float(v_recon):.4f}",
-                    "ValWallIoU": f"{float(v_wall_iou):.3f}",
-                    "ValGoalAcc": f"{float(v_goal_acc):.3f}",
-                    "ValAgentAcc": f"{float(v_agent_acc):.3f}",
-                    "WallBCE": f"{float(wall_bce):.3f}",
-                    "WallDice": f"{float(wall_dice):.3f}",
-                    "WallT": f"{float(wall_tversky):.3f}",
-                    "WallCnt": f"{float(wall_count_l1):.3f}",
-                    "Beta": f"{float(beta):.3f}",
-                    "MuAbs": f"{float(mu_abs):.3f}",
-                    "LV": f"{float(logvar_mean):.3f}",
-                    "ValMu": f"{float(v_mu_abs):.3f}",
-                    "ValLV": f"{float(v_logvar_mean):.3f}",
-                }
-            )
+            postfix = {
+                "Recon": f"{float(recon):.4f}",
+                "KL": f"{float(kl):.4f}",
+                "WallIoU": f"{float(wall_iou):.3f}",
+                "GoalAcc": f"{float(goal_acc):.3f}",
+                "AgentAcc": f"{float(agent_acc):.3f}",
+                "ValRecon": f"{float(v_recon):.4f}",
+                "ValWallIoU": f"{float(v_wall_iou):.3f}",
+                "ValGoalAcc": f"{float(v_goal_acc):.3f}",
+                "ValAgentAcc": f"{float(v_agent_acc):.3f}",
+                "WallBCE": f"{float(wall_bce):.3f}",
+                "WallDice": f"{float(wall_dice):.3f}",
+                "WallT": f"{float(wall_tversky):.3f}",
+                "WallCnt": f"{float(wall_count_l1):.3f}",
+                "Beta": f"{float(beta):.3f}",
+                "MuAbs": f"{float(mu_abs):.3f}",
+                "LV": f"{float(logvar_mean):.3f}",
+                "ValMu": f"{float(v_mu_abs):.3f}",
+                "ValLV": f"{float(v_logvar_mean):.3f}",
+            }
+            if n_diff_dims > 0:
+                postfix["DiffMAE"] = f"{float(diff_mae):.3f}"
+                postfix["ValDiffMAE"] = f"{float(v_diff_mae):.3f}"
+                postfix["MI"] = f"{float(mi_penalty):.3f}"
+            progress.set_postfix(postfix)
 
             # Plot losses
             axes[0].clear()
@@ -592,6 +688,56 @@ def run_training(config: dict):
     print(f"Training complete. Checkpoints: {ckpt_dir}")
     print(f"Training plot: {plot_path}")
     print(f"Training history: {history_path}")
+
+    # After training: compute z_diff centroids per difficulty decile for the decoder.
+    # These allow the decoder to target a specific difficulty without gradient-based
+    # optimisation at decode time — just look up the nearest centroid.
+    if n_diff_dims > 0:
+        print("\nComputing z_diff centroids across difficulty deciles ...")
+        n_deciles = 10
+        encode_fn = jax.jit(lambda params, batch, rng: model.apply({"params": params}, batch, rng)[3])  # returns mean
+        all_means = []
+        batch_size_enc = 512
+        dummy_rng = jax.random.PRNGKey(0)
+        for start in range(0, len(x), batch_size_enc):
+            end = min(start + batch_size_enc, len(x))
+            bx = jnp.array(x[start:end])
+            mu = encode_fn(state.params, bx, dummy_rng)
+            all_means.append(np.array(mu))
+        all_means = np.concatenate(all_means, axis=0)  # (N, latent_dim)
+        z_diff_all = all_means[:, :n_diff_dims]         # (N, n_diff_dims)
+
+        centroids = {}
+        for d in range(n_deciles):
+            lo = d / n_deciles
+            hi = (d + 1) / n_deciles
+            mask = (norm_scores >= lo) & (norm_scores < hi)
+            if not mask.any():
+                mask = np.abs(norm_scores - (lo + hi) / 2) < 0.15
+            centroid = z_diff_all[mask].mean(axis=0).tolist() if mask.any() else [0.0] * n_diff_dims
+            centroids[f"decile_{d}"] = centroid
+
+        # Also save a fine-grained lookup: 100 percentile points
+        fine_targets = np.linspace(0.0, 1.0, 100)
+        fine_centroids = []
+        for t in fine_targets:
+            # Weighted average of z_diff using a Gaussian kernel around target
+            w = np.exp(-0.5 * ((norm_scores - t) / 0.05) ** 2)
+            if w.sum() < 1e-6:
+                w = np.exp(-0.5 * ((norm_scores - t) / 0.15) ** 2)
+            w = w / w.sum()
+            fine_centroids.append((w[:, None] * z_diff_all).sum(axis=0).tolist())
+
+        stats_path = work / vae_folder / "zdiff_centroids.json"
+        with open(stats_path, "w") as f:
+            json.dump({
+                "n_diff_dims": n_diff_dims,
+                "latent_dim": int(config["latent_dim"]),
+                "decile_centroids": centroids,
+                "fine_targets": fine_targets.tolist(),
+                "fine_centroids": fine_centroids,
+            }, f, indent=2)
+        print(f"z_diff centroids saved → {stats_path}")
 
 
 def main() -> None:
