@@ -10,15 +10,18 @@ Decoder architecture (mirrors train_vae.py lines 55-59):
     -> argmax -> integer sequence (batch, 52)
 
 Full VAE param tree (flat top-level keys):
-    Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, Dense_0 (600->128 mean+logvar)
-    Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_1 (800->170)
+    Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, mean_layer (600->64), logvar_layer (600->64)
+    Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_0 (800->170)
+
+Note: the checkpoint encoder uses named Dense layers (mean_layer, logvar_layer) rather than
+an auto-numbered Dense_0. Dense_0 therefore belongs to the decoder (the only unnamed Dense).
 
 Checkpoint param mapping (full VAE -> standalone decoder):
     LSTMCell_2 -> LSTMCell_0  (decoder BiLSTM 1 forward, 400 hidden)
     LSTMCell_3 -> LSTMCell_1  (decoder BiLSTM 1 backward, 400 hidden)
     LSTMCell_4 -> LSTMCell_2  (decoder BiLSTM 2 forward, 400 hidden)
     LSTMCell_5 -> LSTMCell_3  (decoder BiLSTM 2 backward, 400 hidden)
-    Dense_1    -> Dense_0     (output logits, 800 -> 170)
+    Dense_0    -> Dense_0     (output logits, 800 -> 170)
 """
 
 import jax
@@ -63,23 +66,24 @@ def extract_decoder_params(full_params):
     """Extract decoder parameters from the full VAE checkpoint.
 
     The full VAE param tree has flat top-level keys:
-        Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, Dense_0 (600->128)
-        Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_1 (800->170)
+        Encoder: Embed_0, HighwayStage_0/1, LSTMCell_0/1, mean_layer (600->64), logvar_layer (600->64)
+        Decoder: LSTMCell_2/3 (BiLSTM 1), LSTMCell_4/5 (BiLSTM 2), Dense_0 (800->170)
 
-    The standalone CluttrDecoder uses nn.compact and numbers its modules
-    starting from 0, so we remap:
+    The encoder bottleneck uses named Dense layers (mean_layer, logvar_layer), so Dense_0
+    belongs to the decoder. The standalone CluttrDecoder uses nn.compact and numbers its
+    modules starting from 0, so we remap:
         LSTMCell_2 -> LSTMCell_0
         LSTMCell_3 -> LSTMCell_1
         LSTMCell_4 -> LSTMCell_2
         LSTMCell_5 -> LSTMCell_3
-        Dense_1    -> Dense_0     (decoder output, 800->170 vocab logits)
+        Dense_0    -> Dense_0     (decoder output, 800->170 vocab logits)
     """
     key_map = {
         'LSTMCell_2': 'LSTMCell_0',
         'LSTMCell_3': 'LSTMCell_1',
         'LSTMCell_4': 'LSTMCell_2',
         'LSTMCell_5': 'LSTMCell_3',
-        'Dense_1': 'Dense_0',
+        'Dense_0': 'Dense_0',
     }
     return {key_map[k]: v for k, v in full_params.items() if k in key_map}
 
