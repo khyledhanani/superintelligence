@@ -579,32 +579,32 @@ def main(config=None, project="JAXUED_TEST"):
         if config["use_map_elites_mutation"]:
             raise ValueError("--use_plwm_mutation and --use_map_elites_mutation are mutually exclusive")
 
-        plwm_checkpoint_path = config["me_vae_checkpoint"]
-        if plwm_checkpoint_path is None:
-            plwm_checkpoint_path = os.path.join(ROOT_DIR, "vae", "model", "checkpoint_420000.pkl")
-        elif not os.path.isabs(plwm_checkpoint_path):
-            plwm_checkpoint_path = os.path.abspath(os.path.join(os.getcwd(), plwm_checkpoint_path))
-
-        print(f"Loading PLWM encoder+decoder from {plwm_checkpoint_path}...")
-        full_vae_params = load_vae_params(plwm_checkpoint_path)
-        encoder_params = extract_encoder_params(full_vae_params)
-        decoder_params = extract_decoder_params(full_vae_params)
         if config["plwm_use_maze_ae"]:
-            # Grid-based AE: load separate checkpoint
+            # Grid-based CNN AE path — load only the MazeAE checkpoint
             mae_path = config["plwm_mae_checkpoint"]
             if mae_path is None:
                 mae_path = os.path.join(ROOT_DIR, "vae", "model_maze_ae", "checkpoint_final.pkl")
             elif not os.path.isabs(mae_path):
                 mae_path = os.path.abspath(os.path.join(os.getcwd(), mae_path))
-            print(f"  Loading Maze AE from {mae_path}...")
+            print(f"Loading Maze AE from {mae_path}...")
             full_mae_params = load_maze_ae_params(mae_path)
             maze_encoder_params = extract_maze_encoder_params(full_mae_params)
             maze_decoder_params = extract_maze_decoder_params(full_mae_params)
-            # Clear CLUTTR params so on_mutate_levels uses the grid path
-            encoder_params = None
-            decoder_params = None
-            print("  Maze AE loaded (grid-based, full wall coverage).")
+            print(
+                f"PLWM mutation enabled (Maze AE, grid-based): "
+                f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
+            )
         else:
+            # CLUTTR sequence VAE path
+            plwm_checkpoint_path = config["me_vae_checkpoint"]
+            if plwm_checkpoint_path is None:
+                plwm_checkpoint_path = os.path.join(ROOT_DIR, "vae", "model", "checkpoint_420000.pkl")
+            elif not os.path.isabs(plwm_checkpoint_path):
+                plwm_checkpoint_path = os.path.abspath(os.path.join(os.getcwd(), plwm_checkpoint_path))
+            print(f"Loading PLWM CLUTTR encoder+decoder from {plwm_checkpoint_path}...")
+            full_vae_params = load_vae_params(plwm_checkpoint_path)
+            encoder_params = extract_encoder_params(full_vae_params)
+            decoder_params = extract_decoder_params(full_vae_params)
             print(
                 f"PLWM mutation enabled (CLUTTR VAE): latent_dim={me_latent_dim}, "
                 f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
