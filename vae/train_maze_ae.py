@@ -171,10 +171,11 @@ def compute_val_metrics(
     goal_acc  = (goal_pred  == goal_targets ).mean()
     agent_acc = (agent_pred == agent_targets).mean()
 
+    # Return raw JAX arrays — caller must NOT be inside jax.jit
     return {
-        'val/wall_iou':   float(wall_iou),
-        'val/goal_acc':   float(goal_acc),
-        'val/agent_acc':  float(agent_acc),
+        'val/wall_iou':  wall_iou,
+        'val/goal_acc':  goal_acc,
+        'val/agent_acc': agent_acc,
     }
 
 
@@ -266,7 +267,11 @@ def run_training(config: dict) -> None:
         state = state.apply_gradients(grads=grads)
         return state, loss, metrics
 
-    val_metrics_jit = jax.jit(lambda p: compute_val_metrics(p, val_grids, config))
+    # Not JIT'd: compute_val_metrics returns a dict of JAX arrays; calling
+    # float() on them outside JIT forces device sync once per eval interval.
+    def run_val_metrics(p):
+        m = compute_val_metrics(p, val_grids, config)
+        return {k: float(v) for k, v in m.items()}
 
     # ---- History for plots ----
     history: dict[str, list] = {k: [] for k in [
@@ -300,7 +305,7 @@ def run_training(config: dict) -> None:
             history[k].append(float(metrics[k]))
 
         if step % config['plot_freq'] == 0:
-            val_m = val_metrics_jit(state.params)
+            val_m = run_val_metrics(state.params)
             for k, v in val_m.items():
                 history[k].append(v)
 
