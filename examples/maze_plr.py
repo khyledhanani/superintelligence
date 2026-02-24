@@ -31,6 +31,10 @@ if ROOT_DIR not in sys.path:
 from es.vae_decoder import load_vae_params, extract_decoder_params, decode_latent_to_env, repair_cluttr_sequence
 from es.cluttr_encoder import extract_encoder_params, encode_levels_to_latents
 from es.env_bridge import level_to_cluttr_sequence, cluttr_sequence_to_level
+from es.maze_ae import (
+    load_maze_ae_params, extract_maze_encoder_params, extract_maze_decoder_params,
+    maze_level_to_grid, encode_maze_levels, decode_maze_latents,
+)
 from es.map_elites_mutation_service import (
     MapElitesArchive,
     OBS_BINS,
@@ -505,6 +509,8 @@ def main(config=None, project="JAXUED_TEST"):
 
     decoder_params = None
     encoder_params = None
+    maze_encoder_params = None
+    maze_decoder_params = None
     me_latent_dim = int(config["me_latent_dim"])
     me_descriptor_mode = str(config["me_descriptor_mode"]).lower()
     if me_descriptor_mode not in ("behavior", "latent", "hybrid", "bfs"):
@@ -583,10 +589,26 @@ def main(config=None, project="JAXUED_TEST"):
         full_vae_params = load_vae_params(plwm_checkpoint_path)
         encoder_params = extract_encoder_params(full_vae_params)
         decoder_params = extract_decoder_params(full_vae_params)
-        print(
-            f"PLWM mutation enabled: latent_dim={me_latent_dim}, "
-            f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
-        )
+        if config["plwm_use_maze_ae"]:
+            # Grid-based AE: load separate checkpoint
+            mae_path = config["plwm_mae_checkpoint"]
+            if mae_path is None:
+                mae_path = os.path.join(ROOT_DIR, "vae", "model_maze_ae", "checkpoint_final.pkl")
+            elif not os.path.isabs(mae_path):
+                mae_path = os.path.abspath(os.path.join(os.getcwd(), mae_path))
+            print(f"  Loading Maze AE from {mae_path}...")
+            full_mae_params = load_maze_ae_params(mae_path)
+            maze_encoder_params = extract_maze_encoder_params(full_mae_params)
+            maze_decoder_params = extract_maze_decoder_params(full_mae_params)
+            # Clear CLUTTR params so on_mutate_levels uses the grid path
+            encoder_params = None
+            decoder_params = None
+            print("  Maze AE loaded (grid-based, full wall coverage).")
+        else:
+            print(
+                f"PLWM mutation enabled (CLUTTR VAE): latent_dim={me_latent_dim}, "
+                f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
+            )
 
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
@@ -803,39 +825,58 @@ def main(config=None, project="JAXUED_TEST"):
                 )
             elif config["use_plwm_mutation"]:
                 # PLR-Weighted Latent Mutation:
-                #   1. Use last replay batch as PLR-weighted parents (already
-                #      sampled by PLR's score-weighted replay mechanism).
-                #   2. Encode parents -> latents via CluttrEncoder.
-                #   3. Perturb in latent space: z' = z + sigma * noise.
-                #   4. Decode z' -> sequences -> repair -> Levels.
+                #   Parents = replay_last_level_batch (already PLR score-weighted).
+                #   Encode -> perturb -> decode -> evaluate -> PLR insert.
                 parent_levels = train_state.replay_last_level_batch
                 rng_mutate, rng_encode, rng_decode, rng_levels_key = jax.random.split(rng_mutate, 4)
 
-                # Convert parent Levels -> CLUTTR sequences
-                parent_seqs = jax.vmap(level_to_cluttr_sequence)(
-                    parent_levels.wall_map,
-                    parent_levels.goal_pos,
-                    parent_levels.agent_pos,
-                )  # (batch, 52)
+                if config["plwm_use_maze_ae"]:
+                    # ---- Grid-based CNN AE path (full wall coverage) ----
+                    # Convert Level -> (H, W, 3) grid
+                    parent_grids = jax.vmap(maze_level_to_grid)(
+                        parent_levels.wall_map,
+                        parent_levels.goal_pos,
+                        parent_levels.agent_pos,
+                    )  # (batch, H, W, 3)
 
-                # Encode to latent space
-                parent_latents = encode_levels_to_latents(encoder_params, parent_seqs)  # (batch, 64)
+                    # Encode
+                    parent_latents = encode_maze_levels(maze_encoder_params, parent_grids)
 
-                # Perturb
-                noise = jax.random.normal(rng_encode, parent_latents.shape)
-                child_latents = parent_latents + float(config["plwm_sigma"]) * noise  # (batch, 64)
+                    # Perturb
+                    noise = jax.random.normal(rng_encode, parent_latents.shape)
+                    child_latents = parent_latents + float(config["plwm_sigma"]) * noise
 
-                # Decode -> repair -> convert to Levels
-                child_sequences = decode_latent_to_env(
-                    decoder_params, child_latents,
-                    rng_key=rng_decode,
-                    temperature=float(config["plwm_decode_temperature"]),
-                )  # (batch, 52)
-                child_sequences = jax.vmap(repair_cluttr_sequence)(child_sequences)
-                child_levels = jax.vmap(cluttr_sequence_to_level)(
-                    child_sequences,
-                    jax.random.split(rng_levels_key, config["num_train_envs"]),
-                )
+                    # Decode -> Level (with Gumbel-max sampling + repair)
+                    child_levels = decode_maze_latents(
+                        maze_decoder_params,
+                        child_latents,
+                        jax.random.split(rng_decode, config["num_train_envs"]),
+                        wall_threshold=0.5,
+                        temperature=float(config["plwm_decode_temperature"]),
+                    )
+                else:
+                    # ---- CLUTTR sequence VAE path (legacy, ≤50 walls) ----
+                    parent_seqs = jax.vmap(level_to_cluttr_sequence)(
+                        parent_levels.wall_map,
+                        parent_levels.goal_pos,
+                        parent_levels.agent_pos,
+                    )  # (batch, 52)
+
+                    parent_latents = encode_levels_to_latents(encoder_params, parent_seqs)
+
+                    noise = jax.random.normal(rng_encode, parent_latents.shape)
+                    child_latents = parent_latents + float(config["plwm_sigma"]) * noise
+
+                    child_sequences = decode_latent_to_env(
+                        decoder_params, child_latents,
+                        rng_key=rng_decode,
+                        temperature=float(config["plwm_decode_temperature"]),
+                    )
+                    child_sequences = jax.vmap(repair_cluttr_sequence)(child_sequences)
+                    child_levels = jax.vmap(cluttr_sequence_to_level)(
+                        child_sequences,
+                        jax.random.split(rng_levels_key, config["num_train_envs"]),
+                    )
             else:
                 parent_levels = train_state.replay_last_level_batch
                 child_levels = jax.vmap(mutate_level, (0, 0, None))(
@@ -1152,6 +1193,13 @@ if __name__=="__main__":
     group.add_argument("--plwm_decode_temperature", type=float, default=0.25,
                        help="Gumbel-max sampling temperature for PLWM decoder. "
                             "Lower = more deterministic. Default 0.25.")
+    group.add_argument("--plwm_use_maze_ae", action=argparse.BooleanOptionalAction, default=False,
+                       help="Use the grid-based CNN AE (SIGReg) instead of the CLUTTR sequence "
+                            "VAE for PLWM encoding/decoding. Requires --use_plwm_mutation. "
+                            "Supports any wall count (no 50-wall truncation).")
+    group.add_argument("--plwm_mae_checkpoint", type=str, default=None,
+                       help="Path to the MazeAE checkpoint pickle. Defaults to "
+                            "vae/model_maze_ae/checkpoint_final.pkl relative to project root.")
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===

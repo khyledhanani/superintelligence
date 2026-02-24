@@ -1,0 +1,51 @@
+# Grid-based CNN Autoencoder with SIGReg — trained on PLR buffer levels.
+#
+# Architecture: (13,13,3) grid -> Conv encoder -> z (latent_dim)
+#               z -> DeConv decoder -> wall_logits + goal_logits + agent_logits
+#
+# Latent regularization: SIGReg (Sketched Isotropic Gaussian Regularization)
+#   from LeJEPA (Balestriero & LeCun, 2025). Enforces z ~ N(0,I) via
+#   empirical characteristic functions along random projections.
+#   No KL term -> no posterior collapse. Full distribution matching.
+#
+# Paths (relative to working_path/vae_folder)
+
+working_path: "/cs/student/project_msc/2025/csml/kdhanani/superintelligence"
+vae_folder: "vae"
+dataset_path: "datasets/plr_pvl_dataset.npz"
+checkpoint_dir: "model_maze_ae"
+resume_path: null
+
+# Training
+seed: 42
+num_steps: 100000
+batch_size: 512
+learning_rate: 0.0003
+lr_decay_steps: 80000          # cosine decay starts here
+val_fraction: 0.05
+val_eval_size: 1024
+plot_freq: 500
+save_freq: 10000
+
+# Model
+latent_dim: 64
+height: 13
+width: 13
+
+# Reconstruction loss weights
+wall_pos_weight: 7.0           # upweight wall positives (walls are minority cells)
+wall_bce_weight: 1.0
+wall_dice_weight: 1.5
+goal_ce_weight: 2.0
+agent_ce_weight: 2.0
+overlap_penalty_weight: 0.5    # penalise goal/agent landing on same cell
+
+# SIGReg hyperparameters (LeJEPA)
+sigreg_weight: 0.05            # lambda — theory-practice tradeoff (paper recommends 0.05)
+sigreg_directions: 64          # M — number of random projection directions
+sigreg_t_points: 64            # T — discrete t values for integral approximation
+sigreg_t_max: 4.0              # integration range [-t_max, t_max]
+sigreg_warmup_steps: 2000      # pure reconstruction warmup before enabling SIGReg
+
+# Decoding thresholds (used during validation and PLWM)
+wall_threshold: 0.5
