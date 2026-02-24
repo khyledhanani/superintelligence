@@ -67,12 +67,21 @@ class CluttrVAE(nn.Module):
         logits = nn.Dense(CONFIG["vocab_size"])(d_out)
         
         return logits, mean, logvar
-
+    
+    #@nn.compact
+    #def decode(self, z):
+        # z: (latent_dim,) -> logits: (seq_len, vocab_size)
+        #z_seq  = jnp.tile(z[jnp.newaxis, :], (CONFIG["seq_len"], 1))[jnp.newaxis, :, :]
+        #d_out  = nn.Bidirectional(nn.RNN(nn.LSTMCell(400)), nn.RNN(nn.LSTMCell(400)))(z_seq)
+        #d_out  = nn.Bidirectional(nn.RNN(nn.LSTMCell(400)), nn.RNN(nn.LSTMCell(400)))(d_out)
+        #logits = nn.Dense(CONFIG["vocab_size"])(d_out)
+        
+        #return logits[0]  # (seq_len, vocab_size)
 # ==========================================
 # TRAINING UTILITIES
 # ==========================================
 def get_kl_weight(step):
-    return jnp.minimum(1.0, step / CONFIG["anneal_steps"])
+    return jnp.minimum(0.5, step / CONFIG["anneal_steps"])
 
 @jax.jit
 def eval_inference(state, batch, z_rng):
@@ -95,7 +104,13 @@ def train_step(state, batch, z_rng, kl_weight):
     def loss_fn(params):
         logits, mean, logvar = CluttrVAE().apply({'params': params}, batch, z_key, train =True, rngs={'dropout': dropout_key})
         labels_onehot = jax.nn.one_hot(batch, num_classes=CONFIG["vocab_size"])
-        recon_loss = optax.softmax_cross_entropy(logits, labels_onehot).mean()
+        per_token_loss = optax.softmax_cross_entropy(logits, labels_onehot)
+        weights = jnp.ones_like(per_token_loss)
+
+        recon_added_weight_factor = CONFIG['recon_added_weight_factor']
+        weights = weights.at[: -2:].set(recon_added_weight_factor)
+        #recon_loss = optax.softmax_cross_entropy(logits, labels_onehot).mean()
+        recon_loss = jnp.mean(per_token_loss*weights)
         kl_loss = -0.5 * jnp.mean(jnp.sum(1 + logvar - jnp.square(mean) - jnp.exp(logvar), axis=-1))
         weighted_reconstruction_loss = CONFIG["recon_weight"] * recon_loss
         total_loss = weighted_reconstruction_loss + (kl_weight * kl_loss)
