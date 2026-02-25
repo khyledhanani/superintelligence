@@ -1,21 +1,56 @@
+# ==========================================
+# CLUTTR VAE Training Configuration
+# ==========================================
+
+# --- Platform Selection ---
+# Set to "local" for UCL GPUs, "gcp" for GCP TPU/GPU
+platform: "local"  # "local" | "gcp"
+
+# --- Local Paths (UCL GPUs) ---
 working_path: "/cs/student/project_msc/2025/csml/rhautier"
 vae_folder: "vae"
-data_path: "datasets/training_200k_samples.npy"
-checkpoint_dir: "checkpoints_200k_samples"
-KL_recon_plot_name: "plot_200k_samples_training.png"
-resume_path: null
+
+# --- GCP Settings ---
+gcp_project: "your-gcp-project-id"
+gcp_bucket: "your-gcp-bucket-name"
+gcp_bucket_prefix: "vae"  # subfolder inside the bucket
+
+# --- Vertex AI Experiment Tracking ---
+vertex_experiment_name: "cluttr-vae-training"
+vertex_experiment_region: "us-central1"  # region where TPU is provisioned
+enable_vertex_tracking: true  # set false to disable experiment tracking
+
+# --- Data ---
+train_data_path: "datasets/new_train_200k_envs.npy"
+validation_data_path: "datasets/new_val_20k_envs.npy"
+checkpoint_dir: "checkpoints_200k_samples"  # legacy, now managed by RunManager
+KL_recon_plot_name: "plot.png"
+
+# --- Run Management ---
+# To start a new run: leave resume_run_id as null
+# To resume: set resume_run_id to the run folder name, e.g. "20250224_143052_lr5e-05_lat64"
+#   → RunManager loads the ORIGINAL config + latest checkpoint from that run
+resume_run_id: null
+run_tag: "baseline_reconloss_tune"  # optional tag appended to run ID, e.g. "baseline" → "20250224_143052_lr5e-05_lat64_baseline"
+
+# --- Training Hyperparameters ---
 num_steps: 500000
-batch_size: 32
+batch_size: 32          # per-device batch size
 learning_rate: 0.00005
 recon_weight: 500
-anneal_steps: 100000
+wall_weight: 1
+agent_goal_weight: 5
+recon_added_weight_factor: 1.0
+anneal_steps: 300000
 
-
-
+# --- Model Architecture ---
 embed_dim: 300
 vocab_size: 170
 latent_dim: 64
-scale_latent: True
+scale_latent: true
+
+# --- Logging / Saving ---
 plot_freq: 200
-save_freq: 5000
+save_freq: 10000
+eval_metric_freq: 10000
 seq_len: 52
