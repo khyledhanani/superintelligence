@@ -131,7 +131,9 @@ class CluttrVAE(nn.Module):
 
         #mean = jnp.tanh(self.mean_layer(h)) * 4.0
         mean = self.mean_layer(h)
-        logvar = self.logvar_layer(h)
+        # Clamp logvar to [-10, 10]: prevents exp(logvar) from overflowing and
+        # KL from exploding, especially on TPU where LSTMs can produce large values.
+        logvar = jnp.clip(self.logvar_layer(h), -10.0, 10.0)
         return mean, logvar
 
     def decode(self, z):
@@ -307,8 +309,11 @@ def run_training():
     global_batch_size = cfg["batch_size"] * n_devices
 
     # --- HYBRID SCALING FOR VAEs ---
-    # 1. DO scale the Learning Rate to match the larger global batch size
-    scaled_lr = cfg["learning_rate"] * math.sqrt(n_devices)
+    # NOTE: do NOT scale LR by sqrt(n_devices) for VAEs.
+    # With recon_weight=2000 and small early kl_weight, a higher LR causes the
+    # encoder to aggressively use the latent space before KL regularisation
+    # kicks in, sending KL into the thousands. Use the same LR as single-GPU.
+    scaled_lr = cfg["learning_rate"]
     
     # 2. DO NOT scale the steps. The VAE needs all 500k iterations to prevent collapse.
     scaled_num_steps = cfg["num_steps"]
