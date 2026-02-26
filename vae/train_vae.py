@@ -126,7 +126,8 @@ class CluttrVAE(nn.Module):
         bwd_out = outputs[:, :, 300:]
         h = jnp.concatenate([fwd_out[:, -1, :], bwd_out[:, 0, :]], axis=-1)
 
-        mean = jnp.tanh(self.mean_layer(h)) * 4.0
+        #mean = jnp.tanh(self.mean_layer(h)) * 4.0
+        mean = self.mean_layer(h)
         logvar = self.logvar_layer(h)
         return mean, logvar
 
