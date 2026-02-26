@@ -277,7 +277,7 @@ def train_step(state, batch, z_rng, kl_weight):
     (loss, (recon, kl)), grads = grad_fn(state.params)
 
     # Multi-device: average gradients across devices
-    #grads = jax.lax.pmean(grads, axis_name="batch")
+    grads = jax.lax.pmean(grads, axis_name="batch")
 
     state = state.apply_gradients(grads=grads)
     return state, loss, recon, kl
