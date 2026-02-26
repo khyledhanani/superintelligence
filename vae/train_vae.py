@@ -300,10 +300,6 @@ def run_training():
     # NOT the current vae_train_config.yml — this ensures consistency).
     cfg = effective_config
 
-    
-
-    global_batch_size = cfg["batch_size"] * n_devices
-
 
     global_batch_size = cfg["batch_size"] * n_devices
 
