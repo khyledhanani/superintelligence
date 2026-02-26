@@ -305,12 +305,14 @@ def run_training():
     global_batch_size = cfg["batch_size"] * n_devices
 
 
-    scaled_lr = cfg["learning_rate"]*math.sqrt(n_devices)
-    # 2. Scale Steps (Process the same total amount of data)
-    scaled_num_steps = max(1, cfg["num_steps"] // n_devices)
-    scaled_anneal_steps = max(1, cfg["anneal_steps"] // n_devices)
+    global_batch_size = cfg["batch_size"] * n_devices
+
+    # --- VAE FIX: Do NOT scale LR or Steps. VAEs need the iterations! ---
+    scaled_lr = cfg["learning_rate"]
+    scaled_num_steps = cfg["num_steps"]
+    scaled_anneal_steps = cfg["anneal_steps"]
     
-    # 3. Scale logging/plotting frequencies so you get the same number of plots
+    # 3. Scale logging/plotting frequencies so the TPU doesn't stall on I/O
     scaled_plot_freq = max(1, cfg["plot_freq"] // n_devices)
     scaled_save_freq = max(1, cfg["save_freq"] // n_devices)
     scaled_log_freq = max(1, 100 // n_devices)
