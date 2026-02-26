@@ -303,15 +303,18 @@ def run_training():
 
     global_batch_size = cfg["batch_size"] * n_devices
 
-    # --- VAE FIX: Do NOT scale LR or Steps. VAEs need the iterations! ---
-    scaled_lr = cfg["learning_rate"]
+    # --- HYBRID SCALING FOR VAEs ---
+    # 1. DO scale the Learning Rate to match the larger global batch size
+    scaled_lr = cfg["learning_rate"] * math.sqrt(n_devices)
+    
+    # 2. DO NOT scale the steps. The VAE needs all 500k iterations to prevent collapse.
     scaled_num_steps = cfg["num_steps"]
     scaled_anneal_steps = cfg["anneal_steps"]
     
-    # 3. Scale logging/plotting frequencies so the TPU doesn't stall on I/O
-    scaled_plot_freq = max(1, cfg["plot_freq"] // n_devices)
-    scaled_save_freq = max(1, cfg["save_freq"] // n_devices)
-    scaled_log_freq = max(1, 100 // n_devices)
+    # 3. DO NOT scale the logging frequencies, since we are running the full 500k steps.
+    scaled_plot_freq = cfg["plot_freq"]
+    scaled_save_freq = cfg["save_freq"]
+    scaled_log_freq = 100
 
     tracker = ExperimentTracker(cfg)
     print(f"[Training] Run: {run_id}")
@@ -451,7 +454,7 @@ def run_training():
     }
 
     EVAL_METRIC_FREQ = cfg.get("eval_metric_freq", 10000)
-    scaled_eval_metric_freq = max(1, EVAL_METRIC_FREQ // n_devices)
+    scaled_eval_metric_freq = max(1, EVAL_METRIC_FREQ)
 
     # --- Create figure: 7 subplots ---
     fig, axes = plt.subplots(7, 1, figsize=(12, 35), sharex=True)
