@@ -43,6 +43,10 @@ agent_goal_weight: 5
 recon_added_weight_factor: 1.0
 anneal_steps: 300000
 
+# --- Dataset parameters ---
+algo_data_path: 'datasets/algo_mazes_50_walls.npy'
+algo_mix_ratio: 0.10 #0.1 for 10% of the full dataset to be from algo mazes
+
 # --- Model Architecture ---
 embed_dim: 300
 vocab_size: 170

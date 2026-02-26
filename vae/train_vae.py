@@ -332,11 +332,39 @@ def run_training():
         return
 
     dataset_np = io.load_npy(cfg["train_data_path"])
+    total_size = len(dataset_np)
     print(f"Loaded Train dataset: {dataset_np.shape}")
 
     val_dataset_np = io.load_npy(cfg["validation_data_path"])
     val_dataset_small_np = val_dataset_np[:1000]
     print(f"Loaded Val dataset (subset): {val_dataset_small_np.shape}")
+
+
+    # --- Adding algorithmetically generated mazes within the training data --- #
+    algo_mix_ratio = cfg.get("algo_mix_ratio", 0.0)
+
+    if algo_mix_ratio > 0.0:
+        if not io.exists(cfg["algo_data_path"]):
+            print(f"Error: Algo data not found at {cfg['algo_data_path']}")
+            return
+            
+        algo_dataset_full = io.load_npy(cfg["algo_data_path"])
+        
+        # Calculate exactly how many samples we need
+        num_algo = int(total_size * algo_mix_ratio)
+        num_std = total_size - num_algo
+        
+        print(f"[Data] Mixing {algo_mix_ratio*100}% algorithmically generated mazes.")
+        print(f"[Data] Keeping {num_std} standard | Injecting {num_algo} algo")
+        
+        # Take the first N from standard, and the first N from algo
+        std_part = dataset_np[:num_std]
+        algo_part = algo_dataset_full[:num_algo]
+        
+        # Combine them to restore the dataset to exactly total_size (e.g. 200k)
+        dataset_np = np.concatenate([std_part, algo_part], axis=0)
+        np.random.shuffle(dataset_np)
+
 
     # ------------------------------------------------------------------
     # 2. Shard data across devices
