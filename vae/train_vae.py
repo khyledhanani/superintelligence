@@ -309,15 +309,24 @@ def run_training():
     global_batch_size = cfg["batch_size"] * n_devices
 
     # --- HYBRID SCALING FOR VAEs ---
-    # NOTE: do NOT scale LR by sqrt(n_devices) for VAEs.
-    # With recon_weight=2000 and small early kl_weight, a higher LR causes the
-    # encoder to aggressively use the latent space before KL regularisation
-    # kicks in, sending KL into the thousands. Use the same LR as single-GPU.
+    # LR: do NOT scale by sqrt(n_devices). A higher LR causes the encoder to
+    # over-use the latent space before KL regularisation kicks in → KL explosion.
     scaled_lr = cfg["learning_rate"]
-    
+
+    # anneal_steps: divide by n_devices to keep the KL-weight ramp identical
+    # per data-sample seen (not per gradient step).
+    #
+    # Derivation:
+    #   GPU  samples to reach beta_max = anneal_steps_gpu × batch_per_device
+    #   TPU  samples to reach beta_max = anneal_steps_tpu × (n_devices × batch)
+    #   Setting equal: anneal_steps_tpu = anneal_steps_gpu / n_devices
+    #
+    # beta_max is NOT scaled — the final regularisation strength is the same.
+    scaled_beta_max     = cfg.get("beta_max", 0.5)
+    scaled_anneal_steps = cfg["anneal_steps"] // n_devices
+
     # 2. DO NOT scale the steps. The VAE needs all 500k iterations to prevent collapse.
     scaled_num_steps = cfg["num_steps"]
-    scaled_anneal_steps = cfg["anneal_steps"]
     
     # 3. DO NOT scale the logging frequencies, since we are running the full 500k steps.
     scaled_plot_freq = cfg["plot_freq"]
@@ -498,8 +507,7 @@ def run_training():
             batch = shard_batch(dataset_np[idx])
 
             key, z_rng = jax.random.split(key)
-            beta_max = cfg.get("beta_max", 0.5)
-            kl_w = get_kl_weight(step, scaled_anneal_steps, beta_max=beta_max)
+            kl_w = get_kl_weight(step, scaled_anneal_steps, beta_max=scaled_beta_max)
 
             state, loss, recon, kl = sharded_train_step_jit(state, batch, z_rng, kl_w)
 
