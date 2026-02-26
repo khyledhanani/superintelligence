@@ -205,8 +205,8 @@ def interpolate_latent(params, z1, z2, n_steps=10):
 # ==========================================
 # TRAINING UTILITIES
 # ==========================================
-def get_kl_weight(step, scaled_anneal_steps):
-    return jnp.minimum(0.5, step / scaled_anneal_steps)
+def get_kl_weight(step, scaled_anneal_steps, beta_max = 0.5):
+    return jnp.minimum(beta_max, (step / scaled_anneal_steps)*beta_max)
 
 
 @jax.jit
@@ -470,7 +470,8 @@ def run_training():
             batch = shard_batch(dataset_np[idx])
 
             key, z_rng = jax.random.split(key)
-            kl_w = get_kl_weight(step, scaled_anneal_steps)
+            beta_max = cfg.get("beta_max", 0.5)
+            kl_w = get_kl_weight(step, scaled_anneal_steps, beta_max=beta_max)
 
             state, loss, recon, kl = train_step(state, batch, z_rng, kl_w)
 

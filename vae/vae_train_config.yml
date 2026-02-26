@@ -31,7 +31,7 @@ KL_recon_plot_name: "plot.png"
 # To resume: set resume_run_id to the run folder name, e.g. "20250224_143052_lr5e-05_lat64"
 #   → RunManager loads the ORIGINAL config + latest checkpoint from that run
 resume_run_id: null
-run_tag: "baseline_reconloss_tune"  # optional tag appended to run ID, e.g. "baseline" → "20250224_143052_lr5e-05_lat64_baseline"
+run_tag: "baseline_weighted_reconloss_tune"  # optional tag appended to run ID, e.g. "baseline" → "20250224_143052_lr5e-05_lat64_baseline"
 
 # --- Training Hyperparameters ---
 num_steps: 500000
@@ -41,11 +41,12 @@ recon_weight: 500
 wall_weight: 1
 agent_goal_weight: 5
 recon_added_weight_factor: 1.0
+beta_max: 2
 anneal_steps: 300000
 
 # --- Dataset parameters ---
 algo_data_path: 'datasets/algo_mazes_50_walls.npy'
-algo_mix_ratio: 0.10 #0.1 for 10% of the full dataset to be from algo mazes
+algo_mix_ratio: 0.0 #0.1 for 10% of the full dataset to be from algo mazes
 
 # --- Model Architecture ---
 embed_dim: 300
@@ -54,7 +55,7 @@ latent_dim: 64
 scale_latent: true
 
 # --- Logging / Saving ---
-plot_freq: 200
-save_freq: 10000
+plot_freq: 1600
+save_freq: 1250
 eval_metric_freq: 10000
 seq_len: 52
