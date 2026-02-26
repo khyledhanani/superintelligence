@@ -32,6 +32,9 @@ import matplotlib.pyplot as plt
 from flax import linen as nn
 from flax.training import train_state
 from tqdm.auto import tqdm
+from jax.experimental.shard_map import shard_map
+import functools
+from jax.experimental.shard_map import shard_map
 
 from utils import evaluate_cluttr_metrics, compute_latent_stats
 from gcp_io import IOManager
@@ -242,7 +245,6 @@ def eval_loss_step(state, batch, z_rng):
     return recon_loss, kl_loss
 
 
-@jax.jit
 def train_step(state, batch, z_rng, kl_weight):
     z_key, dropout_key = jax.random.split(z_rng)
 
@@ -255,16 +257,9 @@ def train_step(state, batch, z_rng, kl_weight):
         per_token_loss = optax.softmax_cross_entropy(logits, labels_onehot)
 
         weights = jnp.ones_like(per_token_loss)
-        
-        # introduce downweight/upweight recon loss weighting of walls vs agent/goal
         weights = weights.at[:, :-2].set(CONFIG['wall_weight'])
         weights = weights.at[:, -2:].set(CONFIG['agent_goal_weight'])
-        weights = weights / jnp.mean(weights, axis = -1, keepdims = True)
-
-        #recon_added_weight_factor = CONFIG["recon_added_weight_factor"]
-        # FIX: was weights.at[:-2:] which slices batch dim.
-        # Correct: [:, :-2] to weight the wall tokens (all but last 2 in seq).
-        #weights = weights.at[:, :-2].set(recon_added_weight_factor)
+        weights = weights / jnp.mean(weights, axis=-1, keepdims=True)
 
         recon_loss = jnp.mean(per_token_loss * weights)
         kl_loss = -0.5 * jnp.mean(
@@ -276,9 +271,15 @@ def train_step(state, batch, z_rng, kl_weight):
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, (recon, kl)), grads = grad_fn(state.params)
 
-    # Multi-device: average gradients across devices
-    # This maps pmean over every single array in your gradient dictionary
-    grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "batch"), grads)
+    # --- THE COLLECTIVE OPERATION ---
+    # Now that we'll use shard_map, 'batch' is a valid axis name!
+    grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), grads)
+
+    # Also average scalar losses across devices so logged values are global averages,
+    # not just one device's local-batch estimate.
+    loss  = jax.lax.pmean(loss,  axis_name="batch")
+    recon = jax.lax.pmean(recon, axis_name="batch")
+    kl    = jax.lax.pmean(kl,    axis_name="batch")
 
     state = state.apply_gradients(grads=grads)
     return state, loss, recon, kl
@@ -462,6 +463,26 @@ def run_training():
     fig, axes = plt.subplots(7, 1, figsize=(12, 35), sharex=True)
     ax_kl, ax_recon, ax_pct, ax_wall_err, ax_wall_iou, ax_latent, ax_active = axes
 
+    # --- DEFINE SHARDED STEP HERE ---
+    # Put this right before the 'with mesh:' or 'for step in progress_bar'
+    sharded_train_step = shard_map(
+        train_step,
+        mesh=mesh,
+        in_specs=(
+            P(),        # state: replicated across all devices
+            P("batch"), # batch: sharded across the 'batch' axis of the mesh
+            P(),        # z_rng: replicated
+            P()         # kl_weight: replicated
+        ),
+        out_specs=(P(), P(), P(), P()), # loss, recon, kl are returned as replicated values
+        check_rep=False
+    )
+    
+    # JIT the sharded function so it's fast
+    sharded_train_step_jit = jax.jit(sharded_train_step)
+
+
+
     progress_bar = tqdm(range(start_step, scaled_num_steps), desc=f"Training [{run_id}]")
 
     with mesh:
@@ -475,7 +496,7 @@ def run_training():
             beta_max = cfg.get("beta_max", 0.5)
             kl_w = get_kl_weight(step, scaled_anneal_steps, beta_max=beta_max)
 
-            state, loss, recon, kl = train_step(state, batch, z_rng, kl_w)
+            state, loss, recon, kl = sharded_train_step_jit(state, batch, z_rng, kl_w)
 
             recon_f = float(recon)
             kl_f = float(kl)
