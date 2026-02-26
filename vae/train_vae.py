@@ -477,7 +477,7 @@ def run_training():
             key, z_rng = jax.random.split(key)
             kl_w = get_kl_weight(step, scaled_anneal_steps, beta_max=scaled_beta_max)
 
-            state, loss, recon, kl = train_step_jit(state, batch, z_rng, kl_w)
+            state, loss, recon, kl = train_step(state, batch, z_rng, kl_w)
 
             recon_f = float(recon)
             kl_f = float(kl)
