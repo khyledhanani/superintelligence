@@ -17,7 +17,7 @@ Changes from original:
   8. New metrics: per-token accuracy, wall IoU, duplicate walls, latent stats.
   9. New plots: latent diagnostics (active units, mean/std distributions).
 """
-
+import math
 import jax
 import jax.numpy as jnp
 import optax
@@ -205,8 +205,8 @@ def interpolate_latent(params, z1, z2, n_steps=10):
 # ==========================================
 # TRAINING UTILITIES
 # ==========================================
-def get_kl_weight(step):
-    return jnp.minimum(0.5, step / CONFIG["anneal_steps"])
+def get_kl_weight(step, scaled_anneal_steps):
+    return jnp.minimum(0.5, step / scaled_anneal_steps)
 
 
 @jax.jit
@@ -300,9 +300,22 @@ def run_training():
     # NOT the current vae_train_config.yml — this ensures consistency).
     cfg = effective_config
 
-    tracker = ExperimentTracker(cfg)
+    
 
     global_batch_size = cfg["batch_size"] * n_devices
+
+
+    scaled_lr = cfg["learning_rate"]*math.sqrt(n_devices)
+    # 2. Scale Steps (Process the same total amount of data)
+    scaled_num_steps = max(1, cfg["num_steps"] // n_devices)
+    scaled_anneal_steps = max(1, cfg["anneal_steps"] // n_devices)
+    
+    # 3. Scale logging/plotting frequencies so you get the same number of plots
+    scaled_plot_freq = max(1, cfg["plot_freq"] // n_devices)
+    scaled_save_freq = max(1, cfg["save_freq"] // n_devices)
+    scaled_log_freq = max(1, 100 // n_devices)
+
+    tracker = ExperimentTracker(cfg)
     print(f"[Training] Run: {run_id}")
     print(f"[Training] Per-device batch: {cfg['batch_size']} | "
           f"Global batch: {global_batch_size} | Devices: {n_devices}")
@@ -402,7 +415,8 @@ def run_training():
     state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=params,
-        tx=optax.adam(cfg["learning_rate"]),
+        #tx=optax.adam(cfg["learning_rate"]),
+        tx=optax.adam(scaled_lr)
     )
 
     # ------------------------------------------------------------------
@@ -439,12 +453,13 @@ def run_training():
     }
 
     EVAL_METRIC_FREQ = cfg.get("eval_metric_freq", 10000)
+    scaled_eval_metric_freq = max(1, EVAL_METRIC_FREQ // n_devices)
 
     # --- Create figure: 7 subplots ---
     fig, axes = plt.subplots(7, 1, figsize=(12, 35), sharex=True)
     ax_kl, ax_recon, ax_pct, ax_wall_err, ax_wall_iou, ax_latent, ax_active = axes
 
-    progress_bar = tqdm(range(start_step, cfg["num_steps"]), desc=f"Training [{run_id}]")
+    progress_bar = tqdm(range(start_step, scaled_num_steps), desc=f"Training [{run_id}]")
 
     with mesh:
         for step in progress_bar:
@@ -454,7 +469,7 @@ def run_training():
             batch = shard_batch(dataset_np[idx])
 
             key, z_rng = jax.random.split(key)
-            kl_w = get_kl_weight(step)
+            kl_w = get_kl_weight(step, scaled_anneal_steps)
 
             state, loss, recon, kl = train_step(state, batch, z_rng, kl_w)
 
@@ -466,19 +481,19 @@ def run_training():
             history["steps"].append(step)
 
             # Vertex AI time-series (every 100 steps)
-            if step % 100 == 0:
+            if step % scaled_log_freq == 0:
                 tracker.log_time_series_metrics(
                     {"train_recon_loss": recon_f, "train_kl_loss": kl_f},
                     step=step,
                 )
 
             # --- METRICS EVALUATION (slow, infrequent) ---
-            if step % EVAL_METRIC_FREQ == 0 and step > 0:
+            if step % scaled_eval_metric_freq == 0 and step > 0:
                 train_preds = eval_inference(state, dataset_jnp_1k, z_rng)
                 val_preds = eval_inference(state, val_dataset_small, z_rng)
 
                 # Run reachability check every 5th metric eval (expensive)
-                do_reachability = (step % (EVAL_METRIC_FREQ * 5) == 0)
+                do_reachability = (step % (scaled_eval_metric_freq * 5) == 0)
 
                 train_m = evaluate_cluttr_metrics(
                     dataset_np[:1000], np.array(train_preds), pad_token=0,
@@ -522,7 +537,7 @@ def run_training():
                 }, step=step)
 
             # --- VALIDATION LOSS + PLOTTING ---
-            if step % cfg["plot_freq"] == 0 and step > 0:
+            if step % scaled_plot_freq == 0 and step > 0:
                 val_recon, val_kl = eval_loss_step(state, val_dataset_small, z_rng)
                 val_recon_f = float(val_recon)
                 val_kl_f = float(val_kl)
@@ -664,7 +679,7 @@ def run_training():
                 rm.save_plot(fig)
 
             # --- Checkpoint ---
-            if step % cfg["save_freq"] == 0 and step > 0:
+            if step % scaled_save_freq == 0 and step > 0:
                 rm.save_checkpoint(state, step)
 
     # --- Final save ---
