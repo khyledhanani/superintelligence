@@ -4,7 +4,7 @@
 
 # --- Platform Selection ---
 # Set to "local" for UCL GPUs, "gcp" for GCP TPU/GPU
-platform: "gcp"  # "local" | "gcp"
+platform: "local"  # "local" | "gcp"
 
 # --- Local Paths (UCL GPUs) ---
 working_path: "/cs/student/project_msc/2025/csml/rhautier"
@@ -30,18 +30,18 @@ KL_recon_plot_name: "plot.png"
 # To resume: set resume_run_id to the run folder name, e.g. "20250224_143052_lr5e-05_lat64"
 #   → RunManager loads the ORIGINAL config + latest checkpoint from that run
 resume_run_id: null
-run_tag: "test_baseline_weighted_recon_model"  # optional tag appended to run ID, e.g. "baseline" → "20250224_143052_lr5e-05_lat64_baseline"
+run_tag: "baseline_weighted_recon_model_algo_mazes_10pc"  # optional tag appended to run ID, e.g. "baseline" → "20250224_143052_lr5e-05_lat64_baseline"
 
 # --- Training Hyperparameters ---
 num_steps: 500000
 batch_size: 32          # per-device batch size
-learning_rate: 0.0001
-recon_weight: 2000
+learning_rate: 0.00005
+recon_weight: 500
 wall_weight: 1
 agent_goal_weight: 5
 recon_added_weight_factor: 1.0
-beta_max: 2
-anneal_steps: 30000
+beta_max: 0.5
+anneal_steps: 300000
 
 # --- Dataset parameters ---
 algo_data_path: 'datasets/algo_mazes_50_walls.npy'
@@ -55,6 +55,6 @@ scale_latent: true
 
 # --- Logging / Saving ---
 plot_freq: 1000
-save_freq: 20000
-eval_metric_freq: 20000
+save_freq: 10000
+eval_metric_freq: 5000
 seq_len: 52
