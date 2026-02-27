@@ -338,6 +338,7 @@ def run_training():
         "anneal_steps": cfg["anneal_steps"],
         "n_devices": n_devices,
         "platform": cfg["platform"],
+        "max_grad_norm": cfg.get("max_grad_norm", 1.0),
     })
 
     # ------------------------------------------------------------------
@@ -418,11 +419,17 @@ def run_training():
 
     params = jax.device_put(params, replicated_sharding)
 
+    max_grad_norm = cfg.get("max_grad_norm", 1.0)
+    print(f"[Training] Optimizer: Adam (lr={scaled_lr}) with Global Norm Clipping (max={max_grad_norm})")
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        optax.adam(scaled_lr)
+    )
+
     state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=params,
-        #tx=optax.adam(cfg["learning_rate"]),
-        tx=optax.adam(scaled_lr)
+        tx=optimizer
     )
 
     # ------------------------------------------------------------------
