@@ -35,13 +35,13 @@ run_tag: "test_baseline_weighted_recon_model"  # optional tag appended to run ID
 # --- Training Hyperparameters ---
 num_steps: 500000
 batch_size: 32          # per-device batch size
-learning_rate: 0.0001
-recon_weight: 2000
+learning_rate: 0.00005
+recon_weight: 500
 wall_weight: 1
 agent_goal_weight: 5
 recon_added_weight_factor: 1.0
-beta_max: 2
-anneal_steps: 30000
+beta_max: 0.5
+anneal_steps: 300000
 
 # --- Dataset parameters ---
 algo_data_path: 'datasets/algo_mazes_50_walls.npy'
