@@ -55,6 +55,6 @@ scale_latent: true
 
 # --- Logging / Saving ---
 plot_freq: 1000
-save_freq: 10000
+save_freq: 20000
 eval_metric_freq: 5000
 seq_len: 52
