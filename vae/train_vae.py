@@ -127,11 +127,11 @@ class CluttrVAE(nn.Module):
         bwd_out = outputs[:, :, 300:]
         h = jnp.concatenate([fwd_out[:, -1, :], bwd_out[:, 0, :]], axis=-1)
 
-        #mean = jnp.tanh(self.mean_layer(h)) * 4.0
-        mean = self.mean_layer(h)
+        mean = jnp.tanh(self.mean_layer(h)) * 6.0
+        #mean = self.mean_layer(h)
         # Clamp logvar to [-10, 10]: prevents exp(logvar) from overflowing and
         # KL from exploding, especially on TPU where LSTMs can produce large values.
-        logvar = jnp.clip(self.logvar_layer(h), -10.0, 10.0)
+        logvar = jnp.clip(self.logvar_layer(h), -10.0, 4)
         return mean, logvar
 
     def decode(self, z):
