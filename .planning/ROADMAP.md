@@ -43,7 +43,11 @@ Plans:
   2. k-NN novelty scoring over the full buffer (up to 4000 entries) runs inside `jax.jit` without ConcretizationTypeError and returns a scalar novelty score for any candidate behavior signature
   3. Composite fitness F = α·Regret + β·Novelty is computed correctly: given known regret and novelty values, the output matches α*regret + β*novelty with configurable weights
   4. The modular ES interface defines `ask(state, rng) -> (candidates, state)` and `tell(state, candidates, fitness) -> state`; the existing CMA-ES wraps behind this interface and runs without behavioral changes
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 02-01-PLAN.md — ES interface: ESStrategy Protocol + CMAESStrategy wrapper (INFRA-01)
+- [ ] 02-02-PLAN.md — k-NN novelty + composite fitness pure functions (INFRA-03, INFRA-04)
+- [ ] 02-03-PLAN.md — Buffer behavior_sig integration + integration tests (INFRA-02)
 
 ### Phase 3: NS-ES Integration
 **Goal**: A complete end-to-end training run executes with NS-ES providing environments via composite fitness, the archive initializes from warm-up before training, and metrics appear in WandB
@@ -87,7 +91,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation | 2/2 | Complete | 2026-02-28 |
-| 2. Buffer and Fitness Infrastructure | 0/TBD | Not started | - |
+| 2. Buffer and Fitness Infrastructure | 0/3 | Not started | - |
 | 3. NS-ES Integration | 0/TBD | Not started | - |
 | 4. Behavioral SV-CMA-ES | 0/TBD | Not started | - |
 | 5. Ablations and Analysis | 0/TBD | Not started | - |
