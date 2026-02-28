@@ -35,6 +35,7 @@ Progress: [████░░░░░░] 40%
 - Trend: Consistent ~8 min/plan
 
 *Updated after each plan completion*
+| Phase 02-buffer-and-fitness-infrastructure P01 | 3 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -55,6 +56,8 @@ Recent decisions affecting current work:
 - [02-02]: k=5 nearest neighbors as default for novelty k-NN; k is static (functools.partial + static_argnames) so JAX compiles without retracing per value
 - [02-02]: No normalization in compute_fitness — raw combination F = alpha*regret + beta*novelty; caller negates before passing to evosax (which minimizes)
 - [02-02]: alpha and beta are plain Python floats (not JAX arrays) — avoids JAX state management complexity, matches ES config dict structure planned for Phase 3
+- [Phase 02-buffer-and-fitness-infrastructure]: evosax CMA_ES.init() requires 3 args (key, mean, params); mean sets distribution center; plan comment was incorrect
+- [Phase 02-buffer-and-fitness-infrastructure]: CMAESStrategy stores es_params inside state dict — callers never touch evosax internals, clean Protocol surface
 
 ### Pending Todos
 
@@ -70,5 +73,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 02-02-PLAN.md (Novelty scoring and fitness function)
+Stopped at: Completed 02-01-PLAN.md (ES strategy interface and CMAESStrategy wrapper)
 Resume file: None
