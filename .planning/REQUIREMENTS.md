@@ -15,7 +15,7 @@ Requirements for initial release. Each maps to roadmap phases.
 ### ES Infrastructure
 
 - [x] **INFRA-01**: Modular ES strategy interface with ask/tell API supporting swappable algorithms
-- [ ] **INFRA-02**: Replay buffer extended with `behavior_sig` field per level via `level_extra`
+- [x] **INFRA-02**: Replay buffer extended with `behavior_sig` field per level via `level_extra`
 - [x] **INFRA-03**: Composite fitness function F = α·Regret + β·Novelty with configurable weights
 - [x] **INFRA-04**: k-NN novelty scoring against buffer behavior signatures (pure JAX, JIT-compatible)
 
@@ -72,7 +72,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FOUND-01 | Phase 1 | Complete |
 | FOUND-02 | Phase 1 | Complete |
 | INFRA-01 | Phase 2 | Complete |
-| INFRA-02 | Phase 2 | Pending |
+| INFRA-02 | Phase 2 | Complete |
 | INFRA-03 | Phase 2 | Complete |
 | INFRA-04 | Phase 2 | Complete |
 | ALGO-01 | Phase 3 | Pending |

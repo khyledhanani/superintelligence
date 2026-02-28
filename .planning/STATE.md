@@ -10,32 +10,33 @@ See: .planning/PROJECT.md (updated 2026-02-26)
 ## Current Position
 
 Phase: 2 of 5 (Buffer and Fitness Infrastructure)
-Plan: 2 of 2 in current phase
-Status: In progress
-Last activity: 2026-02-28 — Completed 02-02 (Novelty scoring and fitness function)
+Plan: 3 of 3 in current phase
+Status: Complete
+Last activity: 2026-02-28 — Completed 02-03 (Buffer wiring and integration tests)
 
-Progress: [████░░░░░░] 40%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: 8 min
-- Total execution time: 0.52 hours
+- Total plans completed: 5
+- Average duration: 6 min
+- Total execution time: 0.55 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-foundation | 2 | 13 min | 7 min |
-| 02-buffer-and-fitness-infrastructure | 2 | 18 min | 9 min |
+| 02-buffer-and-fitness-infrastructure | 3 | 20 min | 7 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (10 min), 01-02 (3 min), 02-01 (~10 min), 02-02 (8 min)
-- Trend: Consistent ~8 min/plan
+- Last 5 plans: 01-02 (3 min), 02-01 (~10 min), 02-02 (8 min), 02-03 (2 min)
+- Trend: Fast execution for well-specified plans
 
 *Updated after each plan completion*
 | Phase 02-buffer-and-fitness-infrastructure P01 | 3 | 2 tasks | 3 files |
+| Phase 02-buffer-and-fitness-infrastructure P03 | 2 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -58,6 +59,8 @@ Recent decisions affecting current work:
 - [02-02]: alpha and beta are plain Python floats (not JAX arrays) — avoids JAX state management complexity, matches ES config dict structure planned for Phase 3
 - [Phase 02-buffer-and-fitness-infrastructure]: evosax CMA_ES.init() requires 3 args (key, mean, params); mean sets distribution center; plan comment was incorrect
 - [Phase 02-buffer-and-fitness-infrastructure]: CMAESStrategy stores es_params inside state dict — callers never touch evosax internals, clean Protocol surface
+- [02-03]: Only one insert_batch call in train.py (NEW/mutate branch); REPLAY branch uses update_batch — assertion guard applied only at insert_batch site
+- [02-03]: behavior_sig missing from level_extra at insertion is INTENTIONAL in Phase 2; assert is API contract for Phase 3 (which adds behavior_sig extraction)
 
 ### Pending Todos
 
@@ -73,5 +76,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 02-01-PLAN.md (ES strategy interface and CMAESStrategy wrapper)
+Stopped at: Completed 02-03-PLAN.md (Buffer wiring and Phase 2 integration tests)
 Resume file: None

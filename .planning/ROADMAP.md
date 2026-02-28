@@ -13,7 +13,7 @@ This roadmap extends the existing ACCEL UED codebase with behavioral diversity m
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Foundation** - Verified baseline agent and JAX-native behavior signature extraction
-- [ ] **Phase 2: Buffer and Fitness Infrastructure** - Enhanced buffer, k-NN novelty scoring, composite fitness, modular ES interface
+- [x] **Phase 2: Buffer and Fitness Infrastructure** - Enhanced buffer, k-NN novelty scoring, composite fitness, modular ES interface
 - [ ] **Phase 3: NS-ES Integration** - First end-to-end ES with composite fitness, archive warm-up, two-bucket sampling wired in (MVP)
 - [ ] **Phase 4: Behavioral SV-CMA-ES** - N-particle CMA-ES with Stein repulsion in behavior space (primary thesis contribution)
 - [ ] **Phase 5: Ablations and Analysis** - Fitness weight sweeps, regret curve comparisons across all three methods
@@ -45,9 +45,9 @@ Plans:
   4. The modular ES interface defines `ask(state, rng) -> (candidates, state)` and `tell(state, candidates, fitness) -> state`; the existing CMA-ES wraps behind this interface and runs without behavioral changes
 **Plans**: 3 plans
 Plans:
-- [ ] 02-01-PLAN.md — ES interface: ESStrategy Protocol + CMAESStrategy wrapper (INFRA-01)
-- [ ] 02-02-PLAN.md — k-NN novelty + composite fitness pure functions (INFRA-03, INFRA-04)
-- [ ] 02-03-PLAN.md — Buffer behavior_sig integration + integration tests (INFRA-02)
+- [x] 02-01-PLAN.md — ES interface: ESStrategy Protocol + CMAESStrategy wrapper (INFRA-01)
+- [x] 02-02-PLAN.md — k-NN novelty + composite fitness pure functions (INFRA-03, INFRA-04)
+- [x] 02-03-PLAN.md — Buffer behavior_sig integration + integration tests (INFRA-02)
 
 ### Phase 3: NS-ES Integration
 **Goal**: A complete end-to-end training run executes with NS-ES providing environments via composite fitness, the archive initializes from warm-up before training, and metrics appear in WandB
@@ -91,7 +91,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation | 2/2 | Complete | 2026-02-28 |
-| 2. Buffer and Fitness Infrastructure | 1/3 | In Progress|  |
+| 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
 | 3. NS-ES Integration | 0/TBD | Not started | - |
 | 4. Behavioral SV-CMA-ES | 0/TBD | Not started | - |
 | 5. Ablations and Analysis | 0/TBD | Not started | - |
