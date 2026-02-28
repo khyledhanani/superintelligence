@@ -9,7 +9,7 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Foundation
 
-- [ ] **FOUND-01**: Agent PPO/ACCEL training verified to match DCD repo implementation
+- [x] **FOUND-01**: Agent PPO/ACCEL training verified to match DCD repo implementation
 - [ ] **FOUND-02**: Behavior signature vector extracted from agent rollout on any level (visit-count histogram over grid cells, JAX-compatible)
 
 ### ES Infrastructure
@@ -69,7 +69,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FOUND-01 | Phase 1 | Pending |
+| FOUND-01 | Phase 1 | Complete |
 | FOUND-02 | Phase 1 | Pending |
 | INFRA-01 | Phase 2 | Pending |
 | INFRA-02 | Phase 2 | Pending |

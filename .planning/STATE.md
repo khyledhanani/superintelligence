@@ -10,27 +10,27 @@ See: .planning/PROJECT.md (updated 2026-02-26)
 ## Current Position
 
 Phase: 1 of 5 (Foundation)
-Plan: 0 of TBD in current phase
-Status: Ready to plan
-Last activity: 2026-02-27 — Roadmap created from research summary and requirements
+Plan: 1 of TBD in current phase
+Status: In progress
+Last activity: 2026-02-28 — Completed 01-01 (ACCEL agent verification and smoke test)
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 5%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
-- Average duration: -
-- Total execution time: 0 hours
+- Total plans completed: 1
+- Average duration: 10 min
+- Total execution time: 0.17 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 01-foundation | 1 | 10 min | 10 min |
 
 **Recent Trend:**
-- Last 5 plans: -
+- Last 5 plans: 01-01 (10 min)
 - Trend: -
 
 *Updated after each plan completion*
@@ -46,6 +46,10 @@ Recent decisions affecting current work:
 - [Pre-phase]: Unified buffer as replay + novelty archive — eliminates redundant data structures
 - [Pre-phase]: Modular ES interface — need to test CMA-ES / NS-ES / SV-CMA-ES; NS-ES is MVP first
 - [Pre-phase]: JAX-first — all new code must be JIT-compatible; no scikit-learn or FAISS
+- [01-01]: gae_lambda=0.98 classified potential-bug (DCD uses 0.95); monitor training stability
+- [01-01]: entropy_coeff=1e-3 classified intentional (DCD uses 0.0); promotes exploration in sparse-reward maze
+- [01-01]: score_function=MaxMC confirmed correct — matches DCD ACCEL config
+- [01-01]: MAP-Elites/ES mutation confirmed INTENTIONAL — thesis contribution replacing minimax mutation
 
 ### Pending Todos
 
@@ -59,6 +63,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-27
-Stopped at: Roadmap created, STATE.md initialized. Ready to plan Phase 1.
+Last session: 2026-02-28
+Stopped at: Completed 01-01-PLAN.md (ACCEL agent verification and smoke test)
 Resume file: None
