@@ -123,6 +123,121 @@ def rollout_agent_on_levels(rng, env, env_params, agent_params, network, levels,
 
 
 # ---------------------------------------------------------------------------
+# Rollout wrapper that also emits agent positions
+# ---------------------------------------------------------------------------
+
+def rollout_agent_on_levels_with_positions(rng, env, env_params, agent_params, network, levels,
+                                           num_steps=256, deterministic=True):
+    """Thin wrapper around rollout_agent_on_levels that also emits agent_pos from the scan.
+
+    Backward-compatible: existing callers of rollout_agent_on_levels are unaffected.
+
+    Args:
+        rng: PRNG key.
+        env: Maze wrapped in AutoReplayWrapper (Python object, NOT jitted).
+        env_params: EnvParams (max_steps_in_episode=250).
+        agent_params: Frozen network parameters dict.
+        network: ActorCritic instance (Python object, NOT jitted).
+        levels: Batched Level pytree, shape (pop_size, ...).
+        num_steps: Total rollout steps (256 = ACCEL default).
+        deterministic: If True use argmax policy; if False sample actions.
+
+    Returns:
+        rewards:         (num_steps, pop_size)
+        values:          (num_steps, pop_size) — critic V(s_t) at each step
+        dones:           (num_steps, pop_size)
+        agent_positions: (num_steps, pop_size, 2) — [col, row] at each step
+    """
+    pop_size = jax.tree_util.tree_flatten(levels)[0][0].shape[0]
+
+    # Reset all envs to their respective levels (vmapped)
+    rng, rng_reset = jax.random.split(rng)
+    init_obs, init_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(
+        jax.random.split(rng_reset, pop_size), levels, env_params
+    )
+
+    init_hstate = ActorCritic.initialize_carry((pop_size,))
+
+    def step_fn(carry, _):
+        rng, hstate, obs, state, done = carry
+        rng, rng_act, rng_step = jax.random.split(rng, 3)
+
+        # Agent inference: add leading (1, ...) batch dim for RNN
+        # ActorCritic.__call__ expects inputs=(obs, dones), hidden
+        x = jax.tree_util.tree_map(lambda a: a[None, ...], (obs, done))
+        hstate, pi, value = network.apply({'params': agent_params}, x, hstate)
+
+        # Action selection: deterministic (argmax) or stochastic (sample)
+        action = jax.lax.cond(
+            deterministic,
+            lambda: jnp.argmax(pi.logits, axis=-1).squeeze(0),
+            lambda: pi.sample(seed=rng_act).squeeze(0),
+        )
+        value = value.squeeze(0)
+
+        # Env step (vmapped over pop_size)
+        next_obs, next_state, reward, next_done, _ = jax.vmap(
+            env.step, in_axes=(0, 0, 0, None)
+        )(jax.random.split(rng_step, pop_size), state, action, env_params)
+
+        # Emit agent_pos ONLY (not full EnvState — avoids OOM from maze_map)
+        return (rng, hstate, next_obs, next_state, next_done), (reward, value, next_done, next_state.agent_pos)
+
+    _, (rewards, values, dones, agent_positions) = jax.lax.scan(
+        step_fn,
+        (rng, init_hstate, init_obs, init_state, jnp.zeros(pop_size, dtype=jnp.bool_)),
+        None,
+        length=num_steps,
+    )
+
+    return rewards, values, dones, agent_positions
+
+
+# ---------------------------------------------------------------------------
+# Behavior signature extractor
+# ---------------------------------------------------------------------------
+
+# TODO: EXPERIMENTAL v1 -- behavior signature design is NOT final. See .planning/DECISIONS.md for design rationale and planned revisit criteria.
+def extract_behavior_signature(agent_positions, num_steps, grid_h=13, grid_w=13):
+    """Extract an L1-normalized visit-count histogram over the maze grid.
+
+    Given a trajectory of agent positions from a rollout, returns a fixed-length
+    histogram representing the fraction of steps the agent spent in each grid cell.
+    This is the core primitive for all ES diversity mechanisms (NS-ES, SV-CMA-ES).
+
+    Coordinate convention:
+        agent_positions[..., 0] = col (x)
+        agent_positions[..., 1] = row (y)
+        Linear cell index = row * grid_w + col
+
+    Args:
+        agent_positions: (num_steps, pop_size, 2) int32 array of [col, row] positions.
+        num_steps: Number of rollout steps (used for documentation; shape inferred from array).
+        grid_h: Grid height in cells (default 13 for CLUTTR maze).
+        grid_w: Grid width in cells (default 13 for CLUTTR maze).
+
+    Returns:
+        hist: (pop_size, grid_h * grid_w) float32 array, L1-normalized so each row
+              sums to 1.0 (or 0.0 if no steps recorded).
+
+    Usage:
+        dummy_positions = jnp.zeros((4, 2, 2), dtype=jnp.int32)
+        lowered = jax.jit(extract_behavior_signature).lower(dummy_positions, 4)
+        compiled = lowered.compile()  # must succeed without error
+        sig = compiled(dummy_positions, 4)  # shape (2, 169)
+    """
+    num_cells = grid_h * grid_w  # 169
+    col = agent_positions[..., 0].astype(jnp.int32)
+    row = agent_positions[..., 1].astype(jnp.int32)
+    cell_idx = row * grid_w + col
+    one_hot = jax.nn.one_hot(cell_idx, num_classes=num_cells, dtype=jnp.float32)
+    hist = one_hot.sum(axis=0)  # (pop_size, num_cells)
+    total = hist.sum(axis=-1, keepdims=True)
+    hist = hist / jnp.maximum(total, 1.0)
+    return hist
+
+
+# ---------------------------------------------------------------------------
 # Regret-based fitness function
 # ---------------------------------------------------------------------------
 
