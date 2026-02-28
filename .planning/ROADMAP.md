@@ -29,7 +29,10 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. Given any maze level and a loaded agent, `extract_behavior_signature()` returns a fixed-length JAX array representing the agent's visit-count histogram over grid cells
   3. The behavior extractor passes `jax.jit(f).lower(args).compile()` without error — it is JIT-compatible and will not silently fall back to eager mode
   4. Behavior signatures are visually distinct for qualitatively different levels (sparse maze vs dense maze produces different histograms, confirmed by inspection)
-**Plans**: TBD
+**Plans**: 2 plans
+Plans:
+- [ ] 01-PLAN-01.md — Agent verification: PPO/ACCEL code comparison vs DCD + smoke test
+- [ ] 01-PLAN-02.md — Behavior signature: implement extract_behavior_signature() in es/regret_fitness.py
 
 ### Phase 2: Buffer and Fitness Infrastructure
 **Goal**: The shared components that all ES strategies depend on are built, tested, and stable before any strategy is implemented
@@ -83,7 +86,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation | 0/TBD | Not started | - |
+| 1. Foundation | 0/2 | Planning complete | - |
 | 2. Buffer and Fitness Infrastructure | 0/TBD | Not started | - |
 | 3. NS-ES Integration | 0/TBD | Not started | - |
 | 4. Behavioral SV-CMA-ES | 0/TBD | Not started | - |
