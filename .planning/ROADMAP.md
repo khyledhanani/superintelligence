@@ -12,7 +12,7 @@ This roadmap extends the existing ACCEL UED codebase with behavioral diversity m
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Foundation** - Verified baseline agent and JAX-native behavior signature extraction
+- [x] **Phase 1: Foundation** - Verified baseline agent and JAX-native behavior signature extraction
 - [ ] **Phase 2: Buffer and Fitness Infrastructure** - Enhanced buffer, k-NN novelty scoring, composite fitness, modular ES interface
 - [ ] **Phase 3: NS-ES Integration** - First end-to-end ES with composite fitness, archive warm-up, two-bucket sampling wired in (MVP)
 - [ ] **Phase 4: Behavioral SV-CMA-ES** - N-particle CMA-ES with Stein repulsion in behavior space (primary thesis contribution)
@@ -31,8 +31,8 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Behavior signatures are visually distinct for qualitatively different levels (sparse maze vs dense maze produces different histograms, confirmed by inspection)
 **Plans**: 2 plans
 Plans:
-- [ ] 01-PLAN-01.md — Agent verification: PPO/ACCEL code comparison vs DCD + smoke test
-- [ ] 01-PLAN-02.md — Behavior signature: implement extract_behavior_signature() in es/regret_fitness.py
+- [x] 01-PLAN-01.md — Agent verification: PPO/ACCEL code comparison vs DCD + smoke test
+- [x] 01-PLAN-02.md — Behavior signature: implement extract_behavior_signature() in es/regret_fitness.py
 
 ### Phase 2: Buffer and Fitness Infrastructure
 **Goal**: The shared components that all ES strategies depend on are built, tested, and stable before any strategy is implemented
@@ -86,7 +86,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation | 1/2 | In Progress|  |
+| 1. Foundation | 2/2 | Complete | 2026-02-28 |
 | 2. Buffer and Fitness Infrastructure | 0/TBD | Not started | - |
 | 3. NS-ES Integration | 0/TBD | Not started | - |
 | 4. Behavioral SV-CMA-ES | 0/TBD | Not started | - |
