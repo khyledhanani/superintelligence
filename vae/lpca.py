@@ -325,6 +325,7 @@ def plot_pca_overview(means: np.ndarray, pca: PCA, data: np.ndarray,
 
     fig.suptitle("VAE Latent Space — PCA Overview", fontsize=13, fontweight="bold")
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"[Plot] PCA overview -> {output_path}")
@@ -386,6 +387,7 @@ def plot_pc_traversal(results: dict, config: dict,
                 )
 
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -479,6 +481,7 @@ def plot_perturbation_grid(results: dict, config: dict,
     fig.text(-0.01, 0.5, ylabel, va="center", rotation=90, fontsize=9, color="#555")
 
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -565,6 +568,7 @@ def plot_pca_with_thumbnails(results: dict, config: dict,
         # Connector line
         ax_main.plot(px, py, "r+", markersize=6, zorder=5)
 
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
