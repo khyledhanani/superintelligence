@@ -4,6 +4,10 @@ Thin wrapper around evosax with init/ask/tell API.
 
 evosax MINIMIZES fitness — callers should negate scores
 when higher is better (e.g., pass -regret so CMA-ES finds high-regret levels).
+
+NOTE: The new evosax API decorates methods with @partial(jax.jit, static_argnames=("self",))
+which breaks Python's descriptor protocol — instance.method() does NOT auto-bind self.
+We must call methods via the CLASS and pass the instance explicitly.
 """
 import jax
 import jax.numpy as jnp
@@ -49,10 +53,10 @@ class CMAESManager:
     def initialize(self, rng):
         """Initialize CMA-ES state. Returns a JAX pytree."""
         if _NEW_API:
-            state = self.strategy.init(rng, self.es_params)
+            # Must call via class — jax.jit wrapper breaks descriptor protocol
+            return CMA_ES.init(self.strategy, rng, self.es_params)
         else:
-            state = self.strategy.initialize(rng, self.es_params)
-        return state
+            return self.strategy.initialize(rng, self.es_params)
 
     def ask(self, rng, es_state):
         """Sample population from CMA-ES.
@@ -61,7 +65,10 @@ class CMAESManager:
             population: (popsize, latent_dim) candidate latent vectors.
             es_state: updated state.
         """
-        return self.strategy.ask(rng, es_state, self.es_params)
+        if _NEW_API:
+            return CMA_ES.ask(self.strategy, rng, es_state, self.es_params)
+        else:
+            return self.strategy.ask(rng, es_state, self.es_params)
 
     def tell(self, rng, population, fitness, es_state):
         """Update CMA-ES with fitness values.
@@ -77,8 +84,10 @@ class CMAESManager:
             Updated es_state.
         """
         if _NEW_API:
-            # New API: tell(key, population, fitness, state, params) -> (state, metrics)
-            state, _metrics = self.strategy.tell(rng, population, fitness, es_state, self.es_params)
+            # New API: tell(self, key, population, fitness, state, params) -> (state, metrics)
+            state, _metrics = CMA_ES.tell(
+                self.strategy, rng, population, fitness, es_state, self.es_params
+            )
             return state
         else:
             # Old API: tell(population, fitness, state, params) -> state
