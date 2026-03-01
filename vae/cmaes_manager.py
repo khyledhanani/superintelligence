@@ -15,6 +15,8 @@ except ImportError:
     from evosax import CMA_ES
     _NEW_API = False
 
+print(f"[CMAESManager] evosax API: {'new (evosax.algorithms)' if _NEW_API else 'old (evosax)'}")
+
 
 class CMAESManager:
     """Manages CMA-ES search in the VAE latent space.
@@ -32,16 +34,25 @@ class CMAESManager:
             dummy = jnp.zeros(latent_dim)
             self.strategy = CMA_ES(population_size=popsize, solution=dummy)
             self.es_params = self.strategy.default_params
+            # Verify evosax inferred the correct dimensionality
+            assert self.strategy.num_dims == latent_dim, (
+                f"evosax num_dims={self.strategy.num_dims} != latent_dim={latent_dim}. "
+                f"solution_flat.size={self.strategy.solution_flat.size}"
+            )
         else:
             self.strategy = CMA_ES(popsize=popsize, num_dims=latent_dim)
             self.es_params = self.strategy.default_params
 
+        print(f"[CMAESManager] popsize={popsize}, latent_dim={latent_dim}, "
+              f"num_dims={getattr(self.strategy, 'num_dims', 'N/A')}")
+
     def initialize(self, rng):
         """Initialize CMA-ES state. Returns a JAX pytree."""
         if _NEW_API:
-            return self.strategy.init(rng, self.es_params)
+            state = self.strategy.init(rng, self.es_params)
         else:
-            return self.strategy.initialize(rng, self.es_params)
+            state = self.strategy.initialize(rng, self.es_params)
+        return state
 
     def ask(self, rng, es_state):
         """Sample population from CMA-ES.
@@ -52,10 +63,11 @@ class CMAESManager:
         """
         return self.strategy.ask(rng, es_state, self.es_params)
 
-    def tell(self, population, fitness, es_state):
+    def tell(self, rng, population, fitness, es_state):
         """Update CMA-ES with fitness values.
 
         Args:
+            rng: PRNGKey (required by new evosax API, ignored by old API).
             population: (popsize, latent_dim) from ask().
             fitness: (popsize,) scalar fitness per candidate.
                      CMA-ES minimizes, so pass -regret for maximizing regret.
@@ -64,4 +76,10 @@ class CMAESManager:
         Returns:
             Updated es_state.
         """
-        return self.strategy.tell(population, fitness, es_state, self.es_params)
+        if _NEW_API:
+            # New API: tell(key, population, fitness, state, params) -> (state, metrics)
+            state, _metrics = self.strategy.tell(rng, population, fitness, es_state, self.es_params)
+            return state
+        else:
+            # Old API: tell(population, fitness, state, params) -> state
+            return self.strategy.tell(population, fitness, es_state, self.es_params)

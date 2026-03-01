@@ -533,6 +533,20 @@ def main(config=None, project="JAXUED_TEST"):
         duplicate_check=config['buffer_duplicate_check'],
     )
     
+    # Initialize CMA-ES state OUTSIDE jit to avoid tracing issues with evosax
+    if cmaes_mgr is not None:
+        es_state_init = cmaes_mgr.initialize(jax.random.PRNGKey(42))
+        # Verify shapes before entering any jit context
+        print(f"[CMA-ES] Initialized es_state: mean.shape={es_state_init.mean.shape}, "
+              f"p_std.shape={es_state_init.p_std.shape}, C.shape={es_state_init.C.shape}")
+        assert es_state_init.mean.shape == (cmaes_mgr.latent_dim,), (
+            f"CMA-ES state.mean has shape {es_state_init.mean.shape}, "
+            f"expected ({cmaes_mgr.latent_dim},). "
+            f"This likely means evosax inferred the wrong num_dims."
+        )
+    else:
+        es_state_init = None
+
     @jax.jit
     def create_train_state(rng) -> TrainState:
         # Creates the train state
@@ -560,19 +574,13 @@ def main(config=None, project="JAXUED_TEST"):
         sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
         pholder_level_batch = jax.tree_util.tree_map(lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0), pholder_level)
 
-        # CMA-ES state (None placeholder if not using CMA-ES)
-        if cmaes_mgr is not None:
-            es_state = cmaes_mgr.initialize(jax.random.PRNGKey(42))
-        else:
-            es_state = None
-
         return TrainState.create(
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
             sampler=sampler,
             update_state=0,
-            es_state=es_state,
+            es_state=es_state_init,
             num_dr_updates=0,
             num_replay_updates=0,
             num_mutation_updates=0,
@@ -629,7 +637,8 @@ def main(config=None, project="JAXUED_TEST"):
             # CMA-ES: tell fitness and insert into buffer
             if config["use_cmaes"]:
                 # CMA-ES minimizes; negate scores so high-regret = low fitness
-                es_state = cmaes_mgr.tell(z_population, -scores, es_state)
+                rng, rng_tell = jax.random.split(rng)
+                es_state = cmaes_mgr.tell(rng_tell, z_population, -scores, es_state)
 
                 # Periodic reset to prevent stagnation
                 should_reset = (train_state.num_dr_updates % config["cmaes_reset_interval"]) == 0

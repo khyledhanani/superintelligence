@@ -65,7 +65,6 @@ jax-cuda12-pjrt==0.6.2
 jax-cuda12-plugin==0.6.2
 jaxlib==0.6.2
 jaxtyping==0.3.7
-jaxued
 jedi 
 Jinja2==3.1.6
 joblib==1.5.3
