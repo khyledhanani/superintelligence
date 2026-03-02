@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-26)
 ## Current Position
 
 Phase: 4 of 5 (Behavioral SV-CMA-ES)
-Plan: 2 of 3 in current phase (COMPLETE)
-Status: In Progress
-Last activity: 2026-03-02 — Completed 04-02 (SVCMAESStrategy wired into train.py)
+Plan: 3 of 3 in current phase (COMPLETE)
+Status: Phase 4 Complete
+Last activity: 2026-03-02 — Completed 04-03 (Phase 4 SV-CMA-ES tests, all 6 PASS)
 
-Progress: [█████████░] 88%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -32,8 +32,8 @@ Progress: [█████████░] 88%
 | 03-ns-es-integration | 2 | 4 min | 2 min |
 
 **Recent Trend:**
-- Last 5 plans: 02-03 (2 min), 03-01 (2 min), 03-02 (2 min), 03-03 (11 min)
-- Trend: Fast execution for well-specified plans; 03-03 longer due to 3 auto-fixed bugs
+- Last 5 plans: 03-01 (2 min), 03-02 (2 min), 03-03 (11 min), 04-01 (8 min), 04-02 (3 min), 04-03 (2 min)
+- Trend: Fast execution for well-specified plans; test-only plans consistently 2 min
 
 *Updated after each plan completion*
 | Phase 02-buffer-and-fitness-infrastructure P01 | 3 | 2 tasks | 3 files |
@@ -42,6 +42,8 @@ Progress: [█████████░] 88%
 | Phase 03-ns-es-integration P02 | 2 | 2 tasks | 2 files |
 | Phase 03-ns-es-integration P03 | 11 | 1 task | 3 files |
 | Phase 04-behavioral-sv-cma-es P01 | 8 | 2 tasks | 2 files |
+| Phase 04-behavioral-sv-cma-es P02 | 3 | 1 task | 2 files |
+| Phase 04-behavioral-sv-cma-es P03 | 2 | 1 task | 1 file |
 
 ## Accumulated Context
 
@@ -83,6 +85,8 @@ Recent decisions affecting current work:
 - [04-02]: Post-repulsion PLR buffer uses second insert_batch (overwrites first-pass data with post-repulsion levels/regrets/bsigs — richer quality data)
 - [04-02]: max_returns2 from second eval pass stored in post-repulsion level_extra (not reused from first pass — more accurate for post-repulsion levels)
 - [04-02]: sv_behavior_dist_pre/post always logged (0.0 for non-sv_cma_es strategies) — avoids conditional logging, enables cross-run comparison
+- [04-03]: Repulsion test uses norm assertion (not post_dist > pre_dist): correct because Stein direction is sound but mean pairwise distance increase is not monotonically guaranteed from random means
+- [04-03]: N=1 assertion uses exact Python 0.0: mean_pairwise_behavior_dist() early-returns Python float 0.0 for N <= 1 — exact equality is safe and expressive
 
 ### Pending Todos
 
@@ -98,5 +102,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-02
-Stopped at: Completed 04-02-PLAN.md (Phase 4 Plan 2: SVCMAESStrategy wired into train.py)
+Stopped at: Completed 04-03-PLAN.md (Phase 4 Plan 3: SV-CMA-ES tests — all 6 PASS)
 Resume file: None

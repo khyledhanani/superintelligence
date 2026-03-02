@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Foundation** - Verified baseline agent and JAX-native behavior signature extraction
 - [x] **Phase 2: Buffer and Fitness Infrastructure** - Enhanced buffer, k-NN novelty scoring, composite fitness, modular ES interface
 - [x] **Phase 3: NS-ES Integration** - First end-to-end ES with composite fitness, archive warm-up, two-bucket sampling wired in (MVP)
-- [ ] **Phase 4: Behavioral SV-CMA-ES** - N-particle CMA-ES with Stein repulsion in behavior space (primary thesis contribution)
+- [x] **Phase 4: Behavioral SV-CMA-ES** - N-particle CMA-ES with Stein repulsion in behavior space (primary thesis contribution)
 - [ ] **Phase 5: Ablations and Analysis** - Fitness weight sweeps, regret curve comparisons across all three methods
 
 ## Phase Details
@@ -76,9 +76,9 @@ Plans:
   4. The SV-CMA-ES run produces a regret curve plottable alongside NS-ES and vanilla CMA-ES for direct comparison
 **Plans**: 3 plans
 Plans:
-- [ ] 04-01-PLAN.md -- stein.py + SVCMAESStrategy core algorithm implementation
-- [ ] 04-02-PLAN.md -- train.py sv_cma_es routing, __init__.py export, --n_particles argparse
-- [ ] 04-03-PLAN.md -- Phase 4 tests: init, ask, tell, repulsion, N=1 degradation, smoke test
+- [x] 04-01-PLAN.md -- stein.py + SVCMAESStrategy core algorithm implementation
+- [x] 04-02-PLAN.md -- train.py sv_cma_es routing, __init__.py export, --n_particles argparse
+- [x] 04-03-PLAN.md -- Phase 4 tests: init, ask, tell, repulsion, N=1 degradation, smoke test
 
 ### Phase 5: Ablations and Analysis
 **Goal**: The thesis comparison is complete: regret curves across all three methods are plotted, fitness weight ablations are run, and the results are reproducible
@@ -101,5 +101,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Foundation | 2/2 | Complete | 2026-02-28 |
 | 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
 | 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
-| 4. Behavioral SV-CMA-ES | 2/3 | In Progress|  |
+| 4. Behavioral SV-CMA-ES | 3/3 | Complete | 2026-03-02 |
 | 5. Ablations and Analysis | 0/TBD | Not started | - |
