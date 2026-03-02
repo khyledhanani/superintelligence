@@ -62,7 +62,7 @@ from ppo_utils import compute_gae, sample_trajectories_rnn, update_actor_critic_
 
 import wandb
 from regret_fitness import rollout_agent_on_levels_with_positions, extract_behavior_signature
-from accel_training.es_components import NSESStrategy, CMAESStrategy
+from accel_training.es_components import NSESStrategy, CMAESStrategy, SVCMAESStrategy
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +226,11 @@ def train(config):
     for key in ["regret", "novelty_score", "replay_buffer_size", "buffer_occupied",
                 "valid_fraction", "mean_buffer_score"]:
         wandb.define_metric(key, step_metric="update")
+    for key in ["sv_behavior_dist_pre", "sv_behavior_dist_post"]:
+        wandb.define_metric(key, step_metric="update")
     mean_novelty = 0.0  # tracked per-step for NS-ES
+    sv_behavior_dist_pre = 0.0   # tracked per-step for SV-CMA-ES
+    sv_behavior_dist_post = 0.0  # tracked per-step for SV-CMA-ES
 
     # --- ES strategy (NS-ES or CMA-ES baseline) ---
     es_strategy_name = config.get("es_strategy", "cma_es")
@@ -237,6 +241,9 @@ def train(config):
     pop_size_es = config.get("es_pop_size", 16)
     if es_strategy_name == "ns_es":
         es_strategy = NSESStrategy(param_dim=latent_dim_es, pop_size=pop_size_es)
+    elif es_strategy_name == "sv_cma_es":
+        es_config["sv_n_particles"] = config.get("sv_n_particles", 2)
+        es_strategy = SVCMAESStrategy(param_dim=latent_dim_es, pop_size=pop_size_es)
     else:
         es_strategy = CMAESStrategy(param_dim=latent_dim_es, pop_size=pop_size_es)
     rng, rng_es_init = jax.random.split(rng)
@@ -494,7 +501,7 @@ def train(config):
             )
             train_state = train_state.replace(sampler=sampler)
 
-            # ES strategy tell() — update ES state and capture novelty for logging
+            # ES strategy tell() — update ES state and capture novelty/diversity for logging
             if es_strategy_name == "ns_es":
                 buf_size_es = int(train_state.sampler["size"])
                 all_buf_sigs = train_state.sampler["levels_extra"]["behavior_sig"]
@@ -506,6 +513,85 @@ def train(config):
                     beta=config.get("es_beta", 0.2),
                     k=config.get("es_k_novelty", 5),
                 )
+            elif es_strategy_name == "sv_cma_es":
+                # SV-CMA-ES two-pass eval.
+                # First pass already done above (latents_jax_pad -> candidate_sigs, regrets_pad).
+                # Step 4 of CONTEXT: nudge candidate latents by Stein repulsion for second eval pass.
+                # Compute per-particle mean bsigs from first pass for Stein repulsion.
+                n_sv = len(es_state["particles"])
+                pop_sv = config.get("es_pop_size", 16)
+                particle_bsigs_pre = jnp.stack([
+                    jnp.mean(candidate_sigs[i * pop_sv:(i + 1) * pop_sv], axis=0)
+                    for i in range(n_sv)
+                ])  # (N, D_bsig)
+                particle_means_pre = jnp.stack([
+                    p["es_state"].mean for p in es_state["particles"]
+                ])  # (N, param_dim)
+                from accel_training.es_components.stein import compute_stein_repulsion
+                sv_epsilon = config.get("sv_epsilon", 0.01)
+                repulsion = compute_stein_repulsion(particle_means_pre, particle_bsigs_pre, sv_epsilon)
+
+                # Build repelled latents for second eval pass: tile repulsion[i] to pop_sv candidates
+                repulsion_tiled = jnp.concatenate([
+                    jnp.tile(repulsion[i:i + 1], (pop_sv, 1))
+                    for i in range(n_sv)
+                ], axis=0)  # (N*pop_sv, param_dim)
+                post_latents = latents_jax_pad[:n_sv * pop_sv] + repulsion_tiled
+
+                # Second eval pass on repelled latents
+                rng, rng_eval2, rng_bsig2 = jax.random.split(rng, 3)
+                _, levels2, regrets2, max_returns2, _ = eval_fn(rng_eval2, train_state.params, post_latents)
+                _, _, _, agent_pos2 = rollout_agent_on_levels_with_positions(
+                    rng_bsig2, eval_env, env_params,
+                    train_state.params, network, levels2,
+                    num_steps=config["eval_rollout_steps"],
+                )
+                post_bsigs = extract_behavior_signature(agent_pos2, config["eval_rollout_steps"])
+
+                # PLR buffer receives post-repulsion data (locked CONTEXT decision).
+                # First-pass insert already happened above. Overwrite with post-repulsion batch.
+                # Pad regrets2 to num_envs if n_sv*pop_sv < num_envs.
+                n_post = n_sv * pop_sv
+                if n_post < num_envs:
+                    tile_reps2 = (num_envs + n_post - 1) // n_post
+                    regrets2_pad = jnp.tile(regrets2, tile_reps2)[:num_envs]
+                    post_latents_pad = jnp.tile(post_latents, (tile_reps2, 1))[:num_envs]
+                    post_bsigs_pad = jnp.tile(post_bsigs, (tile_reps2, 1))[:num_envs]
+                    levels2_pad = jax.tree_util.tree_map(
+                        lambda x: jnp.tile(x, (tile_reps2, *([1] * (x.ndim - 1))))[:num_envs],
+                        levels2,
+                    )
+                    max_returns2_pad = jnp.tile(max_returns2, tile_reps2)[:num_envs]
+                else:
+                    regrets2_pad = regrets2[:num_envs]
+                    post_latents_pad = post_latents[:num_envs]
+                    post_bsigs_pad = post_bsigs[:num_envs]
+                    levels2_pad = jax.tree_util.tree_map(lambda x: x[:num_envs], levels2)
+                    max_returns2_pad = max_returns2[:num_envs]
+
+                level_extra2 = {
+                    "max_return": max_returns2_pad,
+                    "latent": post_latents_pad,
+                    "behavior_sig": post_bsigs_pad,
+                }
+                assert "behavior_sig" in level_extra2
+                sampler2, _ = level_sampler.insert_batch(
+                    train_state.sampler, levels2_pad, regrets2_pad, level_extra2
+                )
+                train_state = train_state.replace(sampler=sampler2)
+
+                # SV-CMA-ES tell() — strategy receives both eval passes, handles Stein means internally.
+                es_state, sv_metrics = es_strategy.tell(
+                    es_state,
+                    latents_jax_pad,   # pre_cands (N*pop_sv, param_dim)
+                    candidate_sigs,    # pre_bsigs (N*pop_sv, D_bsig)
+                    post_latents,      # post_cands (N*pop_sv, param_dim)
+                    regrets2,          # post_regrets (N*pop_sv,)
+                    post_bsigs,        # post_bsigs (N*pop_sv, D_bsig)
+                    sv_epsilon,
+                )
+                sv_behavior_dist_pre = sv_metrics["sv_behavior_dist_pre"]
+                sv_behavior_dist_post = sv_metrics["sv_behavior_dist_post"]
             else:
                 # CMA-ES baseline: negate composite for evosax (which minimizes)
                 fitness_for_cma = -(
@@ -569,14 +655,16 @@ def train(config):
 
         if (update + 1) % config.get("wandb_log_freq", 10) == 0:
             wandb.log({
-                "update":             update,
-                "regret":             mean_regret,
-                "novelty_score":      mean_novelty,
-                "replay_buffer_size": buf_size,
-                "buffer_occupied":    buf_size / level_sampler.capacity,
-                "valid_fraction":     valid_frac,
-                "mean_buffer_score":  mean_buf_score,
-                "mode":               mode,
+                "update":                  update,
+                "regret":                  mean_regret,
+                "novelty_score":           mean_novelty,
+                "replay_buffer_size":      buf_size,
+                "buffer_occupied":         buf_size / level_sampler.capacity,
+                "valid_fraction":          valid_frac,
+                "mean_buffer_score":       mean_buf_score,
+                "mode":                    mode,
+                "sv_behavior_dist_pre":    sv_behavior_dist_pre,
+                "sv_behavior_dist_post":   sv_behavior_dist_post,
             }, step=update)
 
         if (update + 1) % config["checkpoint_every"] == 0:
@@ -610,6 +698,10 @@ def main():
     parser.add_argument("--log_dir", type=str, default=None, help="Override log_dir from config.")
     parser.add_argument("--seed", type=int, default=None, help="Override seed from config.")
     parser.add_argument("--num_updates", type=int, default=None, help="Override num_updates.")
+    parser.add_argument(
+        "--n_particles", type=int, default=None,
+        help="Number of SV-CMA-ES particles (sv_n_particles in config).",
+    )
     args = parser.parse_args()
 
     config = _load_config(args.config)
@@ -619,6 +711,8 @@ def main():
         config["seed"] = args.seed
     if args.num_updates is not None:
         config["num_updates"] = args.num_updates
+    if args.n_particles is not None:
+        config["sv_n_particles"] = args.n_particles
 
     # Resolve vae_checkpoint relative to project root
     if not os.path.isabs(config["vae_checkpoint"]):
