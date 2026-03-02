@@ -60,6 +60,10 @@ from ued_interface import (
 )
 from ppo_utils import compute_gae, sample_trajectories_rnn, update_actor_critic_rnn
 
+import wandb
+from regret_fitness import rollout_agent_on_levels_with_positions, extract_behavior_signature
+from accel_training.es_components import NSESStrategy, CMAESStrategy
+
 
 # ---------------------------------------------------------------------------
 # TrainState (extends Flax TrainState with PLR sampler)
@@ -85,6 +89,90 @@ def compute_score(score_fn, dones, values, max_returns, advantages):
         return positive_value_loss(dones, advantages)
     else:
         raise ValueError(f"Unknown score_function: {score_fn!r}")
+
+
+# ---------------------------------------------------------------------------
+# Archive warm-up (Phase 3) — pre-populates PLR buffer before training step 0
+# ---------------------------------------------------------------------------
+
+def run_archive_warmup(rng, rng_np, train_state, level_sampler, eval_fn,
+                       eval_env, env_params, network, config):
+    """Pre-populate PLR buffer with valid, solvable levels before training.
+
+    Applies solvability gate: only entries where valid=True and no NaN in
+    regret or behavior_sig are inserted into the buffer. Unsolvable levels
+    (valid=False) and NaN entries are silently skipped.
+
+    Warm-up step budget does NOT count toward num_updates.
+    """
+    n_warmup = config.get("warmup_n", 256)
+    latent_dim = 64
+    num_envs = config["num_train_envs"]
+
+    print(f"  [warmup] Sampling {n_warmup} latents for archive warm-up...")
+    latents_np = rng_np.standard_normal((n_warmup, latent_dim)).astype(np.float32)
+
+    rng, rng_eval, rng_rollout = jax.random.split(rng, 3)
+    sequences, levels, regrets, max_returns, valid = eval_fn(
+        rng_eval, train_state.params, jnp.array(latents_np)
+    )
+
+    # Separate rollout to get agent positions for behavior_sig
+    _, _, _, agent_positions = rollout_agent_on_levels_with_positions(
+        rng_rollout, eval_env, env_params,
+        train_state.params, network, levels,
+        num_steps=config["eval_rollout_steps"],
+    )
+    behavior_sigs = extract_behavior_signature(agent_positions, config["eval_rollout_steps"])
+
+    # NaN guard
+    nan_mask = (
+        np.isnan(np.asarray(regrets))
+        | np.any(np.isnan(np.asarray(behavior_sigs)), axis=-1)
+    )
+    if nan_mask.any():
+        print(f"  [warmup] WARNING: {int(nan_mask.sum())} entries have NaN — will be skipped.")
+
+    # SOLVABILITY GATE (locked CONTEXT.md decision — mandatory):
+    # Filter invalid and NaN entries BEFORE insertion — never insert unsolvable levels.
+    valid_np = np.asarray(valid) & ~nan_mask
+    valid_indices = np.where(valid_np)[0]
+
+    if len(valid_indices) == 0:
+        print("  [warmup] No valid levels produced — buffer remains empty")
+        return rng, rng_np, train_state
+
+    # Select only valid entries
+    latents_np = latents_np[valid_indices]
+    regrets = jnp.array(np.asarray(regrets)[valid_indices])
+    max_returns = jnp.array(np.asarray(max_returns)[valid_indices])
+    behavior_sigs = jnp.array(np.asarray(behavior_sigs)[valid_indices])
+    levels = jax.tree_util.tree_map(lambda x: x[valid_indices], levels)
+    n_valid = len(valid_indices)
+    print(f"  [warmup] {n_valid}/{n_warmup} levels valid (solvable, no NaN)")
+
+    # Tile/slice to num_envs (n_valid may be < num_envs)
+    tile_reps = (num_envs + n_valid - 1) // n_valid  # ceil division
+    latents_jax_pad = jnp.array(np.tile(latents_np, (tile_reps, 1))[:num_envs])
+    regrets_pad = jnp.tile(regrets, tile_reps)[:num_envs]
+    max_returns_pad = jnp.tile(max_returns, tile_reps)[:num_envs]
+    behavior_sigs_pad = jnp.tile(behavior_sigs, (tile_reps, 1))[:num_envs]
+    levels_pad = jax.tree_util.tree_map(
+        lambda x: jnp.tile(x, (tile_reps,) + (1,) * (x.ndim - 1))[:num_envs],
+        levels,
+    )
+
+    # Build level_extra with behavior_sig — satisfies the assert at insert_batch site
+    level_extra = {
+        "max_return": max_returns_pad,
+        "latent": latents_jax_pad,
+        "behavior_sig": behavior_sigs_pad,
+    }
+
+    sampler, _ = level_sampler.insert_batch(train_state.sampler, levels_pad, regrets_pad, level_extra)
+    train_state = train_state.replace(sampler=sampler)
+    print(f"  [warmup] Done: {int(sampler['size'])} entries in PLR buffer")
+    return rng, rng_np, train_state
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +214,33 @@ def train(config):
         min_obstacles=config["min_obstacles"],
         min_distance=config["min_distance"],
     )
+
+    # --- WandB initialization ---
+    run = wandb.init(
+        config=config,
+        project=config.get("wandb_project", "es-accel"),
+        group=config["run_name"],
+        tags=[config.get("es_strategy", "cma_es").upper()],
+    )
+    wandb.define_metric("update")
+    for key in ["regret", "novelty_score", "replay_buffer_size", "buffer_occupied",
+                "valid_fraction", "mean_buffer_score"]:
+        wandb.define_metric(key, step_metric="update")
+    mean_novelty = 0.0  # tracked per-step for NS-ES
+
+    # --- ES strategy (NS-ES or CMA-ES baseline) ---
+    es_strategy_name = config.get("es_strategy", "cma_es")
+    es_config = {
+        "sigma_init": config.get("es_sigma_init", 0.5),
+    }
+    latent_dim_es = 64
+    pop_size_es = config.get("es_pop_size", 16)
+    if es_strategy_name == "ns_es":
+        es_strategy = NSESStrategy(param_dim=latent_dim_es, pop_size=pop_size_es)
+    else:
+        es_strategy = CMAESStrategy(param_dim=latent_dim_es, pop_size=pop_size_es)
+    rng, rng_es_init = jax.random.split(rng)
+    es_state = es_strategy.init_state(rng_es_init, es_config)
 
     # --- MAP-Elites archive ---
     archive = Archive(latent_dim=64)
@@ -269,6 +384,14 @@ def train(config):
             np.save(os.path.join(ckpt_dir, "archive_regrets.npy"), data["regrets"])
         print(f"  Saved checkpoint: {ckpt_dir}")
 
+    # --- Archive warm-up (Phase 3) — runs BEFORE training step 0 ---
+    if config.get("es_strategy", "cma_es") != "cma_es" or config.get("warmup_n", 0) > 0:
+        print("Running archive warm-up...")
+        rng, rng_np, train_state = run_archive_warmup(
+            rng, rng_np, train_state, level_sampler, eval_fn,
+            eval_env, env_params, network, config,
+        )
+
     # --- Main training loop ---
     last_replay_latents = None  # numpy (num_envs, 64) — for ACCEL mutation
     update_state = UpdateState.NEW
@@ -348,8 +471,17 @@ def train(config):
                 regrets_pad = regrets[:num_envs]
                 max_returns_pad = max_returns[:num_envs]
 
+            # Extract behavior signatures for buffer insertion (Phase 3 forward-contract)
+            rng, rng_bsig = jax.random.split(rng)
+            _, _, _, agent_positions = rollout_agent_on_levels_with_positions(
+                rng_bsig, eval_env, env_params,
+                train_state.params, network, levels_pad,
+                num_steps=config["eval_rollout_steps"],
+            )
+            candidate_sigs = extract_behavior_signature(agent_positions, config["eval_rollout_steps"])
+
             # Insert into PLR buffer (latent stored in level_extra)
-            level_extra = {"max_return": max_returns_pad, "latent": latents_jax_pad}
+            level_extra = {"max_return": max_returns_pad, "latent": latents_jax_pad, "behavior_sig": candidate_sigs}
             assert "behavior_sig" in level_extra, (
                 "All PLR buffer insertions must include 'behavior_sig'. "
                 "Call extract_behavior_signature() on rollout positions first."
@@ -361,6 +493,25 @@ def train(config):
                 level_extra,
             )
             train_state = train_state.replace(sampler=sampler)
+
+            # ES strategy tell() — update ES state and capture novelty for logging
+            if es_strategy_name == "ns_es":
+                buf_size_es = int(train_state.sampler["size"])
+                all_buf_sigs = train_state.sampler["extra"]["behavior_sig"]
+                buf_valid_mask = jnp.arange(level_sampler.capacity) < buf_size_es
+                es_state, mean_novelty = es_strategy.tell(
+                    es_state, latents_jax_pad, regrets_pad,
+                    candidate_sigs, all_buf_sigs, buf_valid_mask,
+                    alpha=config.get("es_alpha", 0.8),
+                    beta=config.get("es_beta", 0.2),
+                    k=config.get("es_k_novelty", 5),
+                )
+            else:
+                # CMA-ES baseline: negate composite for evosax (which minimizes)
+                fitness_for_cma = -(
+                    config.get("es_alpha", 0.8) * regrets_pad
+                )
+                es_state = es_strategy.tell(es_state, latents_jax_pad, fitness_for_cma)
 
             # Optionally train on new/mutated levels (exploratory grad updates)
             if exploratory:
@@ -415,6 +566,18 @@ def train(config):
 
         _log(update, mode, archive.num_filled, buf_size,
              mean_regret, valid_frac, mean_buf_score, t_elapsed)
+
+        if (update + 1) % config.get("wandb_log_freq", 10) == 0:
+            wandb.log({
+                "update":             update,
+                "regret":             mean_regret,
+                "novelty_score":      mean_novelty,
+                "replay_buffer_size": buf_size,
+                "buffer_occupied":    buf_size / level_sampler.capacity,
+                "valid_fraction":     valid_frac,
+                "mean_buffer_score":  mean_buf_score,
+                "mode":               mode,
+            }, step=update)
 
         if (update + 1) % config["checkpoint_every"] == 0:
             _save_checkpoint(update + 1, train_state)
