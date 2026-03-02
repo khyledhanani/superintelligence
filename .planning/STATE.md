@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-26)
 ## Current Position
 
 Phase: 3 of 5 (NS-ES Integration)
-Plan: 2 of 3 in current phase
-Status: In Progress
-Last activity: 2026-03-02 — Completed 03-02 (NS-ES wired into training loop)
+Plan: 3 of 3 in current phase (COMPLETE)
+Status: Phase Complete
+Last activity: 2026-03-02 — Completed 03-03 (Phase 3 NS-ES tests + 3 bug fixes)
 
-Progress: [████████░░] 73%
+Progress: [█████████░] 80%
 
 ## Performance Metrics
 
@@ -32,14 +32,15 @@ Progress: [████████░░] 73%
 | 03-ns-es-integration | 2 | 4 min | 2 min |
 
 **Recent Trend:**
-- Last 5 plans: 02-02 (8 min), 02-03 (2 min), 03-01 (2 min), 03-02 (2 min)
-- Trend: Fast execution for well-specified plans
+- Last 5 plans: 02-03 (2 min), 03-01 (2 min), 03-02 (2 min), 03-03 (11 min)
+- Trend: Fast execution for well-specified plans; 03-03 longer due to 3 auto-fixed bugs
 
 *Updated after each plan completion*
 | Phase 02-buffer-and-fitness-infrastructure P01 | 3 | 2 tasks | 3 files |
 | Phase 02-buffer-and-fitness-infrastructure P03 | 2 | 2 tasks | 2 files |
 | Phase 03-ns-es-integration P01 | 2 | 2 tasks | 2 files |
 | Phase 03-ns-es-integration P02 | 2 | 2 tasks | 2 files |
+| Phase 03-ns-es-integration P03 | 11 | 1 task | 3 files |
 
 ## Accumulated Context
 
@@ -71,6 +72,10 @@ Recent decisions affecting current work:
 - [03-02]: run_archive_warmup triggered when es_strategy != cma_es OR warmup_n > 0 — allows warm-up for CMA-ES baseline too
 - [03-02]: ES tell() placed after insert_batch in NEW/mutate branch so buffer_sigs reflect just-inserted state
 - [03-02]: mean_novelty initialized to 0.0; only updated in NS-ES NEW/mutate branch; WandB logs last known value for replay steps
+- [03-03]: Flax variable dict convention: train_state.params is {'params': {...}}; pass directly to network.apply() — do NOT wrap again
+- [03-03]: AutoReplayState nests inner EnvState: agent_pos is at state.env_state.agent_pos, not state.agent_pos
+- [03-03]: LevelSampler extras stored at sampler['levels_extra'], not sampler['extra']
+- [03-03]: All 3 bugs (double-params, agent_pos, sampler key) were pre-existing Phase 2 code triggered first time by Phase 3 full integration path
 
 ### Pending Todos
 
@@ -78,7 +83,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Phase 3 flag]: First end-to-end ES wiring into JAX training loop has broad integration surface — run /gsd:research-phase before planning Phase 3
+- [Phase 3 resolved]: First end-to-end ES wiring into JAX training loop complete; 3 integration bugs found and fixed; all 4 Phase 3 requirements proven by tests
 - [Phase 4 flag]: Stein kernel implementation and multi-particle evosax state management are novel — run /gsd:research-phase before planning Phase 4
 - [Phase 1 resolved]: Behavior signature dimensionality fixed at 13x13=169 cells for v1 (full resolution, no lossy binning); revisit criteria documented in DECISIONS.md
 - [Phase 2 note]: Default python3 on machine lacks JAX; use /cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env/bin/python for all JAX verification
@@ -86,5 +91,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-02
-Stopped at: Completed 03-02-PLAN.md (NS-ES wired into training loop)
+Stopped at: Completed 03-03-PLAN.md (Phase 3 complete: NS-ES tests + 3 bug fixes)
 Resume file: None

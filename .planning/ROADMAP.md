@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Foundation** - Verified baseline agent and JAX-native behavior signature extraction
 - [x] **Phase 2: Buffer and Fitness Infrastructure** - Enhanced buffer, k-NN novelty scoring, composite fitness, modular ES interface
-- [ ] **Phase 3: NS-ES Integration** - First end-to-end ES with composite fitness, archive warm-up, two-bucket sampling wired in (MVP)
+- [x] **Phase 3: NS-ES Integration** - First end-to-end ES with composite fitness, archive warm-up, two-bucket sampling wired in (MVP)
 - [ ] **Phase 4: Behavioral SV-CMA-ES** - N-particle CMA-ES with Stein repulsion in behavior space (primary thesis contribution)
 - [ ] **Phase 5: Ablations and Analysis** - Fitness weight sweeps, regret curve comparisons across all three methods
 
@@ -63,7 +63,7 @@ Plans:
 Plans:
 - [x] 03-01-PLAN.md — NSESStrategy implementation (ALGO-01)
 - [x] 03-02-PLAN.md — behavior_sig extraction, archive warm-up, WandB, ES routing in train.py (INTEG-01, INTEG-02, INTEG-03)
-- [ ] 03-03-PLAN.md — Phase 3 tests: NSESStrategy, behavior_sig, two-bucket guard, end-to-end smoke (ALGO-01, INTEG-01, INTEG-02, INTEG-03)
+- [x] 03-03-PLAN.md — Phase 3 tests: NSESStrategy, behavior_sig, two-bucket guard, end-to-end smoke (ALGO-01, INTEG-01, INTEG-02, INTEG-03)
 
 ### Phase 4: Behavioral SV-CMA-ES
 **Goal**: The primary thesis contribution is implemented and runs end-to-end: N independent CMA-ES particles apply Stein repulsion in behavior space to maintain diversity across the particle population
@@ -96,6 +96,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 |-------|----------------|--------|-----------|
 | 1. Foundation | 2/2 | Complete | 2026-02-28 |
 | 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
-| 3. NS-ES Integration | 2/3 | In progress | - |
+| 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
 | 4. Behavioral SV-CMA-ES | 0/TBD | Not started | - |
 | 5. Ablations and Analysis | 0/TBD | Not started | - |
