@@ -122,3 +122,12 @@ The training script will log to project `es-accel` (configurable via `wandb_proj
 ---
 *Phase: 03-ns-es-integration*
 *Completed: 2026-03-02*
+
+## Self-Check: PASSED
+
+- FOUND: accel_training/train.py
+- FOUND: accel_training/config.yml
+- FOUND: .planning/phases/03-ns-es-integration/03-02-SUMMARY.md
+- FOUND commit: 0fda4a3 (feat(03-02): wire NS-ES into ACCEL training loop)
+- FOUND commit: 269ce83 (feat(03-02): add ES config block to config.yml)
+- FOUND commit: 499113e (docs(03-02): complete NS-ES integration plan)
