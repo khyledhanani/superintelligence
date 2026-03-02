@@ -86,6 +86,36 @@ def tokens_to_level(tokens):
     )
 
 
+def level_to_tokens(level):
+    """Convert a Level dataclass to a 52-token VAE sequence.
+
+    Inverse of tokens_to_level(). Output format:
+      [50 wall indices (1-based, sorted, 0-padded), goal_idx (1-based), agent_idx (1-based)]
+
+    Args:
+        level: Level with wall_map (13,13), goal_pos (2,), agent_pos (2,).
+
+    Returns:
+        (52,) int32 array in VAE dataset token format.
+    """
+    wall_map = level.wall_map  # (13, 13) bool
+    wall_flat = wall_map.reshape(-1)  # (169,)
+
+    # 1-based indices where walls exist, 0 where not
+    indices_1based = jnp.arange(1, GRID_SIZE * GRID_SIZE + 1)  # 1..169
+    wall_indices = jnp.where(wall_flat, indices_1based, 0)  # (169,)
+
+    # Sort descending to get non-zero first, take top MAX_WALLS, then sort ascending
+    wall_indices = jnp.sort(wall_indices)[::-1][:MAX_WALLS]
+    wall_indices = jnp.sort(wall_indices)  # zeros first, then wall indices ascending
+
+    # Agent and goal as 1-based indices: idx = y * 13 + x + 1
+    goal_idx = level.goal_pos[1] * GRID_SIZE + level.goal_pos[0] + 1
+    agent_idx = level.agent_pos[1] * GRID_SIZE + level.agent_pos[0] + 1
+
+    return jnp.concatenate([wall_indices, jnp.array([goal_idx, agent_idx])]).astype(jnp.int32)
+
+
 def _decode_single(decode_fn, z, rng):
     """Decode a single latent vector to a Level."""
     logits = decode_fn(z)                  # (seq_len, vocab_size)

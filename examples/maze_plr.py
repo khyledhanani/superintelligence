@@ -29,7 +29,7 @@ from enum import IntEnum
 # VAE + CMA-ES imports (conditional on --use_cmaes flag)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vae'))
 from vae_model import CluttrVAE
-from vae_level_utils import decode_latent_to_levels
+from vae_level_utils import decode_latent_to_levels, level_to_tokens
 from cmaes_manager import CMAESManager
 
 class UpdateState(IntEnum):
@@ -336,26 +336,44 @@ class ActorCritic(nn.Module):
 # endregion
 
 # region checkpointing
+def _upload_to_gcs(local_path, gcs_bucket, gcs_path):
+    """Upload a local file to GCS."""
+    from google.cloud import storage
+    client = storage.Client()
+    bucket = client.bucket(gcs_bucket)
+    blob = bucket.blob(gcs_path)
+    blob.upload_from_filename(local_path)
+    print(f"[GCS] Uploaded {local_path} -> gs://{gcs_bucket}/{gcs_path}")
+
+
 def setup_checkpointing(config: dict, train_state: TrainState, env: UnderspecifiedEnv, env_params: EnvParams) -> ocp.CheckpointManager:
     """This takes in the train state and config, and returns an orbax checkpoint manager.
         It also saves the config in `checkpoints/run_name/seed/config.json`
 
     Args:
-        config (dict): 
-        train_state (TrainState): 
-        env (UnderspecifiedEnv): 
-        env_params (EnvParams): 
+        config (dict):
+        train_state (TrainState):
+        env (UnderspecifiedEnv):
+        env_params (EnvParams):
 
     Returns:
-        ocp.CheckpointManager: 
+        ocp.CheckpointManager:
     """
-    overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config['seed']))
-    os.makedirs(overall_save_dir, exist_ok=True)
-    
-    # save the config
-    with open(os.path.join(overall_save_dir, 'config.json'), 'w+') as f:
-        f.write(json.dumps(config.as_dict(), indent=True))
-    
+    if config.get("gcs_bucket"):
+        overall_save_dir = f"gs://{config['gcs_bucket']}/{config['gcs_prefix']}/checkpoints/{config['run_name']}/{config['seed']}"
+        # Save config to GCS via google.cloud.storage
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(config["gcs_bucket"])
+        blob = bucket.blob(f"{config['gcs_prefix']}/checkpoints/{config['run_name']}/{config['seed']}/config.json")
+        blob.upload_from_string(json.dumps(dict(config), indent=2))
+        print(f"[GCS] Config saved to {overall_save_dir}/config.json")
+    else:
+        overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config['seed']))
+        os.makedirs(overall_save_dir, exist_ok=True)
+        with open(os.path.join(overall_save_dir, 'config.json'), 'w+') as f:
+            f.write(json.dumps(dict(config), indent=2))
+
     checkpoint_manager = ocp.CheckpointManager(
         os.path.join(overall_save_dir, 'models'),
         options=ocp.CheckpointManagerOptions(
@@ -424,6 +442,7 @@ def main(config=None, project="JAXUED_TEST"):
     wandb.define_metric("agent/*", step_metric="num_updates")
     wandb.define_metric("return/*", step_metric="num_updates")
     wandb.define_metric("eval_ep_lengths/*", step_metric="num_updates")
+    wandb.define_metric("gen/*", step_metric="num_updates")
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
 
@@ -500,6 +519,13 @@ def main(config=None, project="JAXUED_TEST"):
             frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
             frames = np.array(frames[:episode_length])
             log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
+
+        # Validity rate logging (averaged over eval_freq steps, excluding replay steps where it's 0)
+        if "gen/valid_structure_pct" in stats:
+            valid_pct = np.array(stats["gen/valid_structure_pct"])
+            gen_mask = valid_pct > 0  # DR and mutation steps have non-zero validity
+            if gen_mask.any():
+                log_dict["gen/valid_structure_pct"] = float(valid_pct[gen_mask].mean())
 
         # CMA-ES metrics (averaged over the eval_freq training steps)
         if config.get("use_cmaes") and "cmaes/valid_structure_pct" in stats:
@@ -667,14 +693,17 @@ def main(config=None, project="JAXUED_TEST"):
                 update_grad=config["exploratory_grad_updates"],
             )
 
+            # Validity check for generated levels (CMA-ES or random)
+            is_valid = jax.vmap(lambda l: l.is_well_formatted())(new_levels)
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
+                "gen/valid_structure_pct": is_valid.mean() * 100,
             }
 
             # CMA-ES monitoring metrics
             if config["use_cmaes"]:
-                is_valid = jax.vmap(lambda l: l.is_well_formatted())(new_levels)
                 metrics["cmaes/valid_structure_pct"] = is_valid.mean() * 100
                 metrics["cmaes/mean_fitness"] = scores.mean()
                 metrics["cmaes/mean_episode_length"] = dones.sum(axis=0).mean()
@@ -736,6 +765,7 @@ def main(config=None, project="JAXUED_TEST"):
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
+                "gen/valid_structure_pct": jnp.float32(0.0),  # no new levels generated
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -800,9 +830,13 @@ def main(config=None, project="JAXUED_TEST"):
                 update_grad=config["exploratory_grad_updates"],
             )
             
+            # Validity check for mutated levels
+            is_valid_mut = jax.vmap(lambda l: l.is_well_formatted())(child_levels)
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
+                "gen/valid_structure_pct": is_valid_mut.mean() * 100,
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -948,7 +982,49 @@ def main(config=None, project="JAXUED_TEST"):
         if config["checkpoint_save_interval"] > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
-    return runner_state[1]
+
+    # === End-of-run buffer dump ===
+    final_train_state = runner_state[1]
+    sampler = final_train_state.sampler
+    size = int(sampler["size"])
+    print(f"[Buffer dump] Saving {size} levels from PLR buffer...")
+
+    # Convert buffer levels to 52-token sequences (VAE dataset format)
+    buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
+    tokens = jax.vmap(level_to_tokens)(buffer_levels)  # (size, 52) int32
+
+    scores = np.asarray(sampler["scores"][:size])
+    timestamps = np.asarray(sampler["timestamps"][:size])
+
+    buffer_dump = {
+        "tokens": np.asarray(tokens),
+        "scores": scores,
+        "timestamps": timestamps,
+        "size": size,
+    }
+
+    # Include z-vectors for CMA-ES runs if stored in levels_extra
+    if config.get("use_cmaes") and "levels_extra" in sampler:
+        extra = sampler["levels_extra"]
+        if "z_vector" in extra:
+            buffer_dump["z_vectors"] = np.asarray(extra["z_vector"][:size])
+
+    # Save locally
+    dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+    os.makedirs(dump_dir, exist_ok=True)
+    tokens_path = os.path.join(dump_dir, "buffer_tokens.npy")
+    dump_path = os.path.join(dump_dir, "buffer_dump.npz")
+    np.save(tokens_path, np.asarray(tokens))
+    np.savez_compressed(dump_path, **buffer_dump)
+    print(f"[Buffer dump] Saved locally: {tokens_path}, {dump_path}")
+
+    # Upload to GCS if configured
+    if config.get("gcs_bucket"):
+        gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
+        _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens.npy")
+        _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump.npz")
+
+    return final_train_state
 
 if __name__=="__main__":
     import argparse
@@ -1020,7 +1096,12 @@ if __name__=="__main__":
     group.add_argument("--cmaes_sigma_init", type=float, default=1.0)
     group.add_argument("--cmaes_reset_interval", type=int, default=500,
                        help="Reset CMA-ES every N DR updates to prevent stagnation")
-    
+    # === GCS CONFIG ===
+    group.add_argument("--gcs_bucket", type=str, default=None,
+                       help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
+    group.add_argument("--gcs_prefix", type=str, default="accel",
+                       help="Prefix path within GCS bucket")
+
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])
