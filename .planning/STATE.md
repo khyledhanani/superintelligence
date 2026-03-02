@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** The ES module must find diverse, high-regret environments that continuously challenge the agent — without collapsing to a single mode — so the agent develops generalizable skills through open-ended curriculum learning.
-**Current focus:** Phase 3 — NS-ES Integration
+**Current focus:** Phase 4 — Behavioral SV-CMA-ES
 
 ## Current Position
 
-Phase: 3 of 5 (NS-ES Integration)
-Plan: 3 of 3 in current phase (COMPLETE)
-Status: Phase Complete
-Last activity: 2026-03-02 — Completed 03-03 (Phase 3 NS-ES tests + 3 bug fixes)
+Phase: 4 of 5 (Behavioral SV-CMA-ES)
+Plan: 1 of 3 in current phase (COMPLETE)
+Status: In Progress
+Last activity: 2026-03-02 — Completed 04-01 (Stein repulsion + SVCMAESStrategy core)
 
-Progress: [█████████░] 80%
+Progress: [█████████░] 82%
 
 ## Performance Metrics
 
@@ -41,6 +41,7 @@ Progress: [█████████░] 80%
 | Phase 03-ns-es-integration P01 | 2 | 2 tasks | 2 files |
 | Phase 03-ns-es-integration P02 | 2 | 2 tasks | 2 files |
 | Phase 03-ns-es-integration P03 | 11 | 1 task | 3 files |
+| Phase 04-behavioral-sv-cma-es P01 | 8 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,9 @@ Recent decisions affecting current work:
 - [03-03]: AutoReplayState nests inner EnvState: agent_pos is at state.env_state.agent_pos, not state.agent_pos
 - [03-03]: LevelSampler extras stored at sampler['levels_extra'], not sampler['extra']
 - [03-03]: All 3 bugs (double-params, agent_pos, sampler key) were pre-existing Phase 2 code triggered first time by Phase 3 full integration path
+- [Phase 04-behavioral-sv-cma-es]: N=1 short-circuit in compute_stein_repulsion: return zeros_like before log computation to avoid float32 precision NaN
+- [Phase 04-behavioral-sv-cma-es]: Bandwidth uses log(N+1) not log(N+1e-8): ensures denominator >= log(2) in float32 for all N >= 1
+- [Phase 04-behavioral-sv-cma-es]: SVCMAESStrategy tell() fitness: pure negated regret (evosax minimizes); Stein repulsion applied post-tell() to CMA means
 
 ### Pending Todos
 
@@ -91,5 +95,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-02
-Stopped at: Completed 03-03-PLAN.md (Phase 3 complete: NS-ES tests + 3 bug fixes)
+Stopped at: Completed 04-01-PLAN.md (Phase 4 Plan 1: Stein repulsion + SVCMAESStrategy)
 Resume file: None
