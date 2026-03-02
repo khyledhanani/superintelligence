@@ -2,7 +2,7 @@
 
 ## Overview
 
-This roadmap extends the existing ACCEL UED codebase with behavioral diversity mechanisms, transforming environment generation from regret-maximization into open-ended curriculum discovery. The work proceeds through a strict dependency chain: behavior signature extraction unblocks everything else, so it comes first. Infrastructure follows, then NS-ES validates the approach as an MVP, then Behavioral SV-CMA-ES delivers the primary thesis contribution. The final phase runs ablations and produces the comparison results needed for the thesis.
+This roadmap extends the existing ACCEL UED codebase with behavioral diversity mechanisms, transforming environment generation from regret-maximization into open-ended curriculum discovery. The work proceeds through a strict dependency chain: behavior signature extraction unblocks everything else, so it comes first. Infrastructure follows, then NS-ES validates the approach as an MVP, then Behavioral SV-CMA-ES delivers the primary thesis contribution. Phase 5 refactors the training architecture to a clean two-mode design and runs four comparison experiments. Phase 6 runs fitness weight ablations and validation analysis.
 
 ## Phases
 
@@ -16,7 +16,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Buffer and Fitness Infrastructure** - Enhanced buffer, k-NN novelty scoring, composite fitness, modular ES interface
 - [x] **Phase 3: NS-ES Integration** - First end-to-end ES with composite fitness, archive warm-up, two-bucket sampling wired in (MVP)
 - [x] **Phase 4: Behavioral SV-CMA-ES** - N-particle CMA-ES with Stein repulsion in behavior space (primary thesis contribution)
-- [ ] **Phase 5: Ablations and Analysis** - Fitness weight sweeps, regret curve comparisons across all three methods
+- [ ] **Phase 5: Refactor and Four-Way Comparison** - Clean two-mode train.py rewrite, four comparison experiments (ACCEL, CMA-ES, NS-ES, SV-CMA-ES) at 20k updates, thesis comparison plots
+- [ ] **Phase 6: Ablation Studies** - Fitness weight sweeps for SV-CMA-ES (α/β ablations), validation set evaluation
 
 ## Phase Details
 
@@ -80,22 +81,33 @@ Plans:
 - [x] 04-02-PLAN.md -- train.py sv_cma_es routing, __init__.py export, --n_particles argparse
 - [x] 04-03-PLAN.md -- Phase 4 tests: init, ask, tell, repulsion, N=1 degradation, smoke test
 
-### Phase 5: Ablations and Analysis
-**Goal**: The thesis comparison is complete: regret curves across all four methods are plotted, fitness weight ablations are run, and the results are reproducible
+### Phase 5: Refactor and Four-Way Comparison
+**Goal**: accel_training/train.py is rewritten as a clean two-mode pipeline (replay / es_step), the full codebase is audited for compatibility, and four comparison experiments produce thesis-quality comparison plots
 **Depends on**: Phase 4
 **Requirements**: COMP-01
 **Success Criteria** (what must be TRUE):
-  1. A single script (or notebook) produces side-by-side regret curve plots for original ACCEL baseline (maze_plr.py), vanilla CMA-ES, NS-ES, and Behavioral SV-CMA-ES from WandB run data — the comparison is presentable and directly supports the thesis efficiency claim
-  2. The original ACCEL baseline (examples/maze_plr.py, no ES) is run for 20k updates at the same seed — this is the primary comparison proving ES-guided curriculum is more efficient than unguided ACCEL
-  3. CMA-ES and NS-ES baseline runs are completed for 20k updates at the same seed for the ES strategy comparison
-  4. Fitness weight ablations are run with at least three α/β configurations (e.g., 1.0/0.0, 0.8/0.2, 0.5/0.5); results are logged and the plot shows which configuration performs best
-  5. All runs use the same initial seed and the comparison plot shows regret-per-update efficiency across all four methods
+  1. train.py is rewritten with only two modes — `replay` (PLR buffer → agent training) and `es_step` (ES ask() → VAE decode → eval → PLR buffer insert → tell()); no MAP-Elites archive, no archive warm-up, replay/es_step ratio configurable via config.yml
+  2. Full pipeline audit complete: every file importing from accel_training/ is reviewed and updated; all three ES strategies (cma_es, ns_es, sv_cma_es) run without error under the new architecture
+  3. Pre-launch validation passes: SV-CMA-ES runs 1–2k updates and buf_score rises clearly above the previous ~0.004 ceiling — architecture is confirmed working before committing full runs
+  4. All four experiments complete at 20k updates (same seed): ACCEL baseline (examples/maze_plr.py as-is), CMA-ES, NS-ES, SV-CMA-ES — runs are named and grouped in WandB for easy comparison
+  5. A Jupyter notebook produces two thesis-quality figures from WandB data: (1) side-by-side regret-vs-updates comparison for all four methods, smoothed single-seed curves; (2) placeholder panel for ablations (Phase 6)
+**Plans**: TBD
+
+### Phase 6: Ablation Studies
+**Goal**: Fitness weight ablations quantify the contribution of novelty in SV-CMA-ES, and agents are evaluated on held-out validation mazes
+**Depends on**: Phase 5
+**Requirements**: COMP-01
+**Success Criteria** (what must be TRUE):
+  1. SV-CMA-ES is run with at least three α/β configurations (1.0/0.0, 0.8/0.2, 0.5/0.5); all runs logged to WandB and plotted in the ablation figure
+  2. The ablation plot shows which fitness weighting performs best on regret-per-update efficiency
+  3. Trained agent checkpoints from Phase 5 are evaluated on a fixed held-out validation maze set; solved rate and regret are reported per method
+  4. All ablation runs use the same seed as Phase 5 comparison runs for a fair comparison
 **Plans**: TBD
 
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -103,4 +115,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
 | 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
 | 4. Behavioral SV-CMA-ES | 3/3 | Complete | 2026-03-02 |
-| 5. Ablations and Analysis | 0/TBD | Not started | - |
+| 5. Refactor and Four-Way Comparison | 0/TBD | Not started | - |
+| 6. Ablation Studies | 0/TBD | Not started | - |
