@@ -74,7 +74,11 @@ Plans:
   2. Behavior-space repulsion is active: after ask(), Stein gradient is computed between particles using behavior signatures, and the candidate latents are adjusted before tell() — this is observable by logging per-particle behavior distances before and after repulsion
   3. Particle diversity is maintained throughout training: the mean pairwise behavior distance across particles does not collapse to near-zero within the first 500 steps (logged to WandB)
   4. The SV-CMA-ES run produces a regret curve plottable alongside NS-ES and vanilla CMA-ES for direct comparison
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 04-01-PLAN.md -- stein.py + SVCMAESStrategy core algorithm implementation
+- [ ] 04-02-PLAN.md -- train.py sv_cma_es routing, __init__.py export, --n_particles argparse
+- [ ] 04-03-PLAN.md -- Phase 4 tests: init, ask, tell, repulsion, N=1 degradation, smoke test
 
 ### Phase 5: Ablations and Analysis
 **Goal**: The thesis comparison is complete: regret curves across all three methods are plotted, fitness weight ablations are run, and the results are reproducible
