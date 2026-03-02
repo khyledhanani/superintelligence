@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** The ES module must find diverse, high-regret environments that continuously challenge the agent — without collapsing to a single mode — so the agent develops generalizable skills through open-ended curriculum learning.
-**Current focus:** Phase 2 — Buffer and Fitness Infrastructure
+**Current focus:** Phase 3 — NS-ES Integration
 
 ## Current Position
 
-Phase: 2 of 5 (Buffer and Fitness Infrastructure)
-Plan: 3 of 3 in current phase
-Status: Complete
-Last activity: 2026-02-28 — Completed 02-03 (Buffer wiring and integration tests)
+Phase: 3 of 5 (NS-ES Integration)
+Plan: 1 of 3 in current phase
+Status: In Progress
+Last activity: 2026-03-02 — Completed 03-01 (NSESStrategy implementation)
 
-Progress: [██████░░░░] 60%
+Progress: [███████░░░] 68%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
-- Average duration: 6 min
-- Total execution time: 0.55 hours
+- Total plans completed: 6
+- Average duration: 5 min
+- Total execution time: 0.57 hours
 
 **By Phase:**
 
@@ -29,14 +29,16 @@ Progress: [██████░░░░] 60%
 |-------|-------|-------|----------|
 | 01-foundation | 2 | 13 min | 7 min |
 | 02-buffer-and-fitness-infrastructure | 3 | 20 min | 7 min |
+| 03-ns-es-integration | 1 | 2 min | 2 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-02 (3 min), 02-01 (~10 min), 02-02 (8 min), 02-03 (2 min)
+- Last 5 plans: 02-01 (~10 min), 02-02 (8 min), 02-03 (2 min), 03-01 (2 min)
 - Trend: Fast execution for well-specified plans
 
 *Updated after each plan completion*
 | Phase 02-buffer-and-fitness-infrastructure P01 | 3 | 2 tasks | 3 files |
 | Phase 02-buffer-and-fitness-infrastructure P03 | 2 | 2 tasks | 2 files |
+| Phase 03-ns-es-integration P01 | 2 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -61,6 +63,9 @@ Recent decisions affecting current work:
 - [Phase 02-buffer-and-fitness-infrastructure]: CMAESStrategy stores es_params inside state dict — callers never touch evosax internals, clean Protocol surface
 - [02-03]: Only one insert_batch call in train.py (NEW/mutate branch); REPLAY branch uses update_batch — assertion guard applied only at insert_batch site
 - [02-03]: behavior_sig missing from level_extra at insertion is INTENTIONAL in Phase 2; assert is API contract for Phase 3 (which adds behavior_sig extraction)
+- [03-01]: NSESStrategy.tell() extends ESStrategy Protocol minimum surface with novelty inputs; caller uses concrete NSESStrategy type not Protocol abstraction
+- [03-01]: No separate novelty archive — buffer_sigs and valid_mask passed into tell() at call time (locked CONTEXT.md decision)
+- [03-01]: mean_novelty returned as Python float (float() conversion inside tell()) for logging convenience in train.py
 
 ### Pending Todos
 
@@ -75,6 +80,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-28
-Stopped at: Completed 02-03-PLAN.md (Buffer wiring and Phase 2 integration tests)
+Last session: 2026-03-02
+Stopped at: Completed 03-01-PLAN.md (NSESStrategy implementation)
 Resume file: None

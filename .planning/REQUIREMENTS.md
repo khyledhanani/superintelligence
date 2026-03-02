@@ -21,7 +21,7 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Algorithms
 
-- [ ] **ALGO-01**: NS-ES strategy implementation with composite fitness and buffer-as-novelty-archive
+- [x] **ALGO-01**: NS-ES strategy implementation with composite fitness and buffer-as-novelty-archive
 - [ ] **ALGO-02**: Behavioral SV-CMA-ES with N CMA-ES particles and Stein repulsion in behavior space
 
 ### Integration
@@ -75,7 +75,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INFRA-02 | Phase 2 | Complete |
 | INFRA-03 | Phase 2 | Complete |
 | INFRA-04 | Phase 2 | Complete |
-| ALGO-01 | Phase 3 | Pending |
+| ALGO-01 | Phase 3 | Complete |
 | INTEG-01 | Phase 3 | Pending |
 | INTEG-02 | Phase 3 | Pending |
 | INTEG-03 | Phase 3 | Pending |
@@ -89,4 +89,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-26*
-*Last updated: 2026-02-27 after roadmap creation*
+*Last updated: 2026-03-02 after 03-01 completion (ALGO-01 marked complete)*
