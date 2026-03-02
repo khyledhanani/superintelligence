@@ -26,9 +26,9 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Integration
 
-- [ ] **INTEG-01**: Two-bucket sampling wired into ACCEL training loop (replay prob p + ES frontier 1-p)
-- [ ] **INTEG-02**: Archive warm-up phase (init_pop evaluation before training starts)
-- [ ] **INTEG-03**: End-to-end training pipeline with ES-generated curriculum, WandB logging, checkpointing
+- [x] **INTEG-01**: Two-bucket sampling wired into ACCEL training loop (replay prob p + ES frontier 1-p)
+- [x] **INTEG-02**: Archive warm-up phase (init_pop evaluation before training starts)
+- [x] **INTEG-03**: End-to-end training pipeline with ES-generated curriculum, WandB logging, checkpointing
 
 ### Comparison
 
@@ -76,9 +76,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INFRA-03 | Phase 2 | Complete |
 | INFRA-04 | Phase 2 | Complete |
 | ALGO-01 | Phase 3 | Complete |
-| INTEG-01 | Phase 3 | Pending |
-| INTEG-02 | Phase 3 | Pending |
-| INTEG-03 | Phase 3 | Pending |
+| INTEG-01 | Phase 3 | Complete |
+| INTEG-02 | Phase 3 | Complete |
+| INTEG-03 | Phase 3 | Complete |
 | ALGO-02 | Phase 4 | Pending |
 | COMP-01 | Phase 5 | Pending |
 

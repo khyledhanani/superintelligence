@@ -62,7 +62,7 @@ Plans:
 **Plans**: 3 plans
 Plans:
 - [x] 03-01-PLAN.md — NSESStrategy implementation (ALGO-01)
-- [ ] 03-02-PLAN.md — behavior_sig extraction, archive warm-up, WandB, ES routing in train.py (INTEG-01, INTEG-02, INTEG-03)
+- [x] 03-02-PLAN.md — behavior_sig extraction, archive warm-up, WandB, ES routing in train.py (INTEG-01, INTEG-02, INTEG-03)
 - [ ] 03-03-PLAN.md — Phase 3 tests: NSESStrategy, behavior_sig, two-bucket guard, end-to-end smoke (ALGO-01, INTEG-01, INTEG-02, INTEG-03)
 
 ### Phase 4: Behavioral SV-CMA-ES
@@ -96,6 +96,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 |-------|----------------|--------|-----------|
 | 1. Foundation | 2/2 | Complete | 2026-02-28 |
 | 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
-| 3. NS-ES Integration | 1/3 | In progress | - |
+| 3. NS-ES Integration | 2/3 | In progress | - |
 | 4. Behavioral SV-CMA-ES | 0/TBD | Not started | - |
 | 5. Ablations and Analysis | 0/TBD | Not started | - |

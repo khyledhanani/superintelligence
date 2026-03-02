@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-26)
 ## Current Position
 
 Phase: 3 of 5 (NS-ES Integration)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In Progress
-Last activity: 2026-03-02 — Completed 03-01 (NSESStrategy implementation)
+Last activity: 2026-03-02 — Completed 03-02 (NS-ES wired into training loop)
 
-Progress: [███████░░░] 68%
+Progress: [████████░░] 73%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
-- Average duration: 5 min
-- Total execution time: 0.57 hours
+- Total plans completed: 7
+- Average duration: 4 min
+- Total execution time: 0.60 hours
 
 **By Phase:**
 
@@ -29,16 +29,17 @@ Progress: [███████░░░] 68%
 |-------|-------|-------|----------|
 | 01-foundation | 2 | 13 min | 7 min |
 | 02-buffer-and-fitness-infrastructure | 3 | 20 min | 7 min |
-| 03-ns-es-integration | 1 | 2 min | 2 min |
+| 03-ns-es-integration | 2 | 4 min | 2 min |
 
 **Recent Trend:**
-- Last 5 plans: 02-01 (~10 min), 02-02 (8 min), 02-03 (2 min), 03-01 (2 min)
+- Last 5 plans: 02-02 (8 min), 02-03 (2 min), 03-01 (2 min), 03-02 (2 min)
 - Trend: Fast execution for well-specified plans
 
 *Updated after each plan completion*
 | Phase 02-buffer-and-fitness-infrastructure P01 | 3 | 2 tasks | 3 files |
 | Phase 02-buffer-and-fitness-infrastructure P03 | 2 | 2 tasks | 2 files |
 | Phase 03-ns-es-integration P01 | 2 | 2 tasks | 2 files |
+| Phase 03-ns-es-integration P02 | 2 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -66,6 +67,10 @@ Recent decisions affecting current work:
 - [03-01]: NSESStrategy.tell() extends ESStrategy Protocol minimum surface with novelty inputs; caller uses concrete NSESStrategy type not Protocol abstraction
 - [03-01]: No separate novelty archive — buffer_sigs and valid_mask passed into tell() at call time (locked CONTEXT.md decision)
 - [03-01]: mean_novelty returned as Python float (float() conversion inside tell()) for logging convenience in train.py
+- [03-02]: ES strategy routing via config['es_strategy'] string: ns_es -> NSESStrategy, cma_es -> CMAESStrategy at train() startup
+- [03-02]: run_archive_warmup triggered when es_strategy != cma_es OR warmup_n > 0 — allows warm-up for CMA-ES baseline too
+- [03-02]: ES tell() placed after insert_batch in NEW/mutate branch so buffer_sigs reflect just-inserted state
+- [03-02]: mean_novelty initialized to 0.0; only updated in NS-ES NEW/mutate branch; WandB logs last known value for replay steps
 
 ### Pending Todos
 
@@ -81,5 +86,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-02
-Stopped at: Completed 03-01-PLAN.md (NSESStrategy implementation)
+Stopped at: Completed 03-02-PLAN.md (NS-ES wired into training loop)
 Resume file: None
