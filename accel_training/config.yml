@@ -52,14 +52,19 @@ run_name: accel_vae_map_elites
 # --- Misc ---
 seed: 42
 
-# --- ES / NS-ES (Phase 3) ---
-es_strategy: ns_es        # "ns_es" for NS-ES | "cma_es" for vanilla CMA-ES baseline
+# --- ES strategy ---
+# Options: "cma_es" (vanilla baseline) | "ns_es" (NS-ES, Phase 3) | "sv_cma_es" (Behavioral SV-CMA-ES, Phase 4)
+es_strategy: sv_cma_es
 es_alpha: 0.8             # regret weight in composite fitness F = alpha*regret + beta*novelty
 es_beta: 0.2              # novelty weight in composite fitness
 es_pop_size: 16           # ES population size (matches n_candidates for consistent comparison)
 es_sigma_init: 0.5        # initial CMA-ES sigma (matches mutation_sigma for fair comparison)
 es_k_novelty: 5           # k for k-NN novelty scoring (matches Phase 2 default k=5)
 warmup_n: 256             # archive warm-up: number of latents evaluated before training step 0
+
+# --- SV-CMA-ES (Phase 4) ---
+sv_n_particles: 2         # number of CMA-ES particles (N=1 degrades to vanilla CMA-ES)
+sv_epsilon: 0.01          # Stein repulsion step size
 
 # --- WandB ---
 wandb_project: es-accel   # WandB project name

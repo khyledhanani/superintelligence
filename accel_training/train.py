@@ -38,9 +38,8 @@ from flax.training.train_state import TrainState as _BaseTrainState
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.join(_HERE, '..')
-sys.path.insert(0, _HERE)          # for local imports: ppo_utils, ued_interface
+sys.path.insert(0, _HERE)          # for local imports: ppo_utils, ued_interface, agent_loader, map_elites, regret_fitness
 sys.path.insert(0, _ROOT)          # for jaxued, src/jaxued
-sys.path.insert(0, os.path.join(_ROOT, 'es'))   # for agent_loader, vae_decoder, env_bridge, map_elites
 
 import yaml
 
@@ -50,7 +49,7 @@ from jaxued.utils import compute_max_returns, max_mc, positive_value_loss
 from jaxued.wrappers import AutoReplayWrapper
 
 from agent_loader import ActorCritic
-from map_elites import Archive
+from archive import Archive
 from ued_interface import (
     load_vae,
     generate_candidates,
@@ -699,6 +698,11 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Override seed from config.")
     parser.add_argument("--num_updates", type=int, default=None, help="Override num_updates.")
     parser.add_argument(
+        "--es_strategy", type=str, default=None,
+        choices=["cma_es", "ns_es", "sv_cma_es"],
+        help="ES strategy: cma_es | ns_es | sv_cma_es (overrides config).",
+    )
+    parser.add_argument(
         "--n_particles", type=int, default=None,
         help="Number of SV-CMA-ES particles (sv_n_particles in config).",
     )
@@ -711,6 +715,8 @@ def main():
         config["seed"] = args.seed
     if args.num_updates is not None:
         config["num_updates"] = args.num_updates
+    if args.es_strategy is not None:
+        config["es_strategy"] = args.es_strategy
     if args.n_particles is not None:
         config["sv_n_particles"] = args.n_particles
 
