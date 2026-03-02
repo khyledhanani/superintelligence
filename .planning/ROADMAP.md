@@ -101,5 +101,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Foundation | 2/2 | Complete | 2026-02-28 |
 | 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
 | 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
-| 4. Behavioral SV-CMA-ES | 1/3 | In Progress|  |
+| 4. Behavioral SV-CMA-ES | 2/3 | In Progress|  |
 | 5. Ablations and Analysis | 0/TBD | Not started | - |

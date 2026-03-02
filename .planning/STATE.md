@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-26)
 ## Current Position
 
 Phase: 4 of 5 (Behavioral SV-CMA-ES)
-Plan: 1 of 3 in current phase (COMPLETE)
+Plan: 2 of 3 in current phase (COMPLETE)
 Status: In Progress
-Last activity: 2026-03-02 — Completed 04-01 (Stein repulsion + SVCMAESStrategy core)
+Last activity: 2026-03-02 — Completed 04-02 (SVCMAESStrategy wired into train.py)
 
-Progress: [█████████░] 82%
+Progress: [█████████░] 88%
 
 ## Performance Metrics
 
@@ -80,6 +80,9 @@ Recent decisions affecting current work:
 - [Phase 04-behavioral-sv-cma-es]: N=1 short-circuit in compute_stein_repulsion: return zeros_like before log computation to avoid float32 precision NaN
 - [Phase 04-behavioral-sv-cma-es]: Bandwidth uses log(N+1) not log(N+1e-8): ensures denominator >= log(2) in float32 for all N >= 1
 - [Phase 04-behavioral-sv-cma-es]: SVCMAESStrategy tell() fitness: pure negated regret (evosax minimizes); Stein repulsion applied post-tell() to CMA means
+- [04-02]: Post-repulsion PLR buffer uses second insert_batch (overwrites first-pass data with post-repulsion levels/regrets/bsigs — richer quality data)
+- [04-02]: max_returns2 from second eval pass stored in post-repulsion level_extra (not reused from first pass — more accurate for post-repulsion levels)
+- [04-02]: sv_behavior_dist_pre/post always logged (0.0 for non-sv_cma_es strategies) — avoids conditional logging, enables cross-run comparison
 
 ### Pending Todos
 
@@ -95,5 +98,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-02
-Stopped at: Completed 04-01-PLAN.md (Phase 4 Plan 1: Stein repulsion + SVCMAESStrategy)
+Stopped at: Completed 04-02-PLAN.md (Phase 4 Plan 2: SVCMAESStrategy wired into train.py)
 Resume file: None
