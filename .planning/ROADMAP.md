@@ -81,14 +81,15 @@ Plans:
 - [x] 04-03-PLAN.md -- Phase 4 tests: init, ask, tell, repulsion, N=1 degradation, smoke test
 
 ### Phase 5: Ablations and Analysis
-**Goal**: The thesis comparison is complete: regret curves across all three methods are plotted, fitness weight ablations are run, and the results are reproducible
+**Goal**: The thesis comparison is complete: regret curves across all four methods are plotted, fitness weight ablations are run, and the results are reproducible
 **Depends on**: Phase 4
 **Requirements**: COMP-01
 **Success Criteria** (what must be TRUE):
-  1. A single script (or notebook) produces side-by-side regret curve plots for vanilla ACCEL, NS-ES, and Behavioral SV-CMA-ES from WandB run data — the comparison is presentable
-  2. Fitness weight ablations are run with at least three α/β configurations (e.g., 1.0/0.0, 0.8/0.2, 0.5/0.5); results are logged and the plot shows which configuration performs best
-  3. All three strategies run from the same initial seed and produce the same result when re-run — reproducibility is confirmed
-  4. The LLM injection interface is designed and documented as a hook point in the ES strategy: a comment block or stub function exists where external guidance would be injected, with notes on the expected interface
+  1. A single script (or notebook) produces side-by-side regret curve plots for original ACCEL baseline (maze_plr.py), vanilla CMA-ES, NS-ES, and Behavioral SV-CMA-ES from WandB run data — the comparison is presentable and directly supports the thesis efficiency claim
+  2. The original ACCEL baseline (examples/maze_plr.py, no ES) is run for 20k updates at the same seed — this is the primary comparison proving ES-guided curriculum is more efficient than unguided ACCEL
+  3. CMA-ES and NS-ES baseline runs are completed for 20k updates at the same seed for the ES strategy comparison
+  4. Fitness weight ablations are run with at least three α/β configurations (e.g., 1.0/0.0, 0.8/0.2, 0.5/0.5); results are logged and the plot shows which configuration performs best
+  5. All runs use the same initial seed and the comparison plot shows regret-per-update efficiency across all four methods
 **Plans**: TBD
 
 ## Progress

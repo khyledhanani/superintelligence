@@ -628,14 +628,15 @@ def train(config):
             )
 
             # Update buffer scores with fresh regret
-            prev_max_returns = level_sampler.get_levels_extra(train_state.sampler, level_inds)["max_return"]
-            updated_max_returns = jnp.maximum(prev_max_returns, new_max_returns)
+            prev_extra = level_sampler.get_levels_extra(train_state.sampler, level_inds)
+            updated_max_returns = jnp.maximum(prev_extra["max_return"], new_max_returns)
             sampler = level_sampler.update_batch(
                 train_state.sampler,
                 level_inds,
                 new_scores,
                 {"max_return": updated_max_returns,
-                 "latent": jnp.array(last_replay_latents)},
+                 "latent": jnp.array(last_replay_latents),
+                 "behavior_sig": prev_extra["behavior_sig"]},
             )
             train_state = train_state.replace(sampler=sampler)
 
