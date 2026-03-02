@@ -497,7 +497,7 @@ def train(config):
             # ES strategy tell() — update ES state and capture novelty for logging
             if es_strategy_name == "ns_es":
                 buf_size_es = int(train_state.sampler["size"])
-                all_buf_sigs = train_state.sampler["extra"]["behavior_sig"]
+                all_buf_sigs = train_state.sampler["levels_extra"]["behavior_sig"]
                 buf_valid_mask = jnp.arange(level_sampler.capacity) < buf_size_es
                 es_state, mean_novelty = es_strategy.tell(
                     es_state, latents_jax_pad, regrets_pad,

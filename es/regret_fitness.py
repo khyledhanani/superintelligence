@@ -95,7 +95,7 @@ def rollout_agent_on_levels(rng, env, env_params, agent_params, network, levels,
         # Agent inference: add leading (1, ...) batch dim for RNN
         # ActorCritic.__call__ expects inputs=(obs, dones), hidden
         x = jax.tree_util.tree_map(lambda a: a[None, ...], (obs, done))
-        hstate, pi, value = network.apply({'params': agent_params}, x, hstate)
+        hstate, pi, value = network.apply(agent_params, x, hstate)
 
         # Action selection: deterministic (argmax) or stochastic (sample)
         action = jax.lax.cond(
@@ -164,8 +164,9 @@ def rollout_agent_on_levels_with_positions(rng, env, env_params, agent_params, n
 
         # Agent inference: add leading (1, ...) batch dim for RNN
         # ActorCritic.__call__ expects inputs=(obs, dones), hidden
+        # agent_params is the full Flax variable dict {'params': {...}} — pass directly
         x = jax.tree_util.tree_map(lambda a: a[None, ...], (obs, done))
-        hstate, pi, value = network.apply({'params': agent_params}, x, hstate)
+        hstate, pi, value = network.apply(agent_params, x, hstate)
 
         # Action selection: deterministic (argmax) or stochastic (sample)
         action = jax.lax.cond(
@@ -181,7 +182,8 @@ def rollout_agent_on_levels_with_positions(rng, env, env_params, agent_params, n
         )(jax.random.split(rng_step, pop_size), state, action, env_params)
 
         # Emit agent_pos ONLY (not full EnvState — avoids OOM from maze_map)
-        return (rng, hstate, next_obs, next_state, next_done), (reward, value, next_done, next_state.agent_pos)
+        # next_state is AutoReplayState; agent_pos lives in next_state.env_state.agent_pos
+        return (rng, hstate, next_obs, next_state, next_done), (reward, value, next_done, next_state.env_state.agent_pos)
 
     _, (rewards, values, dones, agent_positions) = jax.lax.scan(
         step_fn,
