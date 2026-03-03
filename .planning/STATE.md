@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-02-26)
 ## Current Position
 
 Phase: 5 of 5 (Ablations and Analysis)
-Plan: 1 of ? in current phase (Plan 1 COMPLETE)
-Status: Phase 5 In Progress
-Last activity: 2026-03-03 — Completed 05-01 (Phase 5 Plan 1: Clean Two-Mode Train Pipeline — all 12 tests PASS)
+Plan: 2 of 2 in current phase (Plan 2 COMPLETE)
+Status: Phase 5 Complete
+Last activity: 2026-03-03 — Completed 05-02 (Phase 5 Plan 2: Experiment Launcher and Thesis Notebook)
 
 Progress: [██████████] 100%
 
@@ -45,6 +45,7 @@ Progress: [██████████] 100%
 | Phase 04-behavioral-sv-cma-es P02 | 3 | 1 task | 2 files |
 | Phase 04-behavioral-sv-cma-es P03 | 2 | 1 task | 1 file |
 | Phase 05-ablations-and-analysis P01 | 9 | 2 tasks | 4 files |
+| Phase 05-ablations-and-analysis P02 | 2 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -91,6 +92,9 @@ Recent decisions affecting current work:
 - [Phase 05-ablations-and-analysis]: train() returns train_state only (not tuple) — archive concept is gone from the API surface
 - [Phase 05-ablations-and-analysis]: bootstrap_min=50 default; bootstrap loop does not count toward num_updates; fills PLR buffer before main loop
 - [Phase 05-ablations-and-analysis]: replay_ratio key replaces replay_prob (backward-compatible via config.get fallback)
+- [Phase 05-ablations-and-analysis]: Sequential execution (no backgrounding) in launcher avoids JAX GPU OOM on shared machine
+- [Phase 05-ablations-and-analysis]: read -r pause after smoke test gates user verification (buf_score > 0.004) before 20k full runs
+- [Phase 05-ablations-and-analysis]: ACCEL baseline runs examples/maze_plr.py black-box; WandB run name/group adjusted manually in UI post-run
 
 ### Pending Todos
 
@@ -106,5 +110,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Completed 05-01-PLAN.md (Phase 5 Plan 1: Clean Two-Mode Train Pipeline — all 12 tests PASS)
+Stopped at: Completed 05-02-PLAN.md (Phase 5 Plan 2: Experiment Launcher and Thesis Notebook)
 Resume file: None

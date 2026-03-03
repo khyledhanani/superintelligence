@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Buffer and Fitness Infrastructure** - Enhanced buffer, k-NN novelty scoring, composite fitness, modular ES interface
 - [x] **Phase 3: NS-ES Integration** - First end-to-end ES with composite fitness, archive warm-up, two-bucket sampling wired in (MVP)
 - [x] **Phase 4: Behavioral SV-CMA-ES** - N-particle CMA-ES with Stein repulsion in behavior space (primary thesis contribution)
-- [ ] **Phase 5: Refactor and Four-Way Comparison** - Clean two-mode train.py rewrite, four comparison experiments (ACCEL, CMA-ES, NS-ES, SV-CMA-ES) at 20k updates, thesis comparison plots
+- [x] **Phase 5: Refactor and Four-Way Comparison** - Clean two-mode train.py rewrite, four comparison experiments (ACCEL, CMA-ES, NS-ES, SV-CMA-ES) at 20k updates, thesis comparison plots (completed 2026-03-03)
 - [ ] **Phase 6: Ablation Studies** - Fitness weight sweeps for SV-CMA-ES (α/β ablations), validation set evaluation
 
 ## Phase Details
@@ -118,5 +118,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
 | 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
 | 4. Behavioral SV-CMA-ES | 3/3 | Complete | 2026-03-02 |
-| 5. Refactor and Four-Way Comparison | 1/2 | In Progress|  |
+| 5. Refactor and Four-Way Comparison | 2/2 | Complete   | 2026-03-03 |
 | 6. Ablation Studies | 0/TBD | Not started | - |
