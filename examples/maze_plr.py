@@ -1117,6 +1117,8 @@ def main(config=None, project="JAXUED_TEST"):
     print(f"  Unsolved (0%): {(solve_rates == 0).sum()} | Fully solved (100%): {(solve_rates == 1.0).sum()}")
 
     # Save evaluation results
+    dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+    os.makedirs(dump_dir, exist_ok=True)
     eval_path = os.path.join(dump_dir, "buffer_eval.npz")
     np.savez_compressed(eval_path, solve_rates=solve_rates, paths=agent_paths,
                         episode_lengths=ep_lengths, buffer_scores=buffer_scores, tokens=np.asarray(tokens))
