@@ -44,7 +44,7 @@ VAE_NAMES=(
 
 VAE_CKPTS=(
     "vae/runs/20260227_185835_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.0/checkpoints/checkpoint_260000.pkl"
-    "vae/runs/20260227_202754_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.5/checkpoints/checkpoint_80000.pkl"
+    "vae/runs/20260227_202754_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.5/checkpoints/checkpoint_120000.pkl"
     "vae/runs/20260227_215731_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta2.0/checkpoints/checkpoint_80000.pkl"
 )
 
