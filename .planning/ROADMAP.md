@@ -91,7 +91,10 @@ Plans:
   3. Pre-launch validation passes: SV-CMA-ES runs 1–2k updates and buf_score rises clearly above the previous ~0.004 ceiling — architecture is confirmed working before committing full runs
   4. All four experiments complete at 20k updates (same seed): ACCEL baseline (examples/maze_plr.py as-is), CMA-ES, NS-ES, SV-CMA-ES — runs are named and grouped in WandB for easy comparison
   5. A Jupyter notebook produces two thesis-quality figures from WandB data: (1) side-by-side regret-vs-updates comparison for all four methods, smoothed single-seed curves; (2) placeholder panel for ablations (Phase 6)
-**Plans**: TBD
+**Plans**: 2 plans
+Plans:
+- [ ] 05-01-PLAN.md — Rewrite train.py as two-mode pipeline + update config.yml and tests
+- [ ] 05-02-PLAN.md — Launcher script for four experiments + Jupyter notebook for thesis figures
 
 ### Phase 6: Ablation Studies
 **Goal**: Fitness weight ablations quantify the contribution of novelty in SV-CMA-ES, and agents are evaluated on held-out validation mazes
@@ -115,5 +118,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. Buffer and Fitness Infrastructure | 3/3 | Complete | 2026-02-28 |
 | 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
 | 4. Behavioral SV-CMA-ES | 3/3 | Complete | 2026-03-02 |
-| 5. Refactor and Four-Way Comparison | 0/TBD | Not started | - |
+| 5. Refactor and Four-Way Comparison | 0/2 | Not started | - |
 | 6. Ablation Studies | 0/TBD | Not started | - |
