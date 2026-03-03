@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** The ES module must find diverse, high-regret environments that continuously challenge the agent — without collapsing to a single mode — so the agent develops generalizable skills through open-ended curriculum learning.
-**Current focus:** Phase 4 — Behavioral SV-CMA-ES
+**Current focus:** Phase 5 — Ablations and Analysis
 
 ## Current Position
 
-Phase: 4 of 5 (Behavioral SV-CMA-ES)
-Plan: 3 of 3 in current phase (COMPLETE)
-Status: Phase 4 Complete
-Last activity: 2026-03-02 — Completed 04-03 (Phase 4 SV-CMA-ES tests, all 6 PASS)
+Phase: 5 of 5 (Ablations and Analysis)
+Plan: 1 of ? in current phase (Plan 1 COMPLETE)
+Status: Phase 5 In Progress
+Last activity: 2026-03-03 — Completed 05-01 (Phase 5 Plan 1: Clean Two-Mode Train Pipeline — all 12 tests PASS)
 
 Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7
+- Total plans completed: 8
 - Average duration: 4 min
-- Total execution time: 0.60 hours
+- Total execution time: 0.75 hours
 
 **By Phase:**
 
@@ -44,6 +44,7 @@ Progress: [██████████] 100%
 | Phase 04-behavioral-sv-cma-es P01 | 8 | 2 tasks | 2 files |
 | Phase 04-behavioral-sv-cma-es P02 | 3 | 1 task | 2 files |
 | Phase 04-behavioral-sv-cma-es P03 | 2 | 1 task | 1 file |
+| Phase 05-ablations-and-analysis P01 | 9 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -87,6 +88,9 @@ Recent decisions affecting current work:
 - [04-02]: sv_behavior_dist_pre/post always logged (0.0 for non-sv_cma_es strategies) — avoids conditional logging, enables cross-run comparison
 - [04-03]: Repulsion test uses norm assertion (not post_dist > pre_dist): correct because Stein direction is sound but mean pairwise distance increase is not monotonically guaranteed from random means
 - [04-03]: N=1 assertion uses exact Python 0.0: mean_pairwise_behavior_dist() early-returns Python float 0.0 for N <= 1 — exact equality is safe and expressive
+- [Phase 05-ablations-and-analysis]: train() returns train_state only (not tuple) — archive concept is gone from the API surface
+- [Phase 05-ablations-and-analysis]: bootstrap_min=50 default; bootstrap loop does not count toward num_updates; fills PLR buffer before main loop
+- [Phase 05-ablations-and-analysis]: replay_ratio key replaces replay_prob (backward-compatible via config.get fallback)
 
 ### Pending Todos
 
@@ -101,6 +105,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-02
-Stopped at: Completed 04-03-PLAN.md (Phase 4 Plan 3: SV-CMA-ES tests — all 6 PASS)
+Last session: 2026-03-03
+Stopped at: Completed 05-01-PLAN.md (Phase 5 Plan 1: Clean Two-Mode Train Pipeline — all 12 tests PASS)
 Resume file: None

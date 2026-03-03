@@ -32,7 +32,7 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Comparison
 
-- [ ] **COMP-01**: Regret curve comparison across methods (vanilla ACCEL vs NS-ES vs SV-CMA-ES)
+- [x] **COMP-01**: Regret curve comparison across methods (vanilla ACCEL vs NS-ES vs SV-CMA-ES)
 
 ## v2 Requirements
 
@@ -80,7 +80,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INTEG-02 | Phase 3 | Complete |
 | INTEG-03 | Phase 3 | Complete |
 | ALGO-02 | Phase 4 | Complete |
-| COMP-01 | Phase 5 | Pending |
+| COMP-01 | Phase 5 | Complete |
 
 **Coverage:**
 - v1 requirements: 12 total
