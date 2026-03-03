@@ -45,6 +45,7 @@ sys.path.insert(0, _ROOT)   # for jaxued, src/jaxued
 import yaml
 
 from jaxued.environments.maze import Maze
+from jaxued.environments import MazeRenderer
 from jaxued.level_sampler import LevelSampler
 from jaxued.utils import compute_max_returns, max_mc, positive_value_loss
 from jaxued.wrappers import AutoReplayWrapper
@@ -106,6 +107,7 @@ def train(config):
     )
     env = AutoReplayWrapper(maze_env)
     env_params = env.default_params
+    renderer = MazeRenderer(maze_env, tile_size=16)
 
     # --- VAE decoder ---
     print("Loading VAE checkpoint...")
@@ -279,13 +281,74 @@ def train(config):
                 f"| valid={valid_frac:.2f} | buf_score={mean_buf_score:.3f} | {elapsed:.1f}s"
             )
 
-    # --- Checkpoint saving (agent params only) ---
-    def _save_checkpoint(update, train_state):
+    # --- ES state extraction (strategy-aware) ---
+    def _get_es_stats(es_state):
+        """Extract mean/std/C/D from es_state as plain numpy dicts, safe to pickle."""
+        if es_strategy_name == "sv_cma_es":
+            particles = []
+            means = []
+            for p in es_state["particles"]:
+                evo = p["es_state"]
+                particles.append({
+                    "mean":         np.asarray(evo.mean),
+                    "std":          float(evo.std),
+                    "C":            np.asarray(evo.C),
+                    "D":            np.asarray(evo.D),
+                    "generation":   int(evo.generation_counter),
+                    "best_solution": np.asarray(evo.best_solution),
+                })
+                means.append(np.asarray(evo.mean))
+            dist = float(np.linalg.norm(means[0] - means[1])) if len(means) >= 2 else 0.0
+            return {"particles": particles, "particle_mean_distance": dist}
+        else:  # cma_es or ns_es
+            evo = es_state["es_state"]
+            return {
+                "mean":          np.asarray(evo.mean),
+                "std":           float(evo.std),
+                "C":             np.asarray(evo.C),
+                "D":             np.asarray(evo.D),
+                "generation":    int(evo.generation_counter),
+                "best_solution": np.asarray(evo.best_solution),
+            }
+
+    # --- Checkpoint saving ---
+    def _save_checkpoint(update, train_state, es_state, rng):
         ckpt_dir = os.path.join(log_dir, f"checkpoint_{update:07d}")
         os.makedirs(ckpt_dir, exist_ok=True)
+
+        # 1. Agent params
         params_np = jax.tree_util.tree_map(np.asarray, train_state.params)
         with open(os.path.join(ckpt_dir, "agent_params.pkl"), "wb") as f:
             pickle.dump(params_np, f)
+
+        # 2. ES state stats
+        es_stats = _get_es_stats(es_state)
+        with open(os.path.join(ckpt_dir, "es_state.pkl"), "wb") as f:
+            pickle.dump(es_stats, f)
+
+        # 3. Decode mean latent(s) and log as WandB image
+        try:
+            rng, rng_img = jax.random.split(rng)
+            if es_strategy_name == "sv_cma_es":
+                for i, p in enumerate(es_stats["particles"]):
+                    mean = jnp.array(p["mean"]).reshape(1, 64)
+                    padded = jnp.concatenate([mean, jnp.zeros((pop_size_es - 1, 64))])
+                    _, levels, _, _, valid = eval_fn(rng_img, train_state.params, padded)
+                    if bool(valid[0]):
+                        level_i = jax.tree_util.tree_map(lambda x: x[0], levels)
+                        img = np.asarray(renderer.render_level(level_i, env_params))
+                        wandb.log({f"es/particle_{i}_maze": wandb.Image(img)}, step=update)
+            else:
+                mean = jnp.array(es_stats["mean"]).reshape(1, 64)
+                padded = jnp.concatenate([mean, jnp.zeros((pop_size_es - 1, 64))])
+                _, levels, _, _, valid = eval_fn(rng_img, train_state.params, padded)
+                if bool(valid[0]):
+                    level_i = jax.tree_util.tree_map(lambda x: x[0], levels)
+                    img = np.asarray(renderer.render_level(level_i, env_params))
+                    wandb.log({"es/mean_maze": wandb.Image(img)}, step=update)
+        except Exception as e:
+            print(f"  [es_state] image logging skipped: {e}")
+
         print(f"  Saved checkpoint: {ckpt_dir}")
 
     # -----------------------------------------------------------------------
@@ -578,7 +641,7 @@ def train(config):
         _log(update, mode, buf_size, mean_regret, valid_frac, mean_buf_score, t_elapsed)
 
         if (update + 1) % config.get("wandb_log_freq", 10) == 0:
-            wandb.log({
+            log_dict = {
                 "update":                update,
                 "regret":                mean_regret,
                 "novelty_score":         mean_novelty,
@@ -589,13 +652,30 @@ def train(config):
                 "mode":                  mode,
                 "sv_behavior_dist_pre":  sv_behavior_dist_pre,
                 "sv_behavior_dist_post": sv_behavior_dist_post,
-            }, step=update)
+            }
+            # ES state scalar metrics (only meaningful after an es_step)
+            if mode == "es_step":
+                if es_strategy_name in ("cma_es", "ns_es"):
+                    evo = es_state["es_state"]
+                    log_dict["es/std"]              = float(evo.std)
+                    log_dict["es/mean_norm"]        = float(jnp.linalg.norm(evo.mean))
+                    log_dict["es/cov_max_eigenval"] = float(evo.D.max())
+                    log_dict["es/cov_min_eigenval"] = float(evo.D.min())
+                    log_dict["es/cov_condition"]    = float(evo.D.max() / (evo.D.min() + 1e-8))
+                elif es_strategy_name == "sv_cma_es":
+                    for i, p in enumerate(es_state["particles"]):
+                        evo = p["es_state"]
+                        log_dict[f"es/p{i}_std"]       = float(evo.std)
+                        log_dict[f"es/p{i}_mean_norm"] = float(jnp.linalg.norm(evo.mean))
+                    means = jnp.stack([p["es_state"].mean for p in es_state["particles"]])
+                    log_dict["es/particle_distance"] = float(jnp.linalg.norm(means[0] - means[1]))
+            wandb.log(log_dict, step=update)
 
         if (update + 1) % config["checkpoint_every"] == 0:
-            _save_checkpoint(update + 1, train_state)
+            _save_checkpoint(update + 1, train_state, es_state, rng)
 
     # --- Final checkpoint ---
-    _save_checkpoint(config["num_updates"], train_state)
+    _save_checkpoint(config["num_updates"], train_state, es_state, rng)
     csv_file.close()
     print("\nTraining complete.")
     print(f"  Buffer: {int(train_state.sampler['size'])} levels")
