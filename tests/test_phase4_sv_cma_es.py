@@ -313,10 +313,12 @@ def test_n1_degrades_to_cma_es():
 
 
 def test_end_to_end_3_updates_sv_cma_es():
-    """Smoke test: train.py runs 3 updates with sv_cma_es strategy and warmup_n=4 (ALGO-02).
+    """Smoke test: train.py runs 3 updates with sv_cma_es strategy (ALGO-02).
 
-    Verifies that the full SV-CMA-ES pipeline (warmup -> training loop -> ES routing)
+    Verifies that the full SV-CMA-ES pipeline (bootstrap -> training loop -> ES routing)
     runs without crashing with sv_n_particles=2 and sv_epsilon=0.01.
+    Uses new config keys (bootstrap_min, replay_ratio) and new train() return signature
+    (train_state only, not tuple).
 
     Guards on VAE checkpoint presence (skips if not found).
     """
@@ -346,7 +348,7 @@ def test_end_to_end_3_updates_sv_cma_es():
         "agent_view_size": 5,
         # Level buffer
         "level_buffer_capacity": 4000,
-        "replay_prob": 0.8,
+        "replay_ratio": 0.5,
         "staleness_coeff": 0.3,
         "minimum_fill_ratio": 0.5,
         "prioritization": "rank",
@@ -354,16 +356,13 @@ def test_end_to_end_3_updates_sv_cma_es():
         "topk_k": 4,
         "score_function": "MaxMC",
         "exploratory_grad_updates": False,
-        # ACCEL / MAP-Elites
-        "use_accel": True,
-        "n_candidates": 16,
-        "mutation_sigma": 0.5,
-        "random_fraction": 0.3,
+        # ES / Level Generation
         "eval_rollout_steps": 128,
         "min_obstacles": 5,
         "min_distance": 3,
         "decode_temperature": 0.25,
-        # Training loop — overrides for smoke test
+        "bootstrap_min": 5,
+        # Training loop
         "num_updates": 3,
         "eval_freq": 500,
         "checkpoint_every": 2000,
@@ -372,7 +371,6 @@ def test_end_to_end_3_updates_sv_cma_es():
         "log_dir": "/tmp/test_phase4_smoke",
         "run_name": "test_sv_cma_es",
         # ES / SV-CMA-ES
-        "warmup_n": 4,
         "es_strategy": "sv_cma_es",
         "sv_n_particles": 2,
         "sv_epsilon": 0.01,
@@ -388,7 +386,7 @@ def test_end_to_end_3_updates_sv_cma_es():
         "seed": 0,
     }
 
-    train_state, archive = train(config)
+    train_state = train(config)
 
     assert train_state is not None, "train() must return a non-None train_state"
     assert "size" in train_state.sampler, "train_state.sampler must have 'size' key"

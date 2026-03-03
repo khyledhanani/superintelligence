@@ -1,6 +1,7 @@
-# ACCEL Training Configuration
-# VAE + MAP-Elites replaces the random level generator from DCD's train.py.
-# LevelSampler (jaxued) handles PLR replay; Archive handles MAP-Elites diversity.
+# ES Training Configuration
+# Two-mode pipeline: es_step (ES ask -> VAE decode -> eval -> PLR insert -> ES tell)
+#                   and replay (PLR sample -> PPO update).
+# ES strategy options: cma_es (baseline) | ns_es (novelty-seeking) | sv_cma_es (Stein Variational)
 
 # --- Agent / PPO ---
 lr: 0.0001
@@ -14,40 +15,37 @@ epoch_ppo: 5
 num_minibatches: 1
 
 # --- Rollout ---
-num_train_envs: 32       # Parallel envs for training (replay/mutate steps)
+num_train_envs: 32       # Parallel envs for training (replay steps)
 num_steps: 256           # Steps per rollout
 agent_view_size: 5       # Maze agent view size (must match checkpoint)
 
 # --- Level buffer (PLR / jaxued LevelSampler) ---
 level_buffer_capacity: 4000
-replay_prob: 0.8         # Probability of replay vs. new-level step
+replay_ratio: 0.8        # Probability of replay mode vs es_step mode
 staleness_coeff: 0.3
 minimum_fill_ratio: 0.5  # Must be this fraction full before replaying
 prioritization: rank     # rank | topk
 temperature: 0.3         # For rank prioritization
 topk_k: 4               # For topk prioritization
 score_function: MaxMC    # MaxMC | pvl
-exploratory_grad_updates: false  # Train on new/mutated levels too (not just replay)?
+exploratory_grad_updates: false  # Train on ES levels too (not just replay)?
 
-# --- ACCEL / MAP-Elites ---
-use_accel: true          # Enable ACCEL mutation step after each replay
-n_candidates: 16         # Candidates generated per new-level step
-mutation_sigma: 0.5      # Std dev of latent-space Gaussian mutation
-random_fraction: 0.3     # Fraction of candidates from random (vs. archive mutation)
+# --- ES / Level Generation ---
 eval_rollout_steps: 128  # Short rollout for candidate evaluation (regret scoring)
 min_obstacles: 5         # Complexity filter: min non-zero obstacle tokens
 min_distance: 3          # Complexity filter: min agent-goal Manhattan distance
 decode_temperature: 0.25 # VAE decode temperature (0=argmax, >0=stochastic)
+bootstrap_min: 50        # Minimum buffer levels before replay allowed (replaces archive warm-up)
 
 # --- Training loop ---
-num_updates: 30000
+num_updates: 20000
 eval_freq: 500           # Eval + log every N updates
 checkpoint_every: 2000   # Save checkpoint every N updates
 
 # --- Paths ---
 vae_checkpoint: vae/model/checkpoint_420000.pkl
-log_dir: runs/accel_custom/
-run_name: accel_vae_map_elites
+log_dir: runs/es_two_mode/
+run_name: sv_cma_es_n2_eps001
 
 # --- Misc ---
 seed: 42
@@ -57,15 +55,15 @@ seed: 42
 es_strategy: sv_cma_es
 es_alpha: 0.8             # regret weight in composite fitness F = alpha*regret + beta*novelty
 es_beta: 0.2              # novelty weight in composite fitness
-es_pop_size: 16           # ES population size (matches n_candidates for consistent comparison)
-es_sigma_init: 0.5        # initial CMA-ES sigma (matches mutation_sigma for fair comparison)
-es_k_novelty: 5           # k for k-NN novelty scoring (matches Phase 2 default k=5)
-warmup_n: 256             # archive warm-up: number of latents evaluated before training step 0
+es_pop_size: 16           # ES population size
+es_sigma_init: 0.5        # initial CMA-ES sigma
+es_k_novelty: 5           # k for k-NN novelty scoring
 
 # --- SV-CMA-ES (Phase 4) ---
 sv_n_particles: 2         # number of CMA-ES particles (N=1 degrades to vanilla CMA-ES)
 sv_epsilon: 0.01          # Stein repulsion step size
 
 # --- WandB ---
-wandb_project: es-accel   # WandB project name
-wandb_log_freq: 10        # log metrics every N updates
+wandb_project: es-accel       # WandB project name
+wandb_log_freq: 10            # log metrics every N updates
+wandb_group: phase5-comparison  # WandB group tag for experiment comparison

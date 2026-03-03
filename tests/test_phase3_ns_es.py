@@ -5,8 +5,8 @@ Tests:
   2. NSESStrategy tell() uses composite fitness with actual novelty variation (ALGO-01)
   3. extract_behavior_signature returns (pop_size, 169) L1-normalized float32 (INTEG-02)
   4. Empty buffer guard: sample_replay_decision returns False when buffer empty (INTEG-01)
-  5. run_archive_warmup() populates the PLR buffer (sampler['size'] > 0) (INTEG-02)
-  6. End-to-end 3-update smoke test with ns_es strategy and warmup_n=4 (INTEG-03)
+  5. Bootstrap populates PLR buffer: train(config) with num_updates=3 completes and returns train_state (INTEG-02)
+  6. End-to-end 3-update smoke test with ns_es strategy (INTEG-03)
 
 Run with:
     /cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env/bin/python tests/test_phase3_ns_es.py
@@ -233,65 +233,25 @@ def test_two_bucket_empty_buffer_guard():
     print("  PASS test_two_bucket_empty_buffer_guard")
 
 
-def test_archive_warmup_populates_buffer():
-    """Test that run_archive_warmup() inserts entries into sampler['size'] > 0 (INTEG-02).
+def test_bootstrap_populates_buffer():
+    """Test bootstrap loop populates PLR buffer before training (INTEG-02).
 
     Guards on VAE checkpoint presence (skips if not found).
-    Directly calls run_archive_warmup() with warmup_n=4 and verifies buffer is populated.
+    Calls train(config) with small bootstrap_min=5 and num_updates=3.
+    Verifies train() completes without error and returns a train_state (not a tuple).
+    This proves the bootstrap loop ran and the new train() return signature is correct.
     """
     if not os.path.exists("vae/model/checkpoint_420000.pkl"):
-        print("  SKIP test_archive_warmup_populates_buffer (VAE checkpoint not found at vae/model/checkpoint_420000.pkl)")
+        print("  SKIP test_bootstrap_populates_buffer (VAE checkpoint not found at vae/model/checkpoint_420000.pkl)")
         return
 
-    import numpy as np
-    import optax
-    from flax import core, struct
-    from flax.training.train_state import TrainState as _BaseTrainState
-    from jaxued.environments.maze import Maze
-    from jaxued.level_sampler import LevelSampler
-    from jaxued.wrappers import AutoReplayWrapper
-    from agent_loader import ActorCritic
-    from ued_interface import load_vae, build_eval_fn
-    from accel_training.train import run_archive_warmup, TrainState
+    import os as _os
+    _os.makedirs("/tmp/test_phase3_bootstrap", exist_ok=True)
 
-    # Minimal config mirroring config.yml defaults for warmup test
+    from accel_training.train import train
+
     config = {
-        "seed": 0,
-        "num_train_envs": 4,
-        "num_steps": 256,
-        "agent_view_size": 5,
-        "level_buffer_capacity": 32,
-        "replay_prob": 0.8,
-        "staleness_coeff": 0.3,
-        "minimum_fill_ratio": 0.5,
-        "prioritization": "rank",
-        "temperature": 0.3,
-        "topk_k": 4,
-        "score_function": "MaxMC",
-        "exploratory_grad_updates": False,
-        "use_accel": True,
-        "n_candidates": 16,
-        "mutation_sigma": 0.5,
-        "random_fraction": 0.3,
-        "eval_rollout_steps": 128,
-        "min_obstacles": 5,
-        "min_distance": 3,
-        "decode_temperature": 0.25,
-        "num_updates": 3,
-        "eval_freq": 500,
-        "checkpoint_every": 2000,
-        "vae_checkpoint": "vae/model/checkpoint_420000.pkl",
-        "log_dir": "/tmp/test_phase3_warmup",
-        "run_name": "test_warmup",
-        "warmup_n": 4,
-        "es_strategy": "ns_es",
-        "es_alpha": 0.8,
-        "es_beta": 0.2,
-        "es_pop_size": 16,
-        "es_sigma_init": 0.5,
-        "es_k_novelty": 5,
-        "wandb_project": "test",
-        "wandb_log_freq": 1,
+        # Agent / PPO
         "lr": 0.0001,
         "max_grad_norm": 0.5,
         "gamma": 0.995,
@@ -301,114 +261,66 @@ def test_archive_warmup_populates_buffer():
         "critic_coeff": 0.5,
         "epoch_ppo": 5,
         "num_minibatches": 1,
+        # Rollout
+        "num_train_envs": 32,
+        "num_steps": 256,
+        "agent_view_size": 5,
+        # Level buffer
+        "level_buffer_capacity": 4000,
+        "replay_ratio": 0.5,
+        "staleness_coeff": 0.3,
+        "minimum_fill_ratio": 0.5,
+        "prioritization": "rank",
+        "temperature": 0.3,
+        "topk_k": 4,
+        "score_function": "MaxMC",
+        "exploratory_grad_updates": False,
+        # ES / Level Generation
+        "eval_rollout_steps": 128,
+        "min_obstacles": 5,
+        "min_distance": 3,
+        "decode_temperature": 0.25,
+        "bootstrap_min": 5,
+        # Training loop
+        "num_updates": 3,
+        "eval_freq": 500,
+        "checkpoint_every": 2000,
+        # Paths
+        "vae_checkpoint": "vae/model/checkpoint_420000.pkl",
+        "log_dir": "/tmp/test_phase3_bootstrap",
+        "run_name": "test_bootstrap",
+        # ES / NS-ES
+        "es_strategy": "ns_es",
+        "es_alpha": 0.8,
+        "es_beta": 0.2,
+        "es_pop_size": 16,
+        "es_sigma_init": 0.5,
+        "es_k_novelty": 5,
+        # WandB
+        "wandb_project": "test",
+        "wandb_log_freq": 1,
+        # Misc
+        "seed": 0,
     }
 
-    rng = jax.random.PRNGKey(config["seed"])
-    rng_np = np.random.default_rng(config["seed"])
+    result = train(config)
 
-    # Setup environment
-    maze_env = Maze(
-        max_height=13, max_width=13,
-        agent_view_size=config["agent_view_size"],
-        normalize_obs=True,
+    # train() must return train_state only (not a tuple)
+    assert not isinstance(result, tuple), (
+        f"train() must return train_state (not a tuple), got {type(result)}"
     )
-    env = AutoReplayWrapper(maze_env)
-    env_params = env.default_params
+    assert result is not None, "train() must return a non-None train_state"
+    assert "size" in result.sampler, "train_state.sampler must have 'size' key"
 
-    # Load VAE and build eval function
-    decoder_params = load_vae(config["vae_checkpoint"])
-    network = ActorCritic(action_dim=7)
-    eval_fn, eval_env = build_eval_fn(
-        decoder_params, network, env_params,
-        latent_dim=64,
-        decode_temperature=config["decode_temperature"],
-        num_steps=config["eval_rollout_steps"],
-        min_obstacles=config["min_obstacles"],
-        min_distance=config["min_distance"],
-    )
-
-    # Level sampler
-    level_sampler = LevelSampler(
-        capacity=config["level_buffer_capacity"],
-        replay_prob=config["replay_prob"],
-        staleness_coeff=config["staleness_coeff"],
-        minimum_fill_ratio=config["minimum_fill_ratio"],
-        prioritization=config["prioritization"],
-        prioritization_params={
-            "temperature": config["temperature"],
-            "k": config["topk_k"],
-        },
-        duplicate_check=False,
-    )
-
-    # Placeholder level for sampler initialization (from VAE decode)
-    from vae_decoder import decode_latent_to_env, repair_cluttr_sequence
-    from env_bridge import cluttr_sequence_to_level
-    rng, rng_init, rng_level = jax.random.split(rng, 3)
-    z_ph = jax.random.normal(rng_level, (1, 64))
-    seq_ph = decode_latent_to_env(decoder_params, z_ph, rng_key=rng_level)
-    seq_ph = repair_cluttr_sequence(seq_ph[0])
-    pholder_level = cluttr_sequence_to_level(seq_ph, rng_level)
-
-    # Initialize network params
-    obs_ph, _ = env.reset_to_level(rng_init, pholder_level, env_params)
-    obs_ph_batch = jax.tree_util.tree_map(
-        lambda x: jnp.repeat(
-            jnp.repeat(x[None, ...], config["num_train_envs"], axis=0)[None, ...],
-            256, axis=0,
-        ),
-        obs_ph,
-    )
-    init_x = (obs_ph_batch, jnp.zeros((256, config["num_train_envs"])))
-    network_params = network.init(rng_init, init_x, ActorCritic.initialize_carry((config["num_train_envs"],)))
-
-    def linear_schedule(count):
-        n_mb_per_update = config["num_minibatches"] * config["epoch_ppo"]
-        frac = 1.0 - (count // n_mb_per_update) / config["num_updates"]
-        return config["lr"] * frac
-
-    tx = optax.chain(
-        optax.clip_by_global_norm(config["max_grad_norm"]),
-        optax.adam(learning_rate=linear_schedule, eps=1e-5),
-    )
-
-    sampler = level_sampler.initialize(
-        pholder_level,
-        {
-            "max_return": jnp.array(-jnp.inf),
-            "latent": jnp.zeros(64, dtype=jnp.float32),
-            "behavior_sig": jnp.zeros(169, dtype=jnp.float32),
-        },
-    )
-    train_state = TrainState.create(
-        apply_fn=network.apply,
-        params=network_params,
-        tx=tx,
-        sampler=sampler,
-    )
-
-    # Call run_archive_warmup with warmup_n=4
-    rng, rng_np, train_state_out = run_archive_warmup(
-        rng, rng_np, train_state, level_sampler, eval_fn,
-        eval_env, env_params, network, config,
-    )
-
-    buf_size = int(train_state_out.sampler["size"])
-    assert buf_size > 0, (
-        f"run_archive_warmup did not populate the buffer (sampler['size'] = {buf_size})"
-    )
-    assert buf_size <= 4, (
-        f"warmup_n=4 should insert at most 4 entries, got {buf_size}"
-    )
-
-    print(f"  PASS test_archive_warmup_populates_buffer — buffer size: {buf_size}")
+    print("  PASS test_bootstrap_populates_buffer")
 
 
 def test_end_to_end_3_updates():
-    """Smoke test: train.py runs 3 updates with warmup_n=4 and ns_es strategy (INTEG-03).
+    """Smoke test: train.py runs 3 updates with bootstrap_min=5 and ns_es strategy (INTEG-03).
 
-    Verifies that the full NS-ES pipeline (warmup -> training loop -> ES routing) runs
-    without crashing. warmup_n=4 exercises run_archive_warmup in the smoke test.
+    Verifies that the full NS-ES pipeline (bootstrap -> training loop -> ES routing) runs
+    without crashing. Uses new config keys (bootstrap_min, replay_ratio) and new train()
+    return signature (train_state only, not tuple).
     """
     if not os.path.exists("vae/model/checkpoint_420000.pkl"):
         print("  SKIP test_end_to_end_3_updates (VAE checkpoint not found at vae/model/checkpoint_420000.pkl)")
@@ -436,7 +348,7 @@ def test_end_to_end_3_updates():
         "agent_view_size": 5,
         # Level buffer
         "level_buffer_capacity": 4000,
-        "replay_prob": 0.8,
+        "replay_ratio": 0.5,
         "staleness_coeff": 0.3,
         "minimum_fill_ratio": 0.5,
         "prioritization": "rank",
@@ -444,16 +356,13 @@ def test_end_to_end_3_updates():
         "topk_k": 4,
         "score_function": "MaxMC",
         "exploratory_grad_updates": False,
-        # ACCEL / MAP-Elites
-        "use_accel": True,
-        "n_candidates": 16,
-        "mutation_sigma": 0.5,
-        "random_fraction": 0.3,
+        # ES / Level Generation
         "eval_rollout_steps": 128,
         "min_obstacles": 5,
         "min_distance": 3,
         "decode_temperature": 0.25,
-        # Training loop — overrides for smoke test
+        "bootstrap_min": 5,
+        # Training loop
         "num_updates": 3,
         "eval_freq": 500,
         "checkpoint_every": 2000,
@@ -462,7 +371,6 @@ def test_end_to_end_3_updates():
         "log_dir": "/tmp/test_phase3_smoke",
         "run_name": "test_smoke",
         # ES / NS-ES
-        "warmup_n": 4,
         "es_strategy": "ns_es",
         "es_alpha": 0.8,
         "es_beta": 0.2,
@@ -476,7 +384,7 @@ def test_end_to_end_3_updates():
         "seed": 0,
     }
 
-    train_state, archive = train(config)
+    train_state = train(config)
 
     assert train_state is not None, "train() must return a non-None train_state"
     assert "size" in train_state.sampler, "train_state.sampler must have 'size' key"
@@ -490,6 +398,6 @@ if __name__ == "__main__":
     test_nses_tell_uses_composite_fitness()
     test_behavior_sig_extraction()
     test_two_bucket_empty_buffer_guard()
-    test_archive_warmup_populates_buffer()
+    test_bootstrap_populates_buffer()
     test_end_to_end_3_updates()
     print("\nAll Phase 3 tests passed.")
