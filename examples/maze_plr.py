@@ -337,12 +337,18 @@ class ActorCritic(nn.Module):
 
 # region checkpointing
 def _upload_to_gcs(local_path, gcs_bucket, gcs_path):
-    """Upload a local file to GCS."""
-    from google.cloud import storage
-    client = storage.Client()
-    bucket = client.bucket(gcs_bucket)
-    blob = bucket.blob(gcs_path)
-    blob.upload_from_filename(local_path)
+    """Upload a local file to GCS. Uses google.cloud.storage if available, else gcloud CLI."""
+    try:
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(gcs_bucket)
+        blob = bucket.blob(gcs_path)
+        blob.upload_from_filename(local_path)
+    except (ImportError, Exception) as e:
+        print(f"[GCS] Python client failed ({e}), falling back to gcloud CLI")
+        import subprocess
+        dest = f"gs://{gcs_bucket}/{gcs_path}"
+        subprocess.run(["gcloud", "storage", "cp", local_path, dest], check=True)
     print(f"[GCS] Uploaded {local_path} -> gs://{gcs_bucket}/{gcs_path}")
 
 
@@ -361,12 +367,21 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
     """
     if config.get("gcs_bucket"):
         overall_save_dir = f"gs://{config['gcs_bucket']}/{config['gcs_prefix']}/checkpoints/{config['run_name']}/{config['seed']}"
-        # Save config to GCS via google.cloud.storage
-        from google.cloud import storage
-        client = storage.Client()
-        bucket = client.bucket(config["gcs_bucket"])
-        blob = bucket.blob(f"{config['gcs_prefix']}/checkpoints/{config['run_name']}/{config['seed']}/config.json")
-        blob.upload_from_string(json.dumps(dict(config), indent=2))
+        # Save config to GCS
+        config_json = json.dumps(dict(config), indent=2)
+        try:
+            from google.cloud import storage
+            client = storage.Client()
+            bucket = client.bucket(config["gcs_bucket"])
+            blob = bucket.blob(f"{config['gcs_prefix']}/checkpoints/{config['run_name']}/{config['seed']}/config.json")
+            blob.upload_from_string(config_json)
+        except (ImportError, Exception):
+            import subprocess, tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                f.write(config_json)
+                tmp_path = f.name
+            subprocess.run(["gcloud", "storage", "cp", tmp_path, f"{overall_save_dir}/config.json"], check=True)
+            os.remove(tmp_path)
         print(f"[GCS] Config saved to {overall_save_dir}/config.json")
     else:
         overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config['seed']))
@@ -399,6 +414,13 @@ def train_state_to_log_dict(train_state: TrainState, level_sampler: LevelSampler
     sampler = train_state.sampler
     idx = jnp.arange(level_sampler.capacity) < sampler["size"]
     s = jnp.maximum(idx.sum(), 1)
+
+    # Score distribution — sort valid scores, index for percentiles
+    scores = sampler["scores"]
+    sorted_scores = jnp.sort(jnp.where(idx, scores, -jnp.inf))
+    n = jnp.maximum(sampler["size"], 1)
+    start = level_sampler.capacity - n  # -inf values sort to front
+
     return {
         "log":{
             "level_sampler/size": sampler["size"],
@@ -406,6 +428,10 @@ def train_state_to_log_dict(train_state: TrainState, level_sampler: LevelSampler
             "level_sampler/max_score": sampler["scores"].max(),
             "level_sampler/weighted_score": (sampler["scores"] * level_sampler.level_weights(sampler)).sum(),
             "level_sampler/mean_score": (sampler["scores"] * idx).sum() / s,
+            "level_sampler/median_score": sorted_scores[start + n // 2],
+            "level_sampler/score_p90": sorted_scores[start + (9 * n) // 10],
+            "level_sampler/score_p10": sorted_scores[start + n // 10],
+            "level_sampler/score_std": jnp.sqrt(((jnp.where(idx, scores, 0) - (jnp.where(idx, scores, 0).sum() / s)) ** 2 * idx).sum() / s),
         },
         "info": {
             "num_dr_updates": train_state.num_dr_updates,
@@ -520,12 +546,18 @@ def main(config=None, project="JAXUED_TEST"):
             frames = np.array(frames[:episode_length])
             log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
 
-        # Validity rate logging (averaged over eval_freq steps, excluding replay steps where it's 0)
+        # Validity rate and insertion rate logging (averaged over eval_freq steps, excluding replay steps where it's 0)
         if "gen/valid_structure_pct" in stats:
             valid_pct = np.array(stats["gen/valid_structure_pct"])
             gen_mask = valid_pct > 0  # DR and mutation steps have non-zero validity
             if gen_mask.any():
                 log_dict["gen/valid_structure_pct"] = float(valid_pct[gen_mask].mean())
+        if "gen/insertion_rate" in stats:
+            insert_rate = np.array(stats["gen/insertion_rate"])
+            gen_mask = insert_rate > 0
+            if gen_mask.any():
+                log_dict["gen/insertion_rate"] = float(insert_rate[gen_mask].mean())
+                log_dict["gen/mean_score_of_inserted"] = float(np.array(stats["gen/mean_score_of_inserted"])[gen_mask].mean())
 
         # CMA-ES metrics (averaged over the eval_freq training steps)
         if config.get("use_cmaes") and "cmaes/valid_structure_pct" in stats:
@@ -678,7 +710,8 @@ def main(config=None, project="JAXUED_TEST"):
                     fresh_es_state, es_state
                 )
 
-            sampler, _ = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+            sampler, insert_indices = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+            num_inserted = (insert_indices >= 0).sum()
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -703,6 +736,8 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid.mean() * 100,
+                "gen/insertion_rate": num_inserted / config["num_train_envs"],
+                "gen/mean_score_of_inserted": jnp.where(insert_indices >= 0, scores, 0).sum() / jnp.maximum(num_inserted, 1),
             }
 
             # CMA-ES monitoring metrics
@@ -775,6 +810,8 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": jnp.float32(0.0),  # no new levels generated
+                "gen/insertion_rate": jnp.float32(0.0),
+                "gen/mean_score_of_inserted": jnp.float32(0.0),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -824,8 +861,9 @@ def main(config=None, project="JAXUED_TEST"):
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
             max_returns = compute_max_returns(dones, rewards)
             scores = compute_score(config, dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
-            
+            sampler, insert_indices_mut = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+            num_inserted_mut = (insert_indices_mut >= 0).sum()
+
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
                 rng,
@@ -841,7 +879,7 @@ def main(config=None, project="JAXUED_TEST"):
                 config["critic_coeff"],
                 update_grad=config["exploratory_grad_updates"],
             )
-            
+
             # Validity check for mutated levels
             is_valid_mut = jax.vmap(lambda l: l.is_well_formatted())(child_levels)
 
@@ -849,6 +887,8 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid_mut.mean() * 100,
+                "gen/insertion_rate": num_inserted_mut / config["num_train_envs"],
+                "gen/mean_score_of_inserted": jnp.where(insert_indices_mut >= 0, scores, 0).sum() / jnp.maximum(num_inserted_mut, 1),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -985,6 +1025,38 @@ def main(config=None, project="JAXUED_TEST"):
     train_state = create_train_state(rng_init)
     runner_state = (rng_train, train_state)
     
+    def dump_buffer(train_state, update_num):
+        """Save PLR buffer as .npy (VAE token format) + .npz (full metadata). Uploads to GCS."""
+        sampler = train_state.sampler
+        size = int(sampler["size"])
+        if size == 0:
+            return
+
+        buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
+        tokens = jax.vmap(level_to_tokens)(buffer_levels)
+
+        dump_data = {
+            "tokens": np.asarray(tokens),
+            "scores": np.asarray(sampler["scores"][:size]),
+            "timestamps": np.asarray(sampler["timestamps"][:size]),
+            "size": size,
+            "update_num": update_num,
+        }
+
+        dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+        os.makedirs(dump_dir, exist_ok=True)
+        tag = f"_{update_num}k" if update_num > 0 else "_final"
+        tokens_path = os.path.join(dump_dir, f"buffer_tokens{tag}.npy")
+        dump_path = os.path.join(dump_dir, f"buffer_dump{tag}.npz")
+        np.save(tokens_path, np.asarray(tokens))
+        np.savez_compressed(dump_path, **dump_data)
+        print(f"[Buffer dump @ {update_num}k] {size} levels -> {tokens_path}")
+
+        if config.get("gcs_bucket"):
+            gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
+            _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens{tag}.npy")
+            _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump{tag}.npz")
+
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
@@ -998,46 +1070,207 @@ def main(config=None, project="JAXUED_TEST"):
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
 
+        # Periodic buffer dump at configured intervals
+        updates_so_far = (eval_step + 1) * config["eval_freq"]
+        if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
+            dump_buffer(runner_state[1], updates_so_far // 1000)
+
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]
     sampler = final_train_state.sampler
     size = int(sampler["size"])
-    print(f"[Buffer dump] Saving {size} levels from PLR buffer...")
+    print(f"[Buffer dump] Saving {size} levels (final)...")
+    dump_buffer(final_train_state, 0)  # tag = "_final"
 
-    # Convert buffer levels to 52-token sequences (VAE dataset format)
     buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
-    tokens = jax.vmap(level_to_tokens)(buffer_levels)  # (size, 52) int32
+    buffer_scores = np.asarray(sampler["scores"][:size])
+    tokens = jax.vmap(level_to_tokens)(buffer_levels)
 
-    scores = np.asarray(sampler["scores"][:size])
-    timestamps = np.asarray(sampler["timestamps"][:size])
+    # === Post-training: evaluate agent on buffer levels ===
+    print(f"\n[Post-training] Evaluating agent on {size} buffer levels...")
+    eval_env_post = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
+    max_steps = env_params.max_steps_in_episode
+    num_eval_attempts = 5
 
-    buffer_dump = {
-        "tokens": np.asarray(tokens),
-        "scores": scores,
-        "timestamps": timestamps,
-        "size": size,
-    }
+    all_solve_rates = []
+    for attempt in range(num_eval_attempts):
+        rng_attempt = jax.random.PRNGKey(attempt + 2000)
+        rng_attempt, rng_reset, rng_eval = jax.random.split(rng_attempt, 3)
+        init_obs, init_env_state = jax.vmap(eval_env_post.reset_to_level, (0, 0, None))(
+            jax.random.split(rng_reset, size), buffer_levels, env_params
+        )
+        states, rewards, episode_lengths = evaluate_rnn(
+            rng_eval, eval_env_post, env_params, final_train_state,
+            ActorCritic.initialize_carry((size,)),
+            init_obs, init_env_state, max_steps,
+        )
+        mask = jnp.arange(max_steps)[:, None] < episode_lengths[None, :]
+        cum_rewards = (rewards * mask).sum(axis=0)
+        all_solve_rates.append((cum_rewards > 0).astype(float))
 
-    # Include z-vectors for CMA-ES runs if stored in levels_extra
-    if config.get("use_cmaes") and "levels_extra" in sampler:
-        extra = sampler["levels_extra"]
-        if "z_vector" in extra:
-            buffer_dump["z_vectors"] = np.asarray(extra["z_vector"][:size])
+    solve_rates = np.asarray(jnp.stack(all_solve_rates).mean(axis=0))
+    # Get paths from last attempt
+    agent_paths = np.asarray(states.agent_pos)  # (max_steps, size, 2)
+    ep_lengths = np.asarray(episode_lengths)
 
-    # Save locally
-    dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
-    os.makedirs(dump_dir, exist_ok=True)
-    tokens_path = os.path.join(dump_dir, "buffer_tokens.npy")
-    dump_path = os.path.join(dump_dir, "buffer_dump.npz")
-    np.save(tokens_path, np.asarray(tokens))
-    np.savez_compressed(dump_path, **buffer_dump)
-    print(f"[Buffer dump] Saved locally: {tokens_path}, {dump_path}")
+    print(f"  Mean solve rate: {solve_rates.mean():.1%}")
+    print(f"  Unsolved (0%): {(solve_rates == 0).sum()} | Fully solved (100%): {(solve_rates == 1.0).sum()}")
 
-    # Upload to GCS if configured
+    # Save evaluation results
+    eval_path = os.path.join(dump_dir, "buffer_eval.npz")
+    np.savez_compressed(eval_path, solve_rates=solve_rates, paths=agent_paths,
+                        episode_lengths=ep_lengths, buffer_scores=buffer_scores, tokens=np.asarray(tokens))
+    print(f"[Buffer eval] Saved: {eval_path}")
     if config.get("gcs_bucket"):
-        gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
-        _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens.npy")
-        _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump.npz")
+        _upload_to_gcs(eval_path, config["gcs_bucket"], f"{gcs_base}/buffer_eval.npz")
+
+    # Log summary to wandb
+    wandb.summary["buffer/mean_solve_rate"] = float(solve_rates.mean())
+    wandb.summary["buffer/unsolved_count"] = int((solve_rates == 0).sum())
+    wandb.summary["buffer/fully_solved_count"] = int((solve_rates == 1.0).sum())
+    wandb.summary["buffer/mean_score"] = float(buffer_scores.mean())
+
+    # === Post-training: render hardest levels with agent paths ===
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        order = np.argsort(solve_rates)  # hardest first
+        n_show = min(16, size)
+        ncols = min(4, n_show)
+        nrows = (n_show + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+        if nrows == 1 and ncols == 1:
+            axes = np.array([[axes]])
+        elif nrows == 1:
+            axes = axes[None, :]
+
+        for idx in range(n_show):
+            level_idx = order[idx]
+            ax = axes[idx // ncols, idx % ncols]
+            level = jax.tree_util.tree_map(lambda x: x[level_idx], buffer_levels)
+            img = np.asarray(env_renderer.render_level(level, env_params))
+            ax.imshow(img)
+
+            path = agent_paths[:, level_idx, :]
+            ep_len = int(ep_lengths[level_idx])
+            path = path[:ep_len]
+            tile_size = 8  # matches MazeRenderer tile_size
+            px = (path[:, 0].astype(float) + 0.5) * tile_size
+            py = (path[:, 1].astype(float) + 0.5) * tile_size
+            ax.plot(px, py, 'r-', linewidth=1, alpha=0.7)
+            if len(px) > 0:
+                ax.plot(px[0], py[0], 'go', markersize=4)
+                ax.plot(px[-1], py[-1], 'rs', markersize=4)
+
+            ax.set_title(f"Solve:{solve_rates[level_idx]:.0%} Score:{buffer_scores[level_idx]:.2f}", fontsize=8)
+            ax.axis("off")
+
+        for idx in range(n_show, nrows * ncols):
+            axes[idx // ncols, idx % ncols].axis("off")
+
+        plt.suptitle(f"Hardest {n_show} Buffer Levels", fontsize=12)
+        plt.tight_layout()
+        plot_path = os.path.join(dump_dir, "hardest_levels.png")
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"[Plot] Saved: {plot_path}")
+        if config.get("gcs_bucket"):
+            _upload_to_gcs(plot_path, config["gcs_bucket"], f"{gcs_base}/hardest_levels.png")
+        wandb.log({"buffer/hardest_levels": wandb.Image(plot_path)})
+    except Exception as e:
+        print(f"[Plot] Skipped rendering: {e}")
+
+    # === Post-training: PCA of buffer snapshots in VAE latent space ===
+    if vae_decode_fn is not None:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from sklearn.decomposition import PCA
+
+            print("\n[Post-training] PCA analysis of buffer snapshots in VAE latent space...")
+
+            # Build VAE encode function
+            def vae_encode_fn(tokens_batch):
+                mean, _ = vae.apply({"params": vae_params}, tokens_batch, train=False, method=vae.encode)
+                return mean
+
+            # Collect all periodic buffer dumps + final
+            dump_dir_pca = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+            snapshot_labels = []
+            snapshot_latents = []
+            snapshot_scores = []
+
+            # Find all dump files in order
+            dump_files = sorted([
+                f for f in os.listdir(dump_dir_pca)
+                if f.startswith("buffer_dump_") and f.endswith(".npz")
+            ])
+
+            for dump_file in dump_files:
+                data = np.load(os.path.join(dump_dir_pca, dump_file))
+                toks = jnp.array(data["tokens"])
+                sc = data["scores"]
+                tag = dump_file.replace("buffer_dump_", "").replace(".npz", "")
+
+                # Encode through VAE in batches
+                latents = []
+                for i in range(0, len(toks), 512):
+                    batch = toks[i:i + 512]
+                    latents.append(np.asarray(vae_encode_fn(batch)))
+                latents = np.concatenate(latents, axis=0)
+
+                snapshot_labels.append(tag)
+                snapshot_latents.append(latents)
+                snapshot_scores.append(sc)
+                print(f"  Encoded {tag}: {len(latents)} levels")
+
+            if len(snapshot_latents) >= 1:
+                # Fit PCA on all snapshots combined
+                all_latents = np.concatenate(snapshot_latents, axis=0)
+                pca = PCA(n_components=2)
+                pca.fit(all_latents)
+
+                # Plot: one color per snapshot timestep
+                fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+                cmap = plt.cm.viridis
+                n_snaps = len(snapshot_labels)
+                colors = [cmap(i / max(n_snaps - 1, 1)) for i in range(n_snaps)]
+
+                for i, (label, latents, sc) in enumerate(zip(snapshot_labels, snapshot_latents, snapshot_scores)):
+                    proj = pca.transform(latents)
+                    axes[0].scatter(proj[:, 0], proj[:, 1], c=[colors[i]], alpha=0.3, s=6, label=label)
+
+                axes[0].set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
+                axes[0].set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
+                axes[0].set_title("Buffer Evolution in VAE Latent Space")
+                axes[0].legend(markerscale=3, fontsize=8)
+
+                # Right plot: final buffer colored by score
+                final_proj = pca.transform(snapshot_latents[-1])
+                final_sc = snapshot_scores[-1]
+                valid = np.isfinite(final_sc) & (final_sc > -1e6)
+                sc_plot = axes[1].scatter(final_proj[valid, 0], final_proj[valid, 1],
+                                          c=final_sc[valid], cmap="plasma", alpha=0.4, s=8)
+                plt.colorbar(sc_plot, ax=axes[1], label="Score (regret)")
+                axes[1].set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
+                axes[1].set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
+                axes[1].set_title("Final Buffer — Colored by Score")
+
+                plt.tight_layout()
+                pca_path = os.path.join(dump_dir_pca, "buffer_pca_evolution.png")
+                plt.savefig(pca_path, dpi=150, bbox_inches="tight")
+                plt.close()
+                print(f"[PCA] Saved: {pca_path}")
+
+                if config.get("gcs_bucket"):
+                    gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
+                    _upload_to_gcs(pca_path, config["gcs_bucket"], f"{gcs_base}/buffer_pca_evolution.png")
+                wandb.log({"buffer/pca_evolution": wandb.Image(pca_path)})
+        except Exception as e:
+            print(f"[PCA] Skipped latent analysis: {e}")
 
     return final_train_state
 
@@ -1116,6 +1349,8 @@ if __name__=="__main__":
                        help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
     group.add_argument("--gcs_prefix", type=str, default="accel",
                        help="Prefix path within GCS bucket")
+    group.add_argument("--buffer_dump_interval", type=int, default=10000,
+                       help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
 
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
