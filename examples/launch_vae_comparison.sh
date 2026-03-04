@@ -43,15 +43,15 @@ VAE_NAMES=(
 )
 
 VAE_CKPTS=(
-    "vae/runs/20260227_185835_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.0/checkpoints/checkpoint_260000.pkl"
-    "vae/runs/20260227_202754_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.5/checkpoints/checkpoint_120000.pkl"
-    "vae/runs/20260227_215731_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta2.0/checkpoints/checkpoint_80000.pkl"
+    "vae/runs/runs/20260227_185835_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.0/checkpoints/checkpoint_260000.pkl"
+    "vae/runs/runs/20260227_202754_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.5/checkpoints/checkpoint_120000.pkl"
+    "vae/runs/runs/20260227_215731_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta2.0/checkpoints/checkpoint_80000.pkl"
 )
 
 VAE_CFGS=(
-    "vae/runs/20260227_185835_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.0/config.yaml"
-    "vae/runs/20260227_202754_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.5/config.yaml"
-    "vae/runs/20260227_215731_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta2.0/config.yaml"
+    "vae/runs/runs/20260227_185835_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.0/config.yaml"
+    "vae/runs/runs/20260227_202754_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta1.5/config.yaml"
+    "vae/runs/runs/20260227_215731_lr5e-05_lat64_baseline_weighted_recon_model_beta1.0_beta2.0/config.yaml"
 )
 
 # ==============================================================================
@@ -80,19 +80,19 @@ echo "============================================"
 # ==============================================================================
 # Condition 1: Plain ACCEL (baseline)
 # ==============================================================================
-for seed in 1 2; do  # seed 0 already completed
-    RUN_NUM=$((RUN_NUM + 1))
-    echo ""
-    echo "[$RUN_NUM/$TOTAL_RUNS] Plain ACCEL | seed=$seed"
-    echo "----------------------------------------------"
-
-    PYTHONUNBUFFERED=1 python3 examples/maze_plr.py $COMMON \
-        --use_accel \
-        --seed $seed \
-        --run_name plain_accel
-
-    echo "[DONE] Plain ACCEL seed=$seed"
-done
+# for seed in 1 2; do  # seed 0 already completed
+#     RUN_NUM=$((RUN_NUM + 1))
+#     echo ""
+#     echo "[$RUN_NUM/$TOTAL_RUNS] Plain ACCEL | seed=$seed"
+#     echo "----------------------------------------------"
+#
+#     PYTHONUNBUFFERED=1 python3 examples/maze_plr.py $COMMON \
+#         --use_accel \
+#         --seed $seed \
+#         --run_name plain_accel
+#
+#     echo "[DONE] Plain ACCEL seed=$seed"
+# done
 
 # ==============================================================================
 # Conditions 2-N: CMA-ES + ACCEL with each VAE
