@@ -125,7 +125,7 @@ def load_checkpoint(checkpoint_dir, checkpoint_step, config):
     return train_state, env, env_params, network
 
 
-def evaluate_on_levels(train_state, env, env_params, levels, num_attempts, batch_size=32):
+def evaluate_on_levels(train_state, env, env_params, levels, num_attempts, batch_size=4096):
     """Run agent on levels and collect trajectories.
 
     Returns dict with per-level results.
