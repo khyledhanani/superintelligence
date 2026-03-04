@@ -545,12 +545,7 @@ def main(config=None, project="JAXUED_TEST"):
             gen_mask = valid_pct > 0  # DR and mutation steps have non-zero validity
             if gen_mask.any():
                 log_dict["gen/valid_structure_pct"] = float(valid_pct[gen_mask].mean())
-        if "gen/insertion_rate" in stats:
-            insert_rate = np.array(stats["gen/insertion_rate"])
-            gen_mask = insert_rate > 0
-            if gen_mask.any():
-                log_dict["gen/insertion_rate"] = float(insert_rate[gen_mask].mean())
-                log_dict["gen/mean_score_of_inserted"] = float(np.array(stats["gen/mean_score_of_inserted"])[gen_mask].mean())
+
 
         # CMA-ES metrics (averaged over the eval_freq training steps)
         if config.get("use_cmaes") and "cmaes/valid_structure_pct" in stats:
@@ -703,8 +698,7 @@ def main(config=None, project="JAXUED_TEST"):
                     fresh_es_state, es_state
                 )
 
-            sampler, insert_indices = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
-            num_inserted = (insert_indices >= 0).sum()
+            sampler, _ = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -729,8 +723,6 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid.mean() * 100,
-                "gen/insertion_rate": num_inserted / config["num_train_envs"],
-                "gen/mean_score_of_inserted": jnp.where(insert_indices >= 0, scores, 0).sum() / jnp.maximum(num_inserted, 1),
             }
 
             # CMA-ES monitoring metrics
@@ -803,8 +795,6 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": jnp.float32(0.0),  # no new levels generated
-                "gen/insertion_rate": jnp.float32(0.0),
-                "gen/mean_score_of_inserted": jnp.float32(0.0),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -854,8 +844,7 @@ def main(config=None, project="JAXUED_TEST"):
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
             max_returns = compute_max_returns(dones, rewards)
             scores = compute_score(config, dones, values, max_returns, advantages)
-            sampler, insert_indices_mut = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
-            num_inserted_mut = (insert_indices_mut >= 0).sum()
+            sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -880,8 +869,6 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid_mut.mean() * 100,
-                "gen/insertion_rate": num_inserted_mut / config["num_train_envs"],
-                "gen/mean_score_of_inserted": jnp.where(insert_indices_mut >= 0, scores, 0).sum() / jnp.maximum(num_inserted_mut, 1),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -1117,6 +1104,7 @@ def main(config=None, project="JAXUED_TEST"):
     # Save evaluation results
     dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
     os.makedirs(dump_dir, exist_ok=True)
+    gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
     eval_path = os.path.join(dump_dir, "buffer_eval.npz")
     np.savez_compressed(eval_path, solve_rates=solve_rates, paths=agent_paths,
                         episode_lengths=ep_lengths, buffer_scores=buffer_scores, tokens=np.asarray(tokens))
