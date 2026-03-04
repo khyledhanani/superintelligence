@@ -297,7 +297,7 @@ def main():
 
     # Evaluate agent on buffer levels
     t0 = time.time()
-    print(f"[Eval] Running {args.num_attempts} attempts on {size} levels (batch_size=32)...")
+    print(f"[Eval] Running {args.num_attempts} attempts on {size} levels...")
     results = evaluate_on_levels(train_state, env, env_params, buffer_levels, args.num_attempts)
     print(f"[Eval] Completed in {time.time()-t0:.1f}s")
 

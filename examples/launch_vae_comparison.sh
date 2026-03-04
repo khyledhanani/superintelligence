@@ -80,7 +80,7 @@ echo "============================================"
 # ==============================================================================
 # Condition 1: Plain ACCEL (baseline)
 # ==============================================================================
-for seed in "${SEEDS[@]}"; do
+for seed in 1 2; do  # seed 0 already completed
     RUN_NUM=$((RUN_NUM + 1))
     echo ""
     echo "[$RUN_NUM/$TOTAL_RUNS] Plain ACCEL | seed=$seed"
