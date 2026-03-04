@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -137,8 +138,10 @@ def evaluate_on_levels(train_state, env, env_params, levels, num_attempts, batch
     all_paths = []  # list of (num_levels, max_steps, 2) arrays per attempt
 
     eval_env = Maze(max_height=13, max_width=13, agent_view_size=5, normalize_obs=True)
+    n_chunks = (num_levels + batch_size - 1) // batch_size
 
     for attempt_batch_start in range(0, num_attempts, 1):
+        t_attempt = time.time()
         rng = jax.random.PRNGKey(attempt_batch_start + 1000)
 
         # Evaluate in chunks to avoid OOM
@@ -146,7 +149,7 @@ def evaluate_on_levels(train_state, env, env_params, levels, num_attempts, batch
         chunk_lengths = []
         chunk_paths = []
 
-        for start in range(0, num_levels, batch_size):
+        for chunk_idx, start in enumerate(range(0, num_levels, batch_size)):
             end = min(start + batch_size, num_levels)
             chunk_levels = jax.tree_util.tree_map(lambda x: x[start:end], levels)
             n_chunk = end - start
@@ -173,6 +176,9 @@ def evaluate_on_levels(train_state, env, env_params, levels, num_attempts, batch
             chunk_lengths.append(np.asarray(episode_lengths))
             chunk_paths.append(agent_positions)
 
+            if (chunk_idx + 1) % 10 == 0 or chunk_idx == n_chunks - 1:
+                print(f"    Attempt {attempt_batch_start+1}/{num_attempts} | chunk {chunk_idx+1}/{n_chunks} | {end}/{num_levels} levels")
+
         attempt_solve = np.concatenate(chunk_solve)
         attempt_lengths = np.concatenate(chunk_lengths)
         attempt_paths = np.concatenate(chunk_paths, axis=1)  # (max_steps, num_levels, 2)
@@ -180,6 +186,7 @@ def evaluate_on_levels(train_state, env, env_params, levels, num_attempts, batch
         all_solve_rates.append(attempt_solve)
         all_mean_lengths.append(attempt_lengths)
         all_paths.append(attempt_paths)
+        print(f"  [Attempt {attempt_batch_start+1}/{num_attempts}] solve={attempt_solve.mean():.1%} | {time.time()-t_attempt:.1f}s")
 
     # Aggregate across attempts
     solve_rates = np.stack(all_solve_rates).mean(axis=0)  # (num_levels,)
@@ -263,6 +270,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    t_total = time.time()
+
     # Load config
     config_path = os.path.join(args.checkpoint_dir, "config.json")
     with open(config_path) as f:
@@ -272,9 +281,11 @@ def main():
           f"use_cmaes={config.get('use_cmaes')}, use_accel={config.get('use_accel')}")
 
     # Load checkpoint
+    t0 = time.time()
     train_state, env, env_params, network = load_checkpoint(
         args.checkpoint_dir, args.checkpoint_step, config
     )
+    print(f"[Checkpoint] Loaded in {time.time()-t0:.1f}s")
 
     # Extract buffer levels
     sampler = train_state.sampler
@@ -285,13 +296,18 @@ def main():
     buffer_scores = np.asarray(sampler["scores"][:size])
 
     # Evaluate agent on buffer levels
-    print(f"[Eval] Running {args.num_attempts} attempts on {size} levels...")
+    t0 = time.time()
+    print(f"[Eval] Running {args.num_attempts} attempts on {size} levels (batch_size=32)...")
     results = evaluate_on_levels(train_state, env, env_params, buffer_levels, args.num_attempts)
+    print(f"[Eval] Completed in {time.time()-t0:.1f}s")
 
     # Convert buffer to tokens for downstream use
+    t0 = time.time()
     tokens = np.asarray(jax.vmap(level_to_tokens)(buffer_levels))
+    print(f"[Tokens] Converted {size} levels to tokens in {time.time()-t0:.1f}s")
 
     # Save results
+    t0 = time.time()
     np.savez_compressed(
         os.path.join(args.output_dir, "buffer_eval.npz"),
         solve_rates=results["solve_rates"],
@@ -300,7 +316,7 @@ def main():
         tokens=tokens,
         paths=results["paths"],
     )
-    print(f"[Saved] {os.path.join(args.output_dir, 'buffer_eval.npz')}")
+    print(f"[Saved] {os.path.join(args.output_dir, 'buffer_eval.npz')} ({time.time()-t0:.1f}s)")
 
     # Print summary
     print(f"\n--- Buffer Evaluation Summary ---")
@@ -313,6 +329,7 @@ def main():
 
     # Render hardest levels with paths
     if args.n_render > 0:
+        t0 = time.time()
         render_levels_with_paths(
             Maze(max_height=13, max_width=13, agent_view_size=5, normalize_obs=True),
             env_params, buffer_levels,
@@ -323,6 +340,9 @@ def main():
             n_show=args.n_render,
             output_path=os.path.join(args.output_dir, "hardest_levels.png"),
         )
+        print(f"[Render] Completed in {time.time()-t0:.1f}s")
+
+    print(f"\n[Done] Total time: {time.time()-t_total:.1f}s")
 
 
 if __name__ == "__main__":

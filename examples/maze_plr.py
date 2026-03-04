@@ -415,23 +415,16 @@ def train_state_to_log_dict(train_state: TrainState, level_sampler: LevelSampler
     idx = jnp.arange(level_sampler.capacity) < sampler["size"]
     s = jnp.maximum(idx.sum(), 1)
 
-    # Score distribution — sort valid scores, index for percentiles
     scores = sampler["scores"]
-    sorted_scores = jnp.sort(jnp.where(idx, scores, -jnp.inf))
-    n = jnp.maximum(sampler["size"], 1)
-    start = level_sampler.capacity - n  # -inf values sort to front
-
+    mean_score = (scores * idx).sum() / s
     return {
         "log":{
             "level_sampler/size": sampler["size"],
             "level_sampler/episode_count": sampler["episode_count"],
-            "level_sampler/max_score": sampler["scores"].max(),
-            "level_sampler/weighted_score": (sampler["scores"] * level_sampler.level_weights(sampler)).sum(),
-            "level_sampler/mean_score": (sampler["scores"] * idx).sum() / s,
-            "level_sampler/median_score": sorted_scores[start + n // 2],
-            "level_sampler/score_p90": sorted_scores[start + (9 * n) // 10],
-            "level_sampler/score_p10": sorted_scores[start + n // 10],
-            "level_sampler/score_std": jnp.sqrt(((jnp.where(idx, scores, 0) - (jnp.where(idx, scores, 0).sum() / s)) ** 2 * idx).sum() / s),
+            "level_sampler/max_score": scores.max(),
+            "level_sampler/weighted_score": (scores * level_sampler.level_weights(sampler)).sum(),
+            "level_sampler/mean_score": mean_score,
+            "level_sampler/score_std": jnp.sqrt(((jnp.where(idx, scores, 0) - mean_score) ** 2 * idx).sum() / s),
         },
         "info": {
             "num_dr_updates": train_state.num_dr_updates,
@@ -1087,6 +1080,11 @@ def main(config=None, project="JAXUED_TEST"):
     tokens = jax.vmap(level_to_tokens)(buffer_levels)
 
     # === Post-training: evaluate agent on buffer levels ===
+    if config.get("skip_post_eval"):
+        print("[Post-training] Skipped (--skip_post_eval). Use evaluate_buffer.py on the checkpoint later.")
+        wandb.finish()
+        return
+
     print(f"\n[Post-training] Evaluating agent on {size} buffer levels...")
     eval_env_post = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
     max_steps = env_params.max_steps_in_episode
@@ -1353,6 +1351,8 @@ if __name__=="__main__":
                        help="Prefix path within GCS bucket")
     group.add_argument("--buffer_dump_interval", type=int, default=10000,
                        help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
+    group.add_argument("--skip_post_eval", action="store_true", default=False,
+                       help="Skip post-training buffer evaluation, rendering, and PCA (run evaluate_buffer.py separately)")
 
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
