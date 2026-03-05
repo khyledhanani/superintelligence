@@ -240,6 +240,96 @@ plt.tight_layout()
 savefig(fig, "03_score_evolution.png")
 
 
+# ── 3b. Wall Count Analysis ───────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("3b. Wall Count Analysis")
+print("=" * 60)
+
+def count_walls(tokens):
+    """Count walls per level from token sequences. First 50 tokens are wall slots; non-zero = wall."""
+    return (tokens[:, :50] > 0).sum(axis=1)
+
+# Wall count evolution over training
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+for run_name, cfg in CONDITIONS.items():
+    xs, ys_mean, ys_std = [], [], []
+    for ts in DUMP_TIMESTEPS + ["final"]:
+        seed_means = []
+        for seed in SEEDS:
+            dumps = all_data[run_name][seed]["dumps"]
+            if ts in dumps:
+                size = int(dumps[ts].get("size", len(dumps[ts]["tokens"])))
+                tokens = dumps[ts]["tokens"][:size]
+                wc = count_walls(tokens)
+                seed_means.append(wc.mean())
+        if seed_means:
+            x_val = int(ts.replace("k", "")) if ts != "final" else 55
+            xs.append(x_val)
+            ys_mean.append(np.mean(seed_means))
+            ys_std.append(np.std(seed_means))
+
+    xs, ys_mean, ys_std = np.array(xs), np.array(ys_mean), np.array(ys_std)
+    axes[0].plot(xs, ys_mean, color=cfg["color"], marker=cfg["marker"],
+                 label=cfg["label"], linewidth=1.5)
+    axes[0].fill_between(xs, ys_mean - ys_std, ys_mean + ys_std,
+                         color=cfg["color"], alpha=0.15)
+
+axes[0].set_xlabel("Training Update (k)")
+axes[0].set_ylabel("Mean Wall Count")
+axes[0].set_title("Mean Wall Count Over Training", fontweight="bold")
+axes[0].legend(fontsize=8)
+
+# Wall count distribution at final timestep
+for run_name, cfg in CONDITIONS.items():
+    all_wc = []
+    for seed in SEEDS:
+        dumps = all_data[run_name][seed]["dumps"]
+        d = dumps.get("final", dumps[sorted(dumps.keys())[-1]] if dumps else None)
+        if d is not None:
+            size = int(d.get("size", len(d["tokens"])))
+            wc = count_walls(d["tokens"][:size])
+            all_wc.extend(wc)
+    if all_wc:
+        axes[1].hist(all_wc, bins=range(0, 52), alpha=0.4, color=cfg["color"],
+                     label=cfg["label"], density=True)
+
+axes[1].set_xlabel("Wall Count")
+axes[1].set_ylabel("Density")
+axes[1].set_title("Final Buffer Wall Count Distribution", fontweight="bold")
+axes[1].legend(fontsize=8)
+axes[1].axvline(x=50, color="black", linestyle="--", alpha=0.5, label="Max (50)")
+
+plt.tight_layout()
+savefig(fig, "03b_wall_count_analysis.png")
+
+# Wall count vs score scatter (final buffers)
+fig, axes = plt.subplots(1, len(CONDITIONS), figsize=(5 * len(CONDITIONS), 5))
+if len(CONDITIONS) == 1:
+    axes = [axes]
+
+for ax, (run_name, cfg) in zip(axes, CONDITIONS.items()):
+    all_wc, all_sc = [], []
+    for seed in SEEDS:
+        dumps = all_data[run_name][seed]["dumps"]
+        d = dumps.get("final", dumps[sorted(dumps.keys())[-1]] if dumps else None)
+        if d is not None:
+            size = int(d.get("size", len(d["tokens"])))
+            wc = count_walls(d["tokens"][:size])
+            sc = d["scores"][:size]
+            all_wc.extend(wc)
+            all_sc.extend(sc)
+    if all_wc:
+        ax.scatter(all_wc, all_sc, alpha=0.15, s=4, color=cfg["color"])
+        ax.set_xlabel("Wall Count")
+        ax.set_ylabel("Score (regret)")
+        ax.set_title(cfg["label"], fontweight="bold")
+
+plt.suptitle("Wall Count vs Score (Final Buffers)", fontsize=14, fontweight="bold")
+plt.tight_layout()
+savefig(fig, "03c_wall_count_vs_score.png")
+
+
 # ── 4. Cross-Condition Latent PCA ─────────────────────────────────────────
 print("\n" + "=" * 60)
 print("4. Cross-Condition Latent PCA")
