@@ -1133,6 +1133,21 @@ if __name__=="__main__":
         "StandardMaze",
         "StandardMaze2",
         "StandardMaze3",
+        "NarrowBridge",
+        "ForkDeception",
+        "PerimeterRun",
+        "SpiralPocket",
+        "SymmetricCross",
+        "ZigZagTunnel",
+        "RoomKeyhole",
+        "DualLoopChoice",
+        "CentralChoke",
+        "LongDetour",
+        "DeadendFan",
+        "OpenFieldBarriers",
+        "ParallelCorridors",
+        "CornerTrapEscape",
+        "SnakeSpine",
     ])
     group = parser.add_argument_group('Training params')
     # === PPO === 
