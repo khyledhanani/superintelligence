@@ -96,6 +96,10 @@ Recent decisions affecting current work:
 - [Phase 05-ablations-and-analysis]: read -r pause after smoke test gates user verification (buf_score > 0.004) before 20k full runs
 - [Phase 05-ablations-and-analysis]: ACCEL baseline runs examples/maze_plr.py black-box; WandB run name/group adjusted manually in UI post-run
 
+### Roadmap Evolution
+
+- Phase 05.1 inserted after Phase 5: Pipeline fixes and re-run (URGENT) — SV-CMA-ES collapse, ACCEL cuSolver failure, CMA-ES restart threshold, VAE decoder update
+
 ### Pending Todos
 
 None yet.
