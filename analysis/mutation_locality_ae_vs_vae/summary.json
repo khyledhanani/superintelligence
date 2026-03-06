@@ -1,0 +1,16 @@
+{
+  "dataset": "vae/datasets/plr_pvl_dataset.npz",
+  "num_parents": 2000,
+  "checkpoints": {
+    "vae": "/Users/khyledhanani/Documents/openend/superintelligence/vae/model/checkpoint_420000.pkl",
+    "ae": "/Users/khyledhanani/Documents/openend/superintelligence/vae/model_maze_ae/checkpoint_final.pkl"
+  },
+  "sigmas": [
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0
+  ],
+  "results_csv": "analysis/mutation_locality_ae_vs_vae/locality_results.csv"
+}

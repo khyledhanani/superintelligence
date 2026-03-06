@@ -30,7 +30,7 @@ if ROOT_DIR not in sys.path:
 
 from es.vae_decoder import load_vae_params, extract_decoder_params, decode_latent_to_env, repair_cluttr_sequence
 from es.cluttr_encoder import extract_encoder_params, encode_levels_to_latents
-from es.env_bridge import level_to_cluttr_sequence, cluttr_sequence_to_level
+from es.env_bridge import level_to_cluttr_sequence, cluttr_sequence_to_level, bfs_path_length
 from es.maze_ae import (
     load_maze_ae_params, extract_maze_encoder_params, extract_maze_decoder_params,
     maze_level_to_grid, encode_maze_levels, decode_maze_latents,
@@ -61,8 +61,12 @@ class TrainState(BaseTrainState):
     num_dr_updates: int
     num_replay_updates: int
     num_mutation_updates: int
+    num_plwm_compared: int
+    num_plwm_improved: int
+    plwm_last_uphill_fraction: chex.Array
     dr_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     replay_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
+    replay_last_level_inds: chex.Array = struct.field(pytree_node=True)
     mutation_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
 
 # region PPO helper functions
@@ -427,6 +431,12 @@ def train_state_to_log_dict(
 
     if use_plwm:
         log["plwm/num_mutations"] = train_state.num_mutation_updates
+        log["plwm/last_uphill_fraction"] = train_state.plwm_last_uphill_fraction
+        log["plwm/cumulative_uphill_fraction"] = (
+            train_state.num_plwm_improved / jnp.maximum(train_state.num_plwm_compared, 1)
+        )
+        log["plwm/num_compared"] = train_state.num_plwm_compared
+        log["plwm/num_improved"] = train_state.num_plwm_improved
 
     return {
         "log": log,
@@ -444,6 +454,63 @@ def compute_score(config, dones, values, max_returns, advantages):
         return positive_value_loss(dones, advantages)
     else:
         raise ValueError(f"Unknown score function: {config['score_function']}")
+
+
+def structural_difficulty_surrogate(
+    wall_map: chex.Array,
+    goal_pos: chex.Array,
+    agent_pos: chex.Array,
+    *,
+    weight_bfs: float,
+    weight_slack: float,
+    weight_dead_ends: float,
+    weight_walls: float,
+    weight_branches: float,
+    require_solvable: bool,
+) -> chex.Array:
+    """Structural difficulty proxy used for surrogate-guided PLWM candidate ranking.
+
+    Inputs are batched:
+      wall_map   : (B, H, W) bool
+      goal_pos   : (B, 2) [x, y]
+      agent_pos  : (B, 2) [x, y]
+    Returns:
+      surrogate score per candidate, shape (B,)
+    """
+    h = wall_map.shape[1]
+    w = wall_map.shape[2]
+    inf = h * w
+
+    bfs = jax.vmap(bfs_path_length)(wall_map, agent_pos, goal_pos).astype(jnp.float32)
+    manhattan = (
+        jnp.abs(goal_pos[:, 0].astype(jnp.int32) - agent_pos[:, 0].astype(jnp.int32))
+        + jnp.abs(goal_pos[:, 1].astype(jnp.int32) - agent_pos[:, 1].astype(jnp.int32))
+    ).astype(jnp.float32)
+    slack = bfs - manhattan
+
+    walls = wall_map.astype(jnp.bool_)
+    free = ~walls
+
+    up = jnp.roll(free, -1, axis=1).at[:, -1, :].set(False)
+    down = jnp.roll(free, 1, axis=1).at[:, 0, :].set(False)
+    left = jnp.roll(free, -1, axis=2).at[:, :, -1].set(False)
+    right = jnp.roll(free, 1, axis=2).at[:, :, 0].set(False)
+    degree = up.astype(jnp.int32) + down.astype(jnp.int32) + left.astype(jnp.int32) + right.astype(jnp.int32)
+
+    dead_ends = jnp.sum(free & (degree == 1), axis=(1, 2)).astype(jnp.float32)
+    branch_points = jnp.sum(free & (degree >= 3), axis=(1, 2)).astype(jnp.float32)
+    wall_count = jnp.sum(walls, axis=(1, 2)).astype(jnp.float32)
+
+    score = (
+        weight_bfs * bfs
+        + weight_slack * slack
+        + weight_dead_ends * dead_ends
+        + weight_walls * wall_count
+        + weight_branches * branch_points
+    )
+    if require_solvable:
+        score = jnp.where(bfs < inf, score, -1e9)
+    return score
 
 def main(config=None, project="JAXUED_TEST"):
     tags = []
@@ -610,6 +677,20 @@ def main(config=None, project="JAXUED_TEST"):
                 f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
             )
 
+        if config["plwm_surrogate_guided"]:
+            if int(config["plwm_surrogate_num_candidates"]) < 1:
+                raise ValueError("--plwm_surrogate_num_candidates must be >= 1.")
+            print(
+                "PLWM surrogate guidance enabled: "
+                f"candidates={config['plwm_surrogate_num_candidates']}, "
+                f"weights(bfs={config['plwm_surrogate_weight_bfs']}, "
+                f"slack={config['plwm_surrogate_weight_slack']}, "
+                f"dead={config['plwm_surrogate_weight_dead_ends']}, "
+                f"walls={config['plwm_surrogate_weight_walls']}, "
+                f"branch={config['plwm_surrogate_weight_branches']}), "
+                f"require_solvable={config['plwm_surrogate_require_solvable']}"
+            )
+
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
@@ -661,6 +742,7 @@ def main(config=None, project="JAXUED_TEST"):
         sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
         me_archive = init_map_elites_archive(me_latent_dim, cells=me_archive_cells)
         pholder_level_batch = jax.tree_util.tree_map(lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0), pholder_level)
+        pholder_level_inds = jnp.zeros((config["num_train_envs"],), dtype=jnp.int32)
         return TrainState.create(
             apply_fn=network.apply,
             params=network_params,
@@ -671,8 +753,12 @@ def main(config=None, project="JAXUED_TEST"):
             num_dr_updates=0,
             num_replay_updates=0,
             num_mutation_updates=0,
+            num_plwm_compared=0,
+            num_plwm_improved=0,
+            plwm_last_uphill_fraction=jnp.array(0.0, dtype=jnp.float32),
             dr_last_level_batch=pholder_level_batch,
             replay_last_level_batch=pholder_level_batch,
+            replay_last_level_inds=pholder_level_inds,
             mutation_last_level_batch=pholder_level_batch,
         )
 
@@ -797,6 +883,7 @@ def main(config=None, project="JAXUED_TEST"):
                 update_state=UpdateState.REPLAY,
                 num_replay_updates=train_state.num_replay_updates + 1,
                 replay_last_level_batch=levels,
+                replay_last_level_inds=level_inds,
             )
             return (rng, train_state), metrics
         
@@ -828,7 +915,11 @@ def main(config=None, project="JAXUED_TEST"):
                 #   Parents = replay_last_level_batch (already PLR score-weighted).
                 #   Encode -> perturb -> decode -> evaluate -> PLR insert.
                 parent_levels = train_state.replay_last_level_batch
+                parent_level_inds = train_state.replay_last_level_inds
+                parent_scores = train_state.sampler["scores"][parent_level_inds]
                 rng_mutate, rng_encode, rng_decode, rng_levels_key = jax.random.split(rng_mutate, 4)
+                batch_size = config["num_train_envs"]
+                num_candidates = int(config["plwm_surrogate_num_candidates"])
 
                 if config["plwm_use_maze_ae"]:
                     # ---- Grid-based CNN AE path (full wall coverage) ----
@@ -842,18 +933,62 @@ def main(config=None, project="JAXUED_TEST"):
                     # Encode
                     parent_latents = encode_maze_levels(maze_encoder_params, parent_grids)
 
-                    # Perturb
-                    noise = jax.random.normal(rng_encode, parent_latents.shape)
-                    child_latents = parent_latents + float(config["plwm_sigma"]) * noise
+                    if config["plwm_surrogate_guided"]:
+                        # Sample multiple perturbation candidates per parent and keep the
+                        # structurally hardest one under a configurable surrogate.
+                        candidate_noise = jax.random.normal(
+                            rng_encode,
+                            (batch_size, num_candidates, parent_latents.shape[-1]),
+                        )
+                        candidate_latents = (
+                            parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
+                        )
+                        flat_latents = candidate_latents.reshape((batch_size * num_candidates, -1))
 
-                    # Decode -> Level (with Gumbel-max sampling + repair)
-                    child_levels = decode_maze_latents(
-                        maze_decoder_params,
-                        child_latents,
-                        jax.random.split(rng_decode, config["num_train_envs"]),
-                        wall_threshold=0.5,
-                        temperature=float(config["plwm_decode_temperature"]),
-                    )
+                        candidate_levels_flat = decode_maze_latents(
+                            maze_decoder_params,
+                            flat_latents,
+                            jax.random.split(rng_decode, batch_size * num_candidates),
+                            wall_threshold=0.5,
+                            temperature=float(config["plwm_decode_temperature"]),
+                        )
+                        surrogate_scores_flat = structural_difficulty_surrogate(
+                            candidate_levels_flat.wall_map,
+                            candidate_levels_flat.goal_pos,
+                            candidate_levels_flat.agent_pos,
+                            weight_bfs=float(config["plwm_surrogate_weight_bfs"]),
+                            weight_slack=float(config["plwm_surrogate_weight_slack"]),
+                            weight_dead_ends=float(config["plwm_surrogate_weight_dead_ends"]),
+                            weight_walls=float(config["plwm_surrogate_weight_walls"]),
+                            weight_branches=float(config["plwm_surrogate_weight_branches"]),
+                            require_solvable=bool(config["plwm_surrogate_require_solvable"]),
+                        )
+                        surrogate_scores = surrogate_scores_flat.reshape((batch_size, num_candidates))
+                        best_idx = jnp.argmax(surrogate_scores, axis=1)
+                        row_idx = jnp.arange(batch_size)
+
+                        child_latents = candidate_latents[row_idx, best_idx]
+                        candidate_levels = jax.tree_util.tree_map(
+                            lambda x: x.reshape((batch_size, num_candidates, *x.shape[1:])),
+                            candidate_levels_flat,
+                        )
+                        child_levels = jax.tree_util.tree_map(
+                            lambda x: x[row_idx, best_idx],
+                            candidate_levels,
+                        )
+                    else:
+                        # Perturb once per parent (legacy PLWM behavior).
+                        noise = jax.random.normal(rng_encode, parent_latents.shape)
+                        child_latents = parent_latents + float(config["plwm_sigma"]) * noise
+
+                        # Decode -> Level (with Gumbel-max sampling + repair)
+                        child_levels = decode_maze_latents(
+                            maze_decoder_params,
+                            child_latents,
+                            jax.random.split(rng_decode, batch_size),
+                            wall_threshold=0.5,
+                            temperature=float(config["plwm_decode_temperature"]),
+                        )
                 else:
                     # ---- CLUTTR sequence VAE path (legacy, ≤50 walls) ----
                     parent_seqs = jax.vmap(level_to_cluttr_sequence)(
@@ -864,21 +999,69 @@ def main(config=None, project="JAXUED_TEST"):
 
                     parent_latents = encode_levels_to_latents(encoder_params, parent_seqs)
 
-                    noise = jax.random.normal(rng_encode, parent_latents.shape)
-                    child_latents = parent_latents + float(config["plwm_sigma"]) * noise
+                    if config["plwm_surrogate_guided"]:
+                        candidate_noise = jax.random.normal(
+                            rng_encode,
+                            (batch_size, num_candidates, parent_latents.shape[-1]),
+                        )
+                        candidate_latents = (
+                            parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
+                        )
+                        flat_latents = candidate_latents.reshape((batch_size * num_candidates, -1))
 
-                    child_sequences = decode_latent_to_env(
-                        decoder_params, child_latents,
-                        rng_key=rng_decode,
-                        temperature=float(config["plwm_decode_temperature"]),
-                    )
-                    child_sequences = jax.vmap(repair_cluttr_sequence)(child_sequences)
-                    child_levels = jax.vmap(cluttr_sequence_to_level)(
-                        child_sequences,
-                        jax.random.split(rng_levels_key, config["num_train_envs"]),
-                    )
+                        child_sequences_flat = decode_latent_to_env(
+                            decoder_params,
+                            flat_latents,
+                            rng_key=rng_decode,
+                            temperature=float(config["plwm_decode_temperature"]),
+                        )
+                        child_sequences_flat = jax.vmap(repair_cluttr_sequence)(child_sequences_flat)
+                        candidate_levels_flat = jax.vmap(cluttr_sequence_to_level)(
+                            child_sequences_flat,
+                            jax.random.split(rng_levels_key, batch_size * num_candidates),
+                        )
+                        surrogate_scores_flat = structural_difficulty_surrogate(
+                            candidate_levels_flat.wall_map,
+                            candidate_levels_flat.goal_pos,
+                            candidate_levels_flat.agent_pos,
+                            weight_bfs=float(config["plwm_surrogate_weight_bfs"]),
+                            weight_slack=float(config["plwm_surrogate_weight_slack"]),
+                            weight_dead_ends=float(config["plwm_surrogate_weight_dead_ends"]),
+                            weight_walls=float(config["plwm_surrogate_weight_walls"]),
+                            weight_branches=float(config["plwm_surrogate_weight_branches"]),
+                            require_solvable=bool(config["plwm_surrogate_require_solvable"]),
+                        )
+                        surrogate_scores = surrogate_scores_flat.reshape((batch_size, num_candidates))
+                        best_idx = jnp.argmax(surrogate_scores, axis=1)
+                        row_idx = jnp.arange(batch_size)
+
+                        child_latents = candidate_latents[row_idx, best_idx]
+                        child_sequences = child_sequences_flat.reshape((batch_size, num_candidates, -1))[row_idx, best_idx]
+                        candidate_levels = jax.tree_util.tree_map(
+                            lambda x: x.reshape((batch_size, num_candidates, *x.shape[1:])),
+                            candidate_levels_flat,
+                        )
+                        child_levels = jax.tree_util.tree_map(
+                            lambda x: x[row_idx, best_idx],
+                            candidate_levels,
+                        )
+                    else:
+                        noise = jax.random.normal(rng_encode, parent_latents.shape)
+                        child_latents = parent_latents + float(config["plwm_sigma"]) * noise
+
+                        child_sequences = decode_latent_to_env(
+                            decoder_params, child_latents,
+                            rng_key=rng_decode,
+                            temperature=float(config["plwm_decode_temperature"]),
+                        )
+                        child_sequences = jax.vmap(repair_cluttr_sequence)(child_sequences)
+                        child_levels = jax.vmap(cluttr_sequence_to_level)(
+                            child_sequences,
+                            jax.random.split(rng_levels_key, batch_size),
+                        )
             else:
                 parent_levels = train_state.replay_last_level_batch
+                parent_scores = jnp.zeros((config["num_train_envs"],), dtype=jnp.float32)
                 child_levels = jax.vmap(mutate_level, (0, 0, None))(
                     jax.random.split(rng_mutate, config["num_train_envs"]),
                     parent_levels,
@@ -907,6 +1090,17 @@ def main(config=None, project="JAXUED_TEST"):
             max_returns = compute_max_returns(dones, rewards)
             scores = compute_score(config, dones, values, max_returns, advantages)
             sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+
+            # Track how often selected PLWM mutations improve over their replay parent score.
+            plwm_batch_uphill_fraction = jnp.array(0.0, dtype=jnp.float32)
+            plwm_batch_compared = jnp.array(0, dtype=jnp.int32)
+            plwm_batch_improved = jnp.array(0, dtype=jnp.int32)
+            if config["use_plwm_mutation"]:
+                plwm_batch_compared = jnp.array(config["num_train_envs"], dtype=jnp.int32)
+                plwm_batch_improved = jnp.sum(scores > parent_scores).astype(jnp.int32)
+                plwm_batch_uphill_fraction = plwm_batch_improved.astype(jnp.float32) / jnp.maximum(
+                    plwm_batch_compared.astype(jnp.float32), 1.0
+                )
 
             if config["use_map_elites_mutation"]:
                 should_update_archive = (train_state.num_mutation_updates % me_update_period) == 0
@@ -956,6 +1150,7 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
                 "me_insertions": me_insertions,
+                "plwm_batch_uphill_fraction": plwm_batch_uphill_fraction,
             }
             
             train_state = train_state.replace(
@@ -963,6 +1158,9 @@ def main(config=None, project="JAXUED_TEST"):
                 me_archive=me_archive,
                 update_state=UpdateState.DR,
                 num_mutation_updates=train_state.num_mutation_updates + 1,
+                num_plwm_compared=train_state.num_plwm_compared + plwm_batch_compared,
+                num_plwm_improved=train_state.num_plwm_improved + plwm_batch_improved,
+                plwm_last_uphill_fraction=plwm_batch_uphill_fraction,
                 mutation_last_level_batch=child_levels,
             )
             return (rng, train_state), metrics
@@ -1208,6 +1406,25 @@ if __name__=="__main__":
     group.add_argument("--plwm_decode_temperature", type=float, default=0.25,
                        help="Gumbel-max sampling temperature for PLWM decoder. "
                             "Lower = more deterministic. Default 0.25.")
+    group.add_argument("--plwm_surrogate_guided", action=argparse.BooleanOptionalAction, default=False,
+                       help="If set, sample multiple latent perturbation candidates per parent "
+                            "and choose the best candidate using a structural difficulty surrogate.")
+    group.add_argument("--plwm_surrogate_num_candidates", type=int, default=8,
+                       help="Number of latent perturbation candidates per parent when surrogate-guided "
+                            "PLWM is enabled. Default 8.")
+    group.add_argument("--plwm_surrogate_weight_bfs", type=float, default=1.0,
+                       help="Weight for BFS path length in structural surrogate score.")
+    group.add_argument("--plwm_surrogate_weight_slack", type=float, default=1.0,
+                       help="Weight for path slack (BFS - Manhattan) in structural surrogate score.")
+    group.add_argument("--plwm_surrogate_weight_dead_ends", type=float, default=0.2,
+                       help="Weight for dead-end count in structural surrogate score.")
+    group.add_argument("--plwm_surrogate_weight_walls", type=float, default=0.05,
+                       help="Weight for wall count in structural surrogate score.")
+    group.add_argument("--plwm_surrogate_weight_branches", type=float, default=0.0,
+                       help="Weight for branch-point count in structural surrogate score.")
+    group.add_argument("--plwm_surrogate_require_solvable", action=argparse.BooleanOptionalAction, default=True,
+                       help="If set, surrogate score for unsolvable candidate levels is forced to -inf "
+                            "so only solvable candidates are selected.")
     group.add_argument("--plwm_use_maze_ae", action=argparse.BooleanOptionalAction, default=False,
                        help="Use the grid-based CNN AE (SIGReg) instead of the CLUTTR sequence "
                             "VAE for PLWM encoding/decoding. Requires --use_plwm_mutation. "

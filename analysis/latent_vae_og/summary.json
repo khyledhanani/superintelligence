@@ -1,0 +1,106 @@
+{
+  "dataset_root": "/Users/khyledhanani/Documents/superintelligence/vae/datasets/vae_og",
+  "es_module_root": "/Users/khyledhanani/Documents/superintelligence",
+  "sample_counts": {
+    "train": 15000,
+    "val": 3000,
+    "total": 18000
+  },
+  "checkpoints": {
+    "cluttr": "/Users/khyledhanani/Documents/superintelligence/vae/model/checkpoint_420000.pkl",
+    "maze_ae": "/Users/khyledhanani/Documents/openend/superintelligence/vae/model_maze_ae/checkpoint_final.pkl"
+  },
+  "cross_model_geometry": {
+    "pair_distance_pearson": 0.1162362786518221,
+    "pair_distance_spearman": 0.10569342857943678,
+    "knn_overlap_at_k": 0.023799999999999964,
+    "top1_neighbor_agreement": 0.018,
+    "pair_samples": 199988
+  },
+  "pca_variance_ratio": {
+    "cluttr_pc1": 0.04252516851424962,
+    "cluttr_pc2": 0.04155450836303802,
+    "maze_pc1": 0.019641192317761645,
+    "maze_pc2": 0.019561113537875974
+  },
+  "metric_alignment": {
+    "cluttr_all": [
+      {
+        "metric": "wall_count",
+        "best_dim": 24,
+        "corr": -0.6967018196674629
+      },
+      {
+        "metric": "free_count",
+        "best_dim": 24,
+        "corr": 0.6967018196674629
+      },
+      {
+        "metric": "branch_points",
+        "best_dim": 24,
+        "corr": 0.6951837792745722
+      },
+      {
+        "metric": "dead_ends",
+        "best_dim": 24,
+        "corr": -0.5452050810299817
+      },
+      {
+        "metric": "manhattan",
+        "best_dim": 29,
+        "corr": -0.07089851900155648
+      }
+    ],
+    "maze_all": [
+      {
+        "metric": "wall_count",
+        "best_dim": 11,
+        "corr": -0.23132514784923788
+      },
+      {
+        "metric": "free_count",
+        "best_dim": 11,
+        "corr": 0.23132514784923788
+      },
+      {
+        "metric": "branch_points",
+        "best_dim": 11,
+        "corr": 0.22969148516427948
+      },
+      {
+        "metric": "dead_ends",
+        "best_dim": 55,
+        "corr": -0.19199074583089645
+      },
+      {
+        "metric": "manhattan",
+        "best_dim": 32,
+        "corr": 0.07484335332636252
+      }
+    ],
+    "cluttr_bfs_subset": [
+      {
+        "metric": "path_slack_subset",
+        "best_dim": 24,
+        "corr": -0.1741499528620124
+      },
+      {
+        "metric": "bfs_path_len_subset",
+        "best_dim": 27,
+        "corr": -0.08780438966721404
+      }
+    ],
+    "maze_bfs_subset": [
+      {
+        "metric": "bfs_path_len_subset",
+        "best_dim": 8,
+        "corr": 0.08957603011245731
+      },
+      {
+        "metric": "path_slack_subset",
+        "best_dim": 60,
+        "corr": -0.08194971900449385
+      }
+    ]
+  }
+}
