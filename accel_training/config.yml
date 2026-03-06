@@ -43,7 +43,7 @@ eval_freq: 500           # Eval + log every N updates
 checkpoint_every: 2000   # Save checkpoint every N updates
 
 # --- Paths ---
-vae_checkpoint: vae/model/checkpoint_420000.pkl
+vae_checkpoint: vae/model/checkpoint_final.pkl   # updated for Phase 5.1 re-run
 log_dir: runs/es_two_mode/
 run_name: sv_cma_es_n2_eps001
 
