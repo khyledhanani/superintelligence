@@ -429,14 +429,22 @@ def train_state_to_log_dict(
         if "mean_staleness" in me:
             log["map_elites/mean_staleness"] = me["mean_staleness"]
 
+    # Generic mutation uphill stats (valid for PLWM and base ACCEL minimax mutation).
+    log["mutation/num_mutations"] = train_state.num_mutation_updates
+    log["mutation/last_uphill_fraction"] = train_state.plwm_last_uphill_fraction
+    log["mutation/cumulative_uphill_fraction"] = (
+        train_state.num_plwm_improved / jnp.maximum(train_state.num_plwm_compared, 1)
+    )
+    log["mutation/num_compared"] = train_state.num_plwm_compared
+    log["mutation/num_improved"] = train_state.num_plwm_improved
+
     if use_plwm:
-        log["plwm/num_mutations"] = train_state.num_mutation_updates
-        log["plwm/last_uphill_fraction"] = train_state.plwm_last_uphill_fraction
-        log["plwm/cumulative_uphill_fraction"] = (
-            train_state.num_plwm_improved / jnp.maximum(train_state.num_plwm_compared, 1)
-        )
-        log["plwm/num_compared"] = train_state.num_plwm_compared
-        log["plwm/num_improved"] = train_state.num_plwm_improved
+        # Backward-compatible aliases for existing dashboards.
+        log["plwm/num_mutations"] = log["mutation/num_mutations"]
+        log["plwm/last_uphill_fraction"] = log["mutation/last_uphill_fraction"]
+        log["plwm/cumulative_uphill_fraction"] = log["mutation/cumulative_uphill_fraction"]
+        log["plwm/num_compared"] = log["mutation/num_compared"]
+        log["plwm/num_improved"] = log["mutation/num_improved"]
 
     return {
         "log": log,
@@ -534,6 +542,7 @@ def main(config=None, project="JAXUED_TEST"):
     wandb.define_metric("agent/*", step_metric="num_updates")
     wandb.define_metric("return/*", step_metric="num_updates")
     wandb.define_metric("eval_ep_lengths/*", step_metric="num_updates")
+    wandb.define_metric("mutation/*", step_metric="num_updates")
 
     def log_eval(stats, train_state_info):
         print(f"Logging update: {stats['update_count']}")
@@ -1063,7 +1072,8 @@ def main(config=None, project="JAXUED_TEST"):
                         )
             else:
                 parent_levels = train_state.replay_last_level_batch
-                parent_scores = jnp.zeros((config["num_train_envs"],), dtype=jnp.float32)
+                parent_level_inds = train_state.replay_last_level_inds
+                parent_scores = train_state.sampler["scores"][parent_level_inds]
                 child_levels = jax.vmap(mutate_level, (0, 0, None))(
                     jax.random.split(rng_mutate, config["num_train_envs"]),
                     parent_levels,
@@ -1097,7 +1107,7 @@ def main(config=None, project="JAXUED_TEST"):
             plwm_batch_uphill_fraction = jnp.array(0.0, dtype=jnp.float32)
             plwm_batch_compared = jnp.array(0, dtype=jnp.int32)
             plwm_batch_improved = jnp.array(0, dtype=jnp.int32)
-            if config["use_plwm_mutation"]:
+            if not config["use_map_elites_mutation"]:
                 plwm_batch_compared = jnp.array(config["num_train_envs"], dtype=jnp.int32)
                 plwm_batch_improved = jnp.sum(scores > parent_scores).astype(jnp.int32)
                 plwm_batch_uphill_fraction = plwm_batch_improved.astype(jnp.float32) / jnp.maximum(
