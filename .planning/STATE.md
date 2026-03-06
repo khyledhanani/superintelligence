@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** The ES module must find diverse, high-regret environments that continuously challenge the agent — without collapsing to a single mode — so the agent develops generalizable skills through open-ended curriculum learning.
-**Current focus:** Phase 5 — Ablations and Analysis
+**Current focus:** Phase 5.1 — Pipeline Fixes and Re-run
 
 ## Current Position
 
-Phase: 5 of 5 (Ablations and Analysis)
-Plan: 2 of 2 in current phase (Plan 2 COMPLETE)
-Status: Phase 5 Complete
-Last activity: 2026-03-03 — Completed 05-02 (Phase 5 Plan 2: Experiment Launcher and Thesis Notebook)
+Phase: 5.1 (Pipeline Fixes and Re-run)
+Plan: 1 of 4 in current phase (Plan 1 COMPLETE)
+Status: In Progress
+Last activity: 2026-03-06 — Completed 05.1-01 (Phase 5.1 Plan 1: Code Fixes)
 
-Progress: [██████████] 100%
+Progress: [██████████] 100% (prior phases) + Phase 5.1 in progress
 
 ## Performance Metrics
 
@@ -46,6 +46,7 @@ Progress: [██████████] 100%
 | Phase 04-behavioral-sv-cma-es P03 | 2 | 1 task | 1 file |
 | Phase 05-ablations-and-analysis P01 | 9 | 2 tasks | 4 files |
 | Phase 05-ablations-and-analysis P02 | 2 | 2 tasks | 2 files |
+| Phase 05.1-pipeline-fixes-and-re-run P01 | 12 | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -95,6 +96,10 @@ Recent decisions affecting current work:
 - [Phase 05-ablations-and-analysis]: Sequential execution (no backgrounding) in launcher avoids JAX GPU OOM on shared machine
 - [Phase 05-ablations-and-analysis]: read -r pause after smoke test gates user verification (buf_score > 0.004) before 20k full runs
 - [Phase 05-ablations-and-analysis]: ACCEL baseline runs examples/maze_plr.py black-box; WandB run name/group adjusted manually in UI post-run
+- [05.1-01]: cma_restart_threshold raised 0.01->0.05; sigma_init=0.5 so threshold fires at sigma<0.025, gives 3-5 IPOP restarts per 20k run
+- [05.1-01]: SV-CMA-ES mean clamp radius 3.0 matches unit normal VAE prior; valid latents approximately in [-3, 3]^64
+- [05.1-01]: ACCEL script uses WANDB_RUN_GROUP env var not --group flag; maze_plr.py argparse has no --group argument
+- [05.1-01]: ACCEL script must be standalone (fresh tmux window); cuSolver handle leak occurs when chaining after ES jobs in same CUDA context
 
 ### Roadmap Evolution
 
@@ -113,6 +118,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-03
-Stopped at: Completed 05-02-PLAN.md (Phase 5 Plan 2: Experiment Launcher and Thesis Notebook)
+Last session: 2026-03-06
+Stopped at: Completed 05.1-01-PLAN.md (Phase 5.1 Plan 1: Code Fixes — CMA-ES threshold, SV-CMA-ES clamping, ACCEL script)
 Resume file: None

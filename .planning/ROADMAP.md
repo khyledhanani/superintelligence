@@ -138,5 +138,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
 | 4. Behavioral SV-CMA-ES | 3/3 | Complete | 2026-03-02 |
 | 5. Refactor and Four-Way Comparison | 2/2 | Complete   | 2026-03-03 |
-| 5.1 Pipeline fixes and re-run | 0/4 | Not started | - |
+| 5.1 Pipeline fixes and re-run | 1/4 | In Progress|  |
 | 6. Ablation Studies | 0/TBD | Not started | - |
