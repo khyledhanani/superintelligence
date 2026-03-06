@@ -96,6 +96,25 @@ Plans:
 - [ ] 05-01-PLAN.md — Rewrite train.py as two-mode pipeline + update config.yml and tests
 - [ ] 05-02-PLAN.md — Launcher script for four experiments + Jupyter notebook for thesis figures
 
+### Phase 05.1: Pipeline fixes and re-run (INSERTED)
+
+**Goal:** Fix all four blockers from Phase 5 verification gaps (ACCEL cuSolver, SV-CMA-ES collapse, CMA-ES restart threshold, VAE decoder) and re-run the full 4-way 20k comparison with working strategies
+**Depends on:** Phase 5
+**Requirements**: COMP-01
+**Success Criteria** (what must be TRUE):
+  1. ACCEL baseline (examples/maze_plr.py) runs to completion on sideswipe/prowl without cuSolver errors
+  2. SV-CMA-ES runs 20k updates without valid_fraction collapsing to 0 (stays above 0.3 throughout)
+  3. CMA-ES restart threshold tuned so restarts fire at least 3-5 times during a 20k run
+  4. VAE decoder updated to latest checkpoint; decoded mazes are visually diverse and valid
+  5. All four 20k experiments complete and agents evaluated on prefab test mazes with non-trivial solve rates
+**Plans:** 4 plans
+
+Plans:
+- [ ] 05.1-01-PLAN.md — Run status check + code fixes (CMA-ES threshold, SV-CMA-ES mean clamping, ACCEL script)
+- [ ] 05.1-02-PLAN.md — VAE checkpoint human gate + config update + ACCEL baseline launch
+- [ ] 05.1-03-PLAN.md — SV-CMA-ES v2 re-run with new checkpoint and mean clamping
+- [ ] 05.1-04-PLAN.md — Evaluation on 8-level DCD benchmark + thesis figures
+
 ### Phase 6: Ablation Studies
 **Goal**: Fitness weight ablations quantify the contribution of novelty in SV-CMA-ES, and agents are evaluated on held-out validation mazes
 **Depends on**: Phase 5
@@ -119,4 +138,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. NS-ES Integration | 3/3 | Complete | 2026-03-02 |
 | 4. Behavioral SV-CMA-ES | 3/3 | Complete | 2026-03-02 |
 | 5. Refactor and Four-Way Comparison | 2/2 | Complete   | 2026-03-03 |
+| 5.1 Pipeline fixes and re-run | 0/4 | Not started | - |
 | 6. Ablation Studies | 0/TBD | Not started | - |
