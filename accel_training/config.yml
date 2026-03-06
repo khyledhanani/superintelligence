@@ -57,6 +57,7 @@ es_alpha: 0.8             # regret weight in composite fitness F = alpha*regret 
 es_beta: 0.2              # novelty weight in composite fitness
 es_pop_size: 16           # ES population size
 es_sigma_init: 0.5        # initial CMA-ES sigma
+cma_restart_threshold: 0.05  # restart CMA-ES when sigma < this fraction of sigma_init (was 0.01; 0.05 gives 3-5 restarts/20k)
 es_k_novelty: 5           # k for k-NN novelty scoring
 
 # --- SV-CMA-ES (Phase 4) ---

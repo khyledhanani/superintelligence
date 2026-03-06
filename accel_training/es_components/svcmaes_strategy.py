@@ -147,6 +147,7 @@ class SVCMAESStrategy:
         post_regrets: jnp.ndarray,
         post_bsigs: jnp.ndarray,
         epsilon: float,
+        valid_mask: jnp.ndarray | None = None,
     ) -> tuple[dict, dict]:
         """Update all N particle CMA states and apply Stein repulsion to means.
 
@@ -156,7 +157,8 @@ class SVCMAESStrategy:
         and the Stein mean adjustment.
 
         Fitness sign: regret is negated before passing to evosax (evosax minimizes;
-        we maximize regret). Stein repulsion is applied AFTER tell() — per CONTEXT
+        we maximize regret). Invalid candidates receive penalty fitness (+10.0) so
+        CMA-ES ranks them worst. Stein repulsion is applied AFTER tell() — per CONTEXT
         step order 6: update CMA means using Stein gradient computed from post-bsigs.
 
         Args:
@@ -167,6 +169,9 @@ class SVCMAESStrategy:
             post_regrets: (N*pop_size,) — second-pass regrets (positive; will be negated).
             post_bsigs:   (N*pop_size, D_bsig) — second-pass behavior signatures.
             epsilon:      float — Stein repulsion step size.
+            valid_mask:   (N*pop_size,) bool or None — True for valid post-pass candidates.
+                          Invalid candidates receive penalty fitness; NaN bsigs handled
+                          via nanmean.
 
         Returns:
             (new_state, metrics_dict) where:
@@ -181,9 +186,9 @@ class SVCMAESStrategy:
         dummy_key = jax.random.PRNGKey(0)
 
         # --- Pre-repulsion diversity metric ---
-        # Average behavior sig per particle over its pop_size candidates.
+        # NaN-safe averaging: nanmean ignores NaN from invalid candidates.
         particle_pre_bsigs = jnp.stack([
-            jnp.mean(pre_bsigs[i * pop_size:(i + 1) * pop_size], axis=0)
+            jnp.nanmean(pre_bsigs[i * pop_size:(i + 1) * pop_size], axis=0)
             for i in range(N)
         ])  # (N, D_bsig)
         dist_pre = mean_pairwise_behavior_dist(particle_pre_bsigs)
@@ -193,7 +198,13 @@ class SVCMAESStrategy:
         for i, p in enumerate(state["particles"]):
             cands_i = post_cands[i * pop_size:(i + 1) * pop_size]     # (pop_size, param_dim)
             regrets_i = post_regrets[i * pop_size:(i + 1) * pop_size] # (pop_size,)
-            fitness_i = -regrets_i  # negate: evosax minimizes, we maximize regret
+
+            # Validity masking: penalize invalid candidates
+            if valid_mask is not None:
+                valid_i = valid_mask[i * pop_size:(i + 1) * pop_size]
+                fitness_i = jnp.where(valid_i, -regrets_i, 10.0)
+            else:
+                fitness_i = -regrets_i  # negate: evosax minimizes, we maximize regret
 
             # evosax tell: tell(key, population, fitness, state, params) — 5 args
             new_es_state, _ = self._es_template.tell(
@@ -209,9 +220,9 @@ class SVCMAESStrategy:
                 p["es_state"].mean for p in new_particles
             ])  # (N, param_dim)
 
-            # Per-particle post-repulsion behavior sigs (average over each particle's pop)
+            # NaN-safe per-particle post-repulsion behavior sigs
             particle_post_bsigs = jnp.stack([
-                jnp.mean(post_bsigs[i * pop_size:(i + 1) * pop_size], axis=0)
+                jnp.nanmean(post_bsigs[i * pop_size:(i + 1) * pop_size], axis=0)
                 for i in range(N)
             ])  # (N, D_bsig)
 
@@ -219,14 +230,15 @@ class SVCMAESStrategy:
 
             for i in range(N):
                 new_mean_i = new_particles[i]["es_state"].mean + repulsion[i]
+                new_mean_i = jnp.clip(new_mean_i, -3.0, 3.0)  # prevent latent drift (Phase 5.1 fix)
                 updated_es_state = new_particles[i]["es_state"].replace(mean=new_mean_i)
                 new_particles[i] = {**new_particles[i], "es_state": updated_es_state}
 
         # --- Post-repulsion diversity metric ---
         if N > 1:
-            # Reuse particle_post_bsigs computed above (already averaged per particle)
+            # NaN-safe averaging
             particle_post_bsigs_final = jnp.stack([
-                jnp.mean(post_bsigs[i * pop_size:(i + 1) * pop_size], axis=0)
+                jnp.nanmean(post_bsigs[i * pop_size:(i + 1) * pop_size], axis=0)
                 for i in range(N)
             ])  # (N, D_bsig)
             dist_post = mean_pairwise_behavior_dist(particle_post_bsigs_final)
