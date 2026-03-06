@@ -817,6 +817,7 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "me_insertions": jnp.array(0, dtype=jnp.int32),
+                "plwm_batch_uphill_fraction": jnp.array(0.0, dtype=jnp.float32),
             }
             
             train_state = train_state.replace(
@@ -876,6 +877,7 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "me_insertions": jnp.array(0, dtype=jnp.int32),
+                "plwm_batch_uphill_fraction": jnp.array(0.0, dtype=jnp.float32),
             }
             
             train_state = train_state.replace(
