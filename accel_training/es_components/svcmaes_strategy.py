@@ -231,7 +231,10 @@ class SVCMAESStrategy:
             for i in range(N):
                 new_mean_i = new_particles[i]["es_state"].mean + repulsion[i]
                 new_mean_i = jnp.clip(new_mean_i, -3.0, 3.0)  # prevent latent drift (Phase 5.1 fix)
-                updated_es_state = new_particles[i]["es_state"].replace(mean=new_mean_i)
+                # Sigma ceiling: mean clamping truncates gradient so CSA inflates sigma unboundedly.
+                # Cap at 2.0 (4x sigma_init=0.5) to keep samples in valid VAE latent range.
+                new_std_i = jnp.minimum(new_particles[i]["es_state"].std, 2.0)
+                updated_es_state = new_particles[i]["es_state"].replace(mean=new_mean_i, std=new_std_i)
                 new_particles[i] = {**new_particles[i], "es_state": updated_es_state}
 
         # --- Post-repulsion diversity metric ---
