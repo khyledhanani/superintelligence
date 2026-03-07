@@ -1,12 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# Cross-evaluation: CMA-ES (beta=2.0) agents on ACCEL buffers and vice versa
+# Bidirectional cross-evaluation:
+#   CMA-ES (beta=2.0) agents <-> ACCEL agents on each other's buffers
 #
-# For each seed of cmaes_vae_beta2.0:
+# For each condition's agent (at matching timestep checkpoint):
 #   - Evaluate on its OWN buffer (self-eval baseline)
-#   - Evaluate on each plain_accel seed's buffer
+#   - Evaluate on the OTHER condition's buffer (cross-eval)
 #
-# Evaluates at buffer timesteps 30k, 40k, 50k (matching available checkpoints).
+# Evaluates at buffer timesteps 30k, 40k, 50k.
 # Results averaged across seeds in the summary CSV.
 #
 # Usage (run on TPU):
@@ -17,12 +18,13 @@ set -e
 BUCKET="ucl-ued-project-bucket"
 PREFIX="accel"
 SEEDS=(0 1 2)
-TIMESTEPS=(30k 40k 50k)
+TIMESTEPS=(10k 20k 30k 40k 50k)
 NUM_ATTEMPTS=10
 OUTPUT_DIR="results/cross_eval"
 
 CMAES_RUN="cmaes_vae_beta2.0"
 ACCEL_RUN="plain_accel"
+ALL_RUNS=("$CMAES_RUN" "$ACCEL_RUN")
 
 CKPT_BASE="/tmp/cross_eval_checkpoints"
 BUFFER_BASE="/tmp/accel_comparison_data"
@@ -30,21 +32,23 @@ BUFFER_BASE="/tmp/accel_comparison_data"
 mkdir -p "$CKPT_BASE" "$BUFFER_BASE" "$OUTPUT_DIR"
 
 # ==============================================================================
-# 1. Download checkpoints (agent params) for cmaes_vae_beta2.0
+# 1. Download checkpoints for BOTH conditions
 # ==============================================================================
 echo "============================================"
-echo "  Downloading CMA-ES (beta=2.0) checkpoints"
+echo "  Downloading agent checkpoints"
 echo "============================================"
-for seed in "${SEEDS[@]}"; do
-    dest="$CKPT_BASE/$CMAES_RUN/$seed"
-    if [ -d "$dest/models" ]; then
-        echo "  [skip] $CMAES_RUN/seed$seed already downloaded"
-    else
-        echo "  Downloading $CMAES_RUN/seed$seed..."
-        mkdir -p "$dest/models"
-        gcloud storage cp "gs://$BUCKET/$PREFIX/checkpoints/$CMAES_RUN/$seed/config.json" "$dest/config.json"
-        gcloud storage cp -r "gs://$BUCKET/$PREFIX/checkpoints/$CMAES_RUN/$seed/models/*" "$dest/models/"
-    fi
+for run_name in "${ALL_RUNS[@]}"; do
+    for seed in "${SEEDS[@]}"; do
+        dest="$CKPT_BASE/$run_name/$seed"
+        if [ -d "$dest/models" ] && [ "$(ls "$dest/models" 2>/dev/null | wc -l)" -gt 0 ]; then
+            echo "  [skip] $run_name/seed$seed already downloaded"
+        else
+            echo "  Downloading $run_name/seed$seed..."
+            mkdir -p "$dest/models"
+            gcloud storage cp "gs://$BUCKET/$PREFIX/checkpoints/$run_name/$seed/config.json" "$dest/config.json"
+            gcloud storage cp -r "gs://$BUCKET/$PREFIX/checkpoints/$run_name/$seed/models/*" "$dest/models/"
+        fi
+    done
 done
 
 # ==============================================================================
@@ -54,7 +58,7 @@ echo ""
 echo "============================================"
 echo "  Downloading buffer dumps"
 echo "============================================"
-for run_name in "$CMAES_RUN" "$ACCEL_RUN"; do
+for run_name in "${ALL_RUNS[@]}"; do
     for seed in "${SEEDS[@]}"; do
         dest="$BUFFER_BASE/$run_name/$seed"
         if [ -d "$dest" ] && ls "$dest"/buffer_dump_*.npz 1>/dev/null 2>&1; then
@@ -76,17 +80,19 @@ echo "============================================"
 echo "  Available data:"
 echo "============================================"
 echo "Checkpoints:"
-for seed in "${SEEDS[@]}"; do
-    dir="$CKPT_BASE/$CMAES_RUN/$seed/models"
-    if [ -d "$dir" ]; then
-        echo "  $CMAES_RUN/seed$seed: $(ls "$dir" | wc -l) checkpoint steps"
-    else
-        echo "  $CMAES_RUN/seed$seed: MISSING"
-    fi
+for run_name in "${ALL_RUNS[@]}"; do
+    for seed in "${SEEDS[@]}"; do
+        dir="$CKPT_BASE/$run_name/$seed/models"
+        if [ -d "$dir" ]; then
+            echo "  $run_name/seed$seed: $(ls "$dir" | wc -l) checkpoint steps"
+        else
+            echo "  $run_name/seed$seed: MISSING"
+        fi
+    done
 done
 echo ""
 echo "Buffer dumps:"
-for run_name in "$CMAES_RUN" "$ACCEL_RUN"; do
+for run_name in "${ALL_RUNS[@]}"; do
     for seed in "${SEEDS[@]}"; do
         dir="$BUFFER_BASE/$run_name/$seed"
         if [ -d "$dir" ]; then
@@ -98,70 +104,76 @@ for run_name in "$CMAES_RUN" "$ACCEL_RUN"; do
 done
 
 # ==============================================================================
-# 4. Run cross-evaluations
+# 4. Run cross-evaluations (all 4 directions)
+#    CMA-ES agent -> CMA-ES buffer (self)
+#    CMA-ES agent -> ACCEL buffer  (cross)
+#    ACCEL agent  -> ACCEL buffer  (self)
+#    ACCEL agent  -> CMA-ES buffer (cross)
 # ==============================================================================
 echo ""
 echo "============================================"
-echo "  Running cross-evaluations"
+echo "  Running cross-evaluations (bidirectional)"
 echo "============================================"
 
+# Count total evaluations: 2 agents x 2 buffers x 3 agent_seeds x 3 buf_seeds x 3 timesteps
 TOTAL=0
 for ts in "${TIMESTEPS[@]}"; do
-    for agent_seed in "${SEEDS[@]}"; do
-        # Self-eval: CMA-ES agent on CMA-ES buffer
-        for buf_seed in "${SEEDS[@]}"; do
-            TOTAL=$((TOTAL + 1))
-        done
-        # Cross-eval: CMA-ES agent on ACCEL buffer
-        for buf_seed in "${SEEDS[@]}"; do
-            TOTAL=$((TOTAL + 1))
+    for agent_run in "${ALL_RUNS[@]}"; do
+        for agent_seed in "${SEEDS[@]}"; do
+            for buf_run in "${ALL_RUNS[@]}"; do
+                for buf_seed in "${SEEDS[@]}"; do
+                    TOTAL=$((TOTAL + 1))
+                done
+            done
         done
     done
 done
 
+echo "  Total evaluations: $TOTAL"
+
 RUN_NUM=0
 for ts in "${TIMESTEPS[@]}"; do
-    # Convert timestep string "30k" -> update count 30000
     UPDATES=$(echo "$ts" | sed 's/k//' | awk '{print $1 * 1000}')
 
     echo ""
     echo "--- Timestep: ${ts} (agent @ ~${UPDATES} updates) ---"
 
-    for agent_seed in "${SEEDS[@]}"; do
-        agent_dir="$CKPT_BASE/$CMAES_RUN/$agent_seed"
+    for agent_run in "${ALL_RUNS[@]}"; do
+        for agent_seed in "${SEEDS[@]}"; do
+            agent_dir="$CKPT_BASE/$agent_run/$agent_seed"
 
-        # Self-eval: CMA-ES agent on CMA-ES buffers
-        for buf_seed in "${SEEDS[@]}"; do
-            RUN_NUM=$((RUN_NUM + 1))
-            buf_npz="$BUFFER_BASE/$CMAES_RUN/$buf_seed/buffer_dump_${ts}.npz"
-            if [ ! -f "$buf_npz" ]; then
-                echo "  [$RUN_NUM/$TOTAL] SKIP (missing $buf_npz)"
+            if [ ! -f "$agent_dir/config.json" ]; then
+                echo "  SKIP $agent_run/s$agent_seed (no checkpoint)"
+                RUN_NUM=$((RUN_NUM + ${#ALL_RUNS[@]} * ${#SEEDS[@]}))
                 continue
             fi
-            echo "  [$RUN_NUM/$TOTAL] ${CMAES_RUN}/s${agent_seed} -> ${CMAES_RUN}/s${buf_seed} @ ${ts}"
-            PYTHONUNBUFFERED=1 python3 examples/cross_evaluate.py \
-                --agent_checkpoint_dir "$agent_dir" \
-                --agent_updates $UPDATES \
-                --buffer_npz "$buf_npz" \
-                --num_attempts $NUM_ATTEMPTS \
-                --output_dir "$OUTPUT_DIR/${ts}"
-        done
 
-        # Cross-eval: CMA-ES agent on ACCEL buffers
-        for buf_seed in "${SEEDS[@]}"; do
-            RUN_NUM=$((RUN_NUM + 1))
-            buf_npz="$BUFFER_BASE/$ACCEL_RUN/$buf_seed/buffer_dump_${ts}.npz"
-            if [ ! -f "$buf_npz" ]; then
-                echo "  [$RUN_NUM/$TOTAL] SKIP (missing $buf_npz)"
-                continue
-            fi
-            echo "  [$RUN_NUM/$TOTAL] ${CMAES_RUN}/s${agent_seed} -> ${ACCEL_RUN}/s${buf_seed} @ ${ts}"
-            PYTHONUNBUFFERED=1 python3 examples/cross_evaluate.py \
-                --agent_checkpoint_dir "$agent_dir" \
-                --agent_updates $UPDATES \
-                --buffer_npz "$buf_npz" \
-                --num_attempts $NUM_ATTEMPTS \
-                --output_dir "$OUTPUT_DIR/${ts}"
+            for buf_run in "${ALL_RUNS[@]}"; do
+                for buf_seed in "${SEEDS[@]}"; do
+                    RUN_NUM=$((RUN_NUM + 1))
+                    buf_npz="$BUFFER_BASE/$buf_run/$buf_seed/buffer_dump_${ts}.npz"
+                    if [ ! -f "$buf_npz" ]; then
+                        echo "  [$RUN_NUM/$TOTAL] SKIP (missing buffer $buf_run/s$buf_seed @ $ts)"
+                        continue
+                    fi
+
+                    if [ "$agent_run" = "$buf_run" ] && [ "$agent_seed" = "$buf_seed" ]; then
+                        eval_type="self"
+                    elif [ "$agent_run" = "$buf_run" ]; then
+                        eval_type="same-cond"
+                    else
+                        eval_type="cross"
+                    fi
+
+                    echo "  [$RUN_NUM/$TOTAL] ($eval_type) ${agent_run}/s${agent_seed} -> ${buf_run}/s${buf_seed} @ ${ts}"
+                    PYTHONUNBUFFERED=1 python3 examples/cross_evaluate.py \
+                        --agent_checkpoint_dir "$agent_dir" \
+                        --agent_updates $UPDATES \
+                        --buffer_npz "$buf_npz" \
+                        --num_attempts $NUM_ATTEMPTS \
+                        --output_dir "$OUTPUT_DIR/${ts}"
+                done
+            done
         done
     done
 done
@@ -190,7 +202,6 @@ for ts_dir in sorted(glob.glob(os.path.join(output_dir, '*k'))):
             'agent_seed': str(data.get('agent_seed', '?')),
             'buffer_run_name': str(data.get('buffer_run_name', '?')),
             'buffer_seed': str(data.get('buffer_seed', '?')),
-            'buffer_timestep': str(data.get('buffer_timestep', '?')),
             'mean_solve_rate': float(data['solve_rates'].mean()),
             'num_levels': int(data.get('num_levels', len(data['solve_rates']))),
         })
@@ -199,26 +210,26 @@ if not rows:
     print('No results found!')
     exit(0)
 
-# Print per-eval results
-print(f\"{'Timestep':>8s} {'Agent':>25s} {'Buffer Run':>22s} {'Buf Seed':>8s} {'Solve%':>8s}\")
-print('-' * 75)
+# Per-eval results
+print(f\"{'TS':>6s} {'Agent':>25s} {'Buffer Run':>22s} {'BufS':>5s} {'Solve%':>8s}\")
+print('-' * 70)
 for r in rows:
     label = f\"{r['agent_name']}/s{r['agent_seed']}\"
-    print(f\"{r['timestep']:>8s} {label:>25s} {r['buffer_run_name']:>22s} {'s'+r['buffer_seed']:>8s} {r['mean_solve_rate']:>7.1%}\")
+    print(f\"{r['timestep']:>6s} {label:>25s} {r['buffer_run_name']:>22s} {'s'+r['buffer_seed']:>5s} {r['mean_solve_rate']:>7.1%}\")
 
-# Aggregate: mean across all seed combos, grouped by (timestep, buffer_run_name)
+# Aggregate by (timestep, agent_name, buffer_run_name) — avg across seeds
 print()
-print('AVERAGED ACROSS ALL AGENT-SEED x BUFFER-SEED COMBOS:')
-print(f\"{'Timestep':>8s} {'Buffer Source':>25s} {'Mean Solve%':>12s} {'Std':>8s} {'N evals':>8s}\")
-print('-' * 65)
+print('AVERAGED ACROSS SEEDS (agent_name -> buffer_source):')
+print(f\"{'TS':>6s} {'Agent Condition':>25s} {'Buffer Source':>25s} {'Mean%':>8s} {'Std':>7s} {'N':>4s}\")
+print('-' * 79)
 
 grouped = defaultdict(list)
 for r in rows:
-    grouped[(r['timestep'], r['buffer_run_name'])].append(r['mean_solve_rate'])
+    grouped[(r['timestep'], r['agent_name'], r['buffer_run_name'])].append(r['mean_solve_rate'])
 
-for (ts, buf_run), rates in sorted(grouped.items()):
+for (ts, agent, buf), rates in sorted(grouped.items()):
     rates = np.array(rates)
-    print(f\"{ts:>8s} {buf_run:>25s} {rates.mean():>11.1%} {rates.std():>7.1%} {len(rates):>8d}\")
+    print(f\"{ts:>6s} {agent:>25s} {buf:>25s} {rates.mean():>7.1%} {rates.std():>6.1%} {len(rates):>4d}\")
 
 # Save full CSV
 csv_path = os.path.join(output_dir, 'cross_eval_all.csv')

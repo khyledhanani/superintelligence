@@ -126,6 +126,18 @@ def load_agent(checkpoint_dir, checkpoint_step=-1):
 
     eval_freq = config.get("eval_freq", 250)
     updates_at_step = (step + 1) * eval_freq
+
+    # If a specific step was requested, check that the match is close enough
+    if checkpoint_step >= 0:
+        target_updates = (checkpoint_step + 1) * eval_freq
+        update_gap = abs(updates_at_step - target_updates)
+        max_gap = 2500  # max acceptable gap in updates
+        if update_gap > max_gap:
+            print(f"[Agent] SKIP: closest checkpoint is {updates_at_step} updates, "
+                  f"target was {target_updates} (gap={update_gap} > {max_gap})")
+            print(f"[Agent] Available steps: {available[0]}..{available[-1]} ({len(available)} total)")
+            return None, config, None, None
+
     print(f"[Agent] Loading step {step} (~{updates_at_step} updates) from {models_dir}")
     print(f"[Agent] Available steps: {available[0]}..{available[-1]} ({len(available)} total)")
     restored = checkpoint_manager.restore(step)
@@ -200,6 +212,10 @@ def run_single_cross_eval(agent_checkpoint_dir, agent_step, buffer_npz_path,
     train_state, config, env, env_params = load_agent(agent_checkpoint_dir, agent_step)
     agent_name = config.get("run_name", os.path.basename(agent_checkpoint_dir))
     agent_seed = config.get("seed", "?")
+
+    if train_state is None:
+        print(f"[Cross-eval] SKIP: no matching checkpoint for {agent_name}/seed{agent_seed}")
+        return None
 
     # Load buffer tokens
     buffer_data = np.load(buffer_npz_path, allow_pickle=True)
@@ -280,7 +296,8 @@ def run_batch_cross_eval(agent_dirs, buffer_npzs, num_attempts, output_dir,
             results = run_single_cross_eval(
                 agent_dir, agent_step, buffer_npz, num_attempts, output_dir
             )
-            all_results.append(results)
+            if results is not None:
+                all_results.append(results)
 
     # Summary table
     print(f"\n{'='*60}")
