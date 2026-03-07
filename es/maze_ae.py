@@ -1,71 +1,65 @@
 """
-Grid-based Convolutional Autoencoder with SIGReg for PLWM.
+Grid-based Maze beta-VAE with task-aware auxiliary heads for PLWM.
 
-Architecture:
-    Encoder: (B,13,13,3) -> Conv stack -> Dense -> z (B, latent_dim)
-    Decoder: z -> Dense -> DeConv stack -> wall_logits (B,13,13)
-                                         goal_logits  (B,169)
-                                         agent_logits (B,169)
+This module keeps the existing encode/decode helper surface while upgrading the
+training model to include:
+- beta-VAE bottleneck (mean/logvar + reparameterization)
+- static structural head
+- curriculum head (success + learnability)
+- validity head
 
-Latent regularization: SIGReg (Sketched Isotropic Gaussian Regularization)
-from LeJEPA (Balestriero & LeCun, 2025). Projects z along M random unit
-vectors and matches the resulting 1-D distributions to N(0,1) via the
-Epps-Pulley test on empirical characteristic functions. This enforces a
-full isotropic Gaussian on the latent space with provably bounded gradients —
-avoiding the posterior collapse that plagues beta-VAE on sparse grids.
-
-Checkpoint structure (pickle):
-    {'params': {'MazeEncoder_0': {...}, 'MazeDecoder_0': {...}}, 'step': int}
-
-PLWM usage:
-    encoder_params = extract_maze_encoder_params(load_maze_ae_params(path))
-    decoder_params = extract_maze_decoder_params(load_maze_ae_params(path))
-    grids = jax.vmap(maze_level_to_grid)(wall_maps, goal_positions, agent_positions)
-    z     = encode_maze_levels(encoder_params, grids)          # (B, 64)
-    z_    = z + sigma * jax.random.normal(rng, z.shape)
-    levels= decode_maze_latents(decoder_params, z_, rng_keys)  # (B,) Level
+Static targets (per level):
+  s1 solvable, s2 wall_density, s3 bfs_norm, s4 manhattan_norm,
+  s5 slack_norm, s6 branch_ratio, s7 dead_end_ratio.
 """
 
-import os
+from __future__ import annotations
+
 import pickle
+from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from es.env_bridge import bfs_path_length
 from jaxued.environments.maze.level import Level
 
 
 # ---------------------------------------------------------------------------
-# Encoder
+# Encoder / Decoder
 # ---------------------------------------------------------------------------
+
 
 class MazeEncoder(nn.Module):
     latent_dim: int = 64
+    variational: bool = True
 
     @nn.compact
     def __call__(self, x):
         # x: (B, H, W, 3)
-        h = nn.Conv(32, (3, 3), padding='SAME')(x)
+        h = nn.Conv(32, (3, 3), padding="SAME")(x)
         h = nn.leaky_relu(h, negative_slope=0.2)
 
-        h = nn.Conv(64, (3, 3), strides=(2, 2), padding='SAME')(h)   # (B, 7, 7, 64)
+        h = nn.Conv(64, (3, 3), strides=(2, 2), padding="SAME")(h)  # (B, 7, 7, 64)
         h = nn.leaky_relu(h, negative_slope=0.2)
 
-        h = nn.Conv(128, (3, 3), strides=(2, 2), padding='SAME')(h)  # (B, 4, 4, 128)
+        h = nn.Conv(128, (3, 3), strides=(2, 2), padding="SAME")(h)  # (B, 4, 4, 128)
         h = nn.leaky_relu(h, negative_slope=0.2)
 
-        h = h.reshape(h.shape[0], -1)          # (B, 2048)
+        h = h.reshape(h.shape[0], -1)  # (B, 2048)
         h = nn.Dense(512)(h)
         h = nn.leaky_relu(h, negative_slope=0.2)
 
-        z = nn.Dense(self.latent_dim)(h)       # (B, latent_dim) — no tanh, SIGReg handles dist
+        if self.variational:
+            mean = nn.Dense(self.latent_dim, name="mean_layer")(h)
+            logvar = nn.Dense(self.latent_dim, name="logvar_layer")(h)
+            return mean, logvar
+
+        # Backward-compatible deterministic path (legacy checkpoints).
+        z = nn.Dense(self.latent_dim)(h)
         return z
 
-
-# ---------------------------------------------------------------------------
-# Decoder
-# ---------------------------------------------------------------------------
 
 class MazeDecoder(nn.Module):
     height: int = 13
@@ -74,143 +68,231 @@ class MazeDecoder(nn.Module):
     @nn.compact
     def __call__(self, z):
         # z: (B, latent_dim)
-        H, W = self.height, self.width
-
         h = nn.Dense(512)(z)
         h = nn.leaky_relu(h, negative_slope=0.2)
 
         h = nn.Dense(4 * 4 * 128)(h)
         h = nn.leaky_relu(h, negative_slope=0.2)
-
         h = h.reshape(h.shape[0], 4, 4, 128)
 
-        h = nn.ConvTranspose(64, (3, 3), strides=(2, 2), padding='SAME')(h)  # (B, 8, 8, 64)
+        h = nn.ConvTranspose(64, (3, 3), strides=(2, 2), padding="SAME")(h)  # (B, 8, 8, 64)
         h = nn.leaky_relu(h, negative_slope=0.2)
 
-        h = nn.ConvTranspose(32, (3, 3), strides=(2, 2), padding='SAME')(h)  # (B, 16, 16, 32)
+        h = nn.ConvTranspose(32, (3, 3), strides=(2, 2), padding="SAME")(h)  # (B, 16, 16, 32)
         h = nn.leaky_relu(h, negative_slope=0.2)
 
-        h = h[:, :H, :W, :]   # crop to (B, 13, 13, 32)
+        h = h[:, : self.height, : self.width, :]  # (B, 13, 13, 32)
 
-        # Wall head
-        wh = nn.Conv(16, (3, 3), padding='SAME')(h)
+        wh = nn.Conv(16, (3, 3), padding="SAME")(h)
         wh = nn.leaky_relu(wh, negative_slope=0.2)
-        wall_logits = nn.Conv(1, (1, 1))(wh)[:, :, :, 0]   # (B, H, W)
+        wall_logits = nn.Conv(1, (1, 1))(wh)[:, :, :, 0]  # (B, H, W)
 
-        # Position heads: global-average-pool spatial features → Dense
-        gap = h.mean(axis=(1, 2))              # (B, 32)
+        gap = h.mean(axis=(1, 2))
         ph = nn.Dense(256)(gap)
         ph = nn.leaky_relu(ph, negative_slope=0.2)
-        goal_logits  = nn.Dense(H * W)(ph)    # (B, H*W)
-        agent_logits = nn.Dense(H * W)(ph)    # (B, H*W)
-
+        goal_logits = nn.Dense(self.height * self.width)(ph)
+        agent_logits = nn.Dense(self.height * self.width)(ph)
         return wall_logits, goal_logits, agent_logits
 
 
-# ---------------------------------------------------------------------------
-# Full AE (used only during training)
-# ---------------------------------------------------------------------------
+class StaticHead(nn.Module):
+    """Predicts static structural targets: solvable + 6 regression dims."""
 
-class MazeAE(nn.Module):
+    @nn.compact
+    def __call__(self, z):
+        h = nn.Dense(128)(z)
+        h = nn.relu(h)
+        solvable_logit = nn.Dense(1)(h)[:, 0]
+        static_reg = nn.Dense(6)(h)
+        return solvable_logit, static_reg
+
+
+class CurriculumHead(nn.Module):
+    """Predicts dynamic curriculum targets: success probability + learnability."""
+
+    @nn.compact
+    def __call__(self, z):
+        h = nn.Dense(128)(z)
+        h = nn.relu(h)
+        p_logit = nn.Dense(1)(h)[:, 0]
+        # Bounded to [0,1] for a stable learnability regression target.
+        learnability = nn.sigmoid(nn.Dense(1)(h)[:, 0])
+        return p_logit, learnability
+
+
+class ValidHead(nn.Module):
+    @nn.compact
+    def __call__(self, z):
+        h = nn.Dense(64)(z)
+        h = nn.relu(h)
+        return nn.Dense(1)(h)[:, 0]
+
+
+class MazeTaskAwareVAE(nn.Module):
     latent_dim: int = 64
     height: int = 13
     width: int = 13
 
     @nn.compact
-    def __call__(self, x):
-        z = MazeEncoder(self.latent_dim)(x)
+    def __call__(self, x, z_rng: jax.Array | None = None, deterministic: bool = False):
+        mean, logvar = MazeEncoder(self.latent_dim, variational=True)(x)
+        if deterministic or z_rng is None:
+            z = mean
+        else:
+            std = jnp.exp(0.5 * logvar)
+            eps = jax.random.normal(z_rng, mean.shape)
+            z = mean + eps * std
+
         wall_logits, goal_logits, agent_logits = MazeDecoder(self.height, self.width)(z)
-        return z, wall_logits, goal_logits, agent_logits
+        solvable_logit, static_reg = StaticHead()(z)
+        p_logit, learnability = CurriculumHead()(z)
+        valid_logit = ValidHead()(z)
+        return {
+            "z": z,
+            "mean": mean,
+            "logvar": logvar,
+            "wall_logits": wall_logits,
+            "goal_logits": goal_logits,
+            "agent_logits": agent_logits,
+            "solvable_logit": solvable_logit,
+            "static_reg": static_reg,
+            "p_logit": p_logit,
+            "learnability": learnability,
+            "valid_logit": valid_logit,
+        }
+
+
+# Backward import compatibility.
+class MazeAE(MazeTaskAwareVAE):
+    pass
 
 
 # ---------------------------------------------------------------------------
-# SIGReg loss (Balestriero & LeCun, 2025 — LeJEPA)
+# Structural targets
 # ---------------------------------------------------------------------------
 
-def sigreg_loss(
-    z: jnp.ndarray,
-    rng: jax.Array,
-    n_directions: int = 64,
-    n_t: int = 64,
-    t_max: float = 4.0,
+
+def _grid_positions_from_onehot(grids: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Return (goal_pos, agent_pos) as [x, y] from one-hot grid channels."""
+    b, h, w, _ = grids.shape
+    goal_flat = grids[:, :, :, 1].reshape(b, -1).argmax(axis=-1)
+    agent_flat = grids[:, :, :, 2].reshape(b, -1).argmax(axis=-1)
+
+    goal_pos = jnp.stack([goal_flat % w, goal_flat // w], axis=-1).astype(jnp.uint32)
+    agent_pos = jnp.stack([agent_flat % w, agent_flat // w], axis=-1).astype(jnp.uint32)
+    return goal_pos, agent_pos
+
+
+def compute_structural_targets(
+    wall_map: jnp.ndarray,
+    goal_pos: jnp.ndarray,
+    agent_pos: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Sketched Isotropic Gaussian Regularization.
-
-    Projects the batch of latent vectors along M random unit directions and
-    measures how far each 1-D projected distribution deviates from N(0,1)
-    using the Epps-Pulley test on empirical characteristic functions (ECFs).
-
-    EP(X) = N * integral |ECF_X(t) - exp(-t^2/2)|^2 dt
-          ≈ N * dt * sum_t [ (mean cos(t*x) - exp(-t^2/2))^2
-                            + (mean sin(t*x))^2 ]
-
-    SIGReg = (1/M) * sum_m EP(z @ a_m)
-    where a_m are unit vectors resampled each call (Cramér-Wold theorem).
+    """Compute s1..s7 for a batch of mazes.
 
     Args:
-        z:            (batch, latent_dim) latent vectors.
-        rng:          JAX PRNG key. Directions are resampled every call.
-        n_directions: M — number of random projections.
-        n_t:          Number of discrete t values for the integral.
-        t_max:        Integration range [-t_max, t_max].
+        wall_map: (B, H, W) bool
+        goal_pos: (B, 2) uint32 [x,y]
+        agent_pos: (B, 2) uint32 [x,y]
 
     Returns:
-        Scalar SIGReg loss value.
+        (B, 7) float32 in the order:
+          s1 solvable, s2 wall_density, s3 bfs_norm, s4 manhattan_norm,
+          s5 slack_norm, s6 branch_ratio, s7 dead_end_ratio.
     """
-    batch, dim = z.shape
+    wall_map = wall_map.astype(jnp.bool_)
+    b, h, w = wall_map.shape
+    inf = float(h * w)
 
-    # Sample M unit directions on S^{dim-1}
-    a = jax.random.normal(rng, (n_directions, dim))
-    a = a / (jnp.linalg.norm(a, axis=-1, keepdims=True) + 1e-8)   # (M, D)
+    bfs = jax.vmap(bfs_path_length)(wall_map, agent_pos, goal_pos).astype(jnp.float32)
+    solvable = (bfs < inf).astype(jnp.float32)
 
-    # Project: (M, batch)
-    proj = jnp.einsum('md,nd->mn', a, z)
+    manhattan = (
+        jnp.abs(goal_pos[:, 0].astype(jnp.int32) - agent_pos[:, 0].astype(jnp.int32))
+        + jnp.abs(goal_pos[:, 1].astype(jnp.int32) - agent_pos[:, 1].astype(jnp.int32))
+    ).astype(jnp.float32)
 
-    # Discrete t grid for integral approximation
-    t = jnp.linspace(-t_max, t_max, n_t)    # (T,)
-    dt = 2.0 * t_max / n_t
+    walls = wall_map
+    free = ~walls
 
-    # ECF at each t: (M, N, T) -> mean over N -> (M, T)
-    pt = proj[:, :, None] * t[None, None, :]   # (M, N, T)
-    ecf_real = jnp.cos(pt).mean(axis=1)         # (M, T)
-    ecf_imag = jnp.sin(pt).mean(axis=1)         # (M, T)
+    up = jnp.roll(free, -1, axis=1).at[:, -1, :].set(False)
+    down = jnp.roll(free, 1, axis=1).at[:, 0, :].set(False)
+    left = jnp.roll(free, -1, axis=2).at[:, :, -1].set(False)
+    right = jnp.roll(free, 1, axis=2).at[:, :, 0].set(False)
+    degree = (
+        up.astype(jnp.int32)
+        + down.astype(jnp.int32)
+        + left.astype(jnp.int32)
+        + right.astype(jnp.int32)
+    )
 
-    # N(0,1) characteristic function: phi(t) = exp(-t^2/2)  [real-valued]
-    gaussian_cf = jnp.exp(-0.5 * t ** 2)        # (T,)
+    wall_count = walls.reshape(b, -1).sum(axis=-1).astype(jnp.float32)
+    free_count = jnp.maximum((h * w) - wall_count, 1.0)
+    branch_points = (free & (degree >= 3)).reshape(b, -1).sum(axis=-1).astype(jnp.float32)
+    dead_ends = (free & (degree == 1)).reshape(b, -1).sum(axis=-1).astype(jnp.float32)
 
-    # |ECF(t) - phi(t)|^2 = (ecf_real - phi)^2 + ecf_imag^2
-    diff_sq = (ecf_real - gaussian_cf[None, :]) ** 2 + ecf_imag ** 2  # (M, T)
+    wall_density = wall_count / float(h * w)
+    bfs_norm = jnp.minimum(bfs, inf) / inf
+    manhattan_norm = manhattan / float(2 * (w - 1))
+    slack_norm = jnp.clip((bfs - manhattan) / inf, 0.0, 1.0)
+    branch_ratio = branch_points / free_count
+    dead_end_ratio = dead_ends / free_count
 
-    # EP per direction: N * integral ~ N * dt * sum_t diff_sq
-    ep_per_dir = batch * dt * diff_sq.sum(axis=-1)   # (M,)
+    return jnp.stack(
+        [
+            solvable,
+            wall_density,
+            bfs_norm,
+            manhattan_norm,
+            slack_norm,
+            branch_ratio,
+            dead_end_ratio,
+        ],
+        axis=-1,
+    )
 
-    return ep_per_dir.mean()
+
+def compute_structural_targets_from_grids(grids: jnp.ndarray) -> jnp.ndarray:
+    wall_map = grids[:, :, :, 0] > 0.5
+    goal_pos, agent_pos = _grid_positions_from_onehot(grids)
+    return compute_structural_targets(wall_map, goal_pos, agent_pos)
 
 
 # ---------------------------------------------------------------------------
 # Checkpoint I/O
 # ---------------------------------------------------------------------------
 
+
 def load_maze_ae_params(checkpoint_path: str) -> dict:
-    """Load MazeAE parameters from a pickle checkpoint."""
-    with open(checkpoint_path, 'rb') as f:
+    with open(checkpoint_path, "rb") as f:
         data = pickle.load(f)
-    return data['params']
+    return data["params"]
 
 
 def extract_maze_encoder_params(full_params: dict) -> dict:
-    """Extract MazeEncoder sub-params from the full MazeAE checkpoint."""
-    return full_params['MazeEncoder_0']
+    return full_params["MazeEncoder_0"]
 
 
 def extract_maze_decoder_params(full_params: dict) -> dict:
-    """Extract MazeDecoder sub-params from the full MazeAE checkpoint."""
-    return full_params['MazeDecoder_0']
+    return full_params["MazeDecoder_0"]
+
+
+def extract_maze_static_head_params(full_params: dict) -> dict:
+    return full_params["StaticHead_0"]
+
+
+def extract_maze_curriculum_head_params(full_params: dict) -> dict:
+    return full_params["CurriculumHead_0"]
+
+
+def extract_maze_valid_head_params(full_params: dict) -> dict:
+    return full_params["ValidHead_0"]
 
 
 # ---------------------------------------------------------------------------
-# PLWM helpers — JIT/vmap compatible
+# PLWM helpers
 # ---------------------------------------------------------------------------
+
 
 def maze_level_to_grid(
     wall_map: jnp.ndarray,
@@ -219,42 +301,51 @@ def maze_level_to_grid(
     height: int = 13,
     width: int = 13,
 ) -> jnp.ndarray:
-    """Convert Level components to (H, W, 3) float32 grid.
-
-    JIT and vmap compatible. Channel layout:
-        0: wall map   (1.0 = wall, 0.0 = free)
-        1: goal       (1.0 at goal cell)
-        2: agent      (1.0 at agent cell)
-
-    Args:
-        wall_map:  (H, W) bool.
-        goal_pos:  [col, row] uint32 (Level convention).
-        agent_pos: [col, row] uint32 (Level convention).
-
-    Returns:
-        (H, W, 3) float32 grid.
-    """
+    """Convert Level components to (H, W, 3) float32 grid."""
     grid = jnp.zeros((height, width, 3), dtype=jnp.float32)
     grid = grid.at[:, :, 0].set(wall_map.astype(jnp.float32))
-    grid = grid.at[goal_pos[1],  goal_pos[0],  1].set(1.0)
+    grid = grid.at[goal_pos[1], goal_pos[0], 1].set(1.0)
     grid = grid.at[agent_pos[1], agent_pos[0], 2].set(1.0)
     return grid
 
 
-def encode_maze_levels(
-    encoder_params: dict,
-    grids: jnp.ndarray,
-) -> jnp.ndarray:
-    """Encode a batch of (H, W, 3) grids to latent vectors.
+def _is_variational_encoder_params(encoder_params: dict) -> bool:
+    return "mean_layer" in encoder_params and "logvar_layer" in encoder_params
 
-    Args:
-        encoder_params: MazeEncoder parameters (from extract_maze_encoder_params).
-        grids:          (B, H, W, 3) float32 grids.
 
-    Returns:
-        (B, latent_dim) latent vectors.
+def encode_maze_levels(encoder_params: dict, grids: jnp.ndarray) -> jnp.ndarray:
+    """Encode a batch of grids to latent vectors.
+
+    Uses the encoder mean for variational checkpoints and preserves legacy
+    behavior for deterministic legacy checkpoints.
     """
-    return MazeEncoder().apply({'params': encoder_params}, grids)
+    if _is_variational_encoder_params(encoder_params):
+        mean, _ = MazeEncoder(variational=True).apply({"params": encoder_params}, grids)
+        return mean
+    return MazeEncoder(variational=False).apply({"params": encoder_params}, grids)
+
+
+def predict_task_targets(full_params: dict, grids: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+    """Predict task-aware targets used by PLWM candidate scoring."""
+    out = MazeTaskAwareVAE().apply({"params": full_params}, grids, deterministic=True)
+
+    # static_reg dims correspond to [s2, s3, s4, s5, s6, s7]
+    static_reg = out["static_reg"]
+    wall_density_pred = jnp.clip(static_reg[:, 0], 0.0, 1.0)
+    bfs_norm_pred = jnp.clip(static_reg[:, 1], 0.0, 1.0)
+
+    valid_prob = jax.nn.sigmoid(out["valid_logit"])
+    invalid_prob = 1.0 - valid_prob
+    p_pred = jax.nn.sigmoid(out["p_logit"])
+    l_pred = jnp.clip(out["learnability"], 0.0, 1.0)
+
+    return {
+        "p_pred": p_pred,
+        "l_pred": l_pred,
+        "invalid_prob": invalid_prob,
+        "bfs_norm_pred": bfs_norm_pred,
+        "wall_density_pred": wall_density_pred,
+    }
 
 
 def _decode_single_level(
@@ -267,38 +358,30 @@ def _decode_single_level(
     height: int,
     width: int,
 ) -> Level:
-    """Decode single-sample decoder outputs to a jaxued Level.
-
-    Uses Gumbel-max sampling for goal/agent positions so mutation diversity
-    is controlled by `temperature` (lower → more deterministic / argmax-like).
-    """
+    """Decode single-sample decoder outputs to a jaxued Level."""
     rng_goal, rng_agent, rng_dir = jax.random.split(rng, 3)
 
-    # ---- Wall map ----
-    wall_map = jax.nn.sigmoid(wall_logits) > wall_threshold   # (H, W)
+    wall_map = jax.nn.sigmoid(wall_logits) > wall_threshold
 
-    # ---- Goal position: Gumbel-max over H*W cells ----
     gumbel_g = jax.random.gumbel(rng_goal, (height * width,))
     goal_flat = jnp.argmax(goal_logits / temperature + gumbel_g)
-    goal_col  = (goal_flat % width).astype(jnp.uint32)
-    goal_row  = (goal_flat // width).astype(jnp.uint32)
+    goal_col = (goal_flat % width).astype(jnp.uint32)
+    goal_row = (goal_flat // width).astype(jnp.uint32)
 
-    # ---- Agent position: Gumbel-max, goal cell masked ----
     agent_mask = jnp.zeros(height * width).at[goal_flat].set(-jnp.inf)
-    gumbel_a   = jax.random.gumbel(rng_agent, (height * width,))
+    gumbel_a = jax.random.gumbel(rng_agent, (height * width,))
     agent_flat = jnp.argmax((agent_logits + agent_mask) / temperature + gumbel_a)
-    agent_col  = (agent_flat % width).astype(jnp.uint32)
-    agent_row  = (agent_flat // width).astype(jnp.uint32)
+    agent_col = (agent_flat % width).astype(jnp.uint32)
+    agent_row = (agent_flat // width).astype(jnp.uint32)
 
-    # ---- Repair: clear walls at goal/agent cells ----
-    wall_map = wall_map.at[goal_row,  goal_col ].set(False)
+    wall_map = wall_map.at[goal_row, goal_col].set(False)
     wall_map = wall_map.at[agent_row, agent_col].set(False)
 
     agent_dir = jax.random.randint(rng_dir, (), 0, 4).astype(jnp.uint8)
 
     return Level(
         wall_map=wall_map,
-        goal_pos=jnp.array([goal_col,  goal_row],  dtype=jnp.uint32),
+        goal_pos=jnp.array([goal_col, goal_row], dtype=jnp.uint32),
         agent_pos=jnp.array([agent_col, agent_row], dtype=jnp.uint32),
         agent_dir=agent_dir,
         width=width,
@@ -315,23 +398,18 @@ def decode_maze_latents(
     height: int = 13,
     width: int = 13,
 ) -> Level:
-    """Decode a batch of latent vectors to jaxued Level objects.
-
-    Args:
-        decoder_params: MazeDecoder parameters (from extract_maze_decoder_params).
-        z:              (B, latent_dim) perturbed latents.
-        rng_keys:       (B, 2) per-sample RNG keys.
-        wall_threshold: Sigmoid threshold for binarizing wall logits.
-        temperature:    Gumbel-max temperature for goal/agent sampling.
-
-    Returns:
-        Batched Level with fields of shape (B, ...).
-    """
+    """Decode a batch of latent vectors to jaxued Level objects."""
     wall_logits, goal_logits, agent_logits = MazeDecoder(height, width).apply(
-        {'params': decoder_params}, z
+        {"params": decoder_params}, z
     )
-    return jax.vmap(
-        lambda wl, gl, al, rng: _decode_single_level(
-            wl, gl, al, rng, wall_threshold, temperature, height, width
-        )
-    )(wall_logits, goal_logits, agent_logits, rng_keys)
+
+    return jax.vmap(_decode_single_level, in_axes=(0, 0, 0, 0, None, None, None, None))(
+        wall_logits,
+        goal_logits,
+        agent_logits,
+        rng_keys,
+        wall_threshold,
+        temperature,
+        height,
+        width,
+    )

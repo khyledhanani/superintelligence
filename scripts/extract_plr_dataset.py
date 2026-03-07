@@ -8,10 +8,15 @@ For each checkpoint step, reads:
   sampler.size    (number of valid entries in the ring buffer)
 
 Outputs a single NPZ file with:
-  grids       (N, 13, 13, 3)  float32  — [wall_channel, goal_channel, agent_channel]
-  scores      (N,)             float32  — raw difficulty scores (not normalised)
-  wall_counts (N,)             int32    — number of walls per maze
-  bfs_lengths (N,)             int32    — shortest navigable path length (169=unsolvable)
+  grids              (N, 13, 13, 3)  float32  — [wall_channel, goal_channel, agent_channel]
+  scores             (N,)             float32  — raw difficulty scores (not normalised)
+  wall_counts        (N,)             int32    — number of walls per maze
+  bfs_lengths        (N,)             int32    — shortest navigable path length (169=unsolvable)
+  static_targets     (N, 7)           float32  — [s1..s7] task-aware static labels
+  p_ema              (N,)             float32  — dynamic success EMA (0 if unavailable)
+  l_ema              (N,)             float32  — p_ema * (1 - p_ema)
+  success_obs_count  (N,)             float32  — dynamic label confidence counts
+  dynamic_weight     (N,)             float32  — min(1, success_obs_count/20)
 
 Usage:
   python scripts/extract_plr_dataset.py \
@@ -54,6 +59,7 @@ _ocp_th._deserialize_sharding_from_json_string = _cpu_fallback_sharding
 # Make sure project root is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from es.env_bridge import bfs_path_length
+from es.maze_ae import compute_structural_targets
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +120,24 @@ def compute_bfs_batch(
     return np.concatenate(results)
 
 
+def compute_static_targets_batch(
+    wall_maps: np.ndarray,
+    goal_positions: np.ndarray,
+    agent_positions: np.ndarray,
+    batch_size: int = 512,
+) -> np.ndarray:
+    fn = jax.jit(compute_structural_targets)
+    out = []
+    n = len(wall_maps)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        wm = jnp.asarray(wall_maps[start:end], dtype=jnp.bool_)
+        gp = jnp.asarray(goal_positions[start:end], dtype=jnp.uint32)
+        ap = jnp.asarray(agent_positions[start:end], dtype=jnp.uint32)
+        out.append(np.asarray(fn(wm, gp, ap), dtype=np.float32))
+    return np.concatenate(out, axis=0)
+
+
 # ---------------------------------------------------------------------------
 # Main extraction
 # ---------------------------------------------------------------------------
@@ -141,6 +165,8 @@ def extract(
     all_wall_counts: list[np.ndarray] = []
     all_goal_pos: list[np.ndarray] = []
     all_agent_pos: list[np.ndarray] = []
+    all_p_ema: list[np.ndarray] = []
+    all_success_obs_count: list[np.ndarray] = []
 
     for step_idx, step in enumerate(selected_steps):
         print(f"[{step_idx+1}/{len(selected_steps)}] Loading step {step} ...", flush=True)
@@ -156,8 +182,15 @@ def extract(
         goal_pos   = np.array(sampler["levels"]["goal_pos"][:size],  dtype=np.int32)   # (size, 2)
         agent_pos  = np.array(sampler["levels"]["agent_pos"][:size], dtype=np.int32)  # (size, 2)
         scores     = np.array(sampler["scores"][:size],               dtype=np.float32) # (size,)
+        if "levels_extra" in sampler and "success_ema" in sampler["levels_extra"]:
+            success_ema = np.array(sampler["levels_extra"]["success_ema"][:size], dtype=np.float32)
+            success_obs_count = np.array(sampler["levels_extra"]["success_obs_count"][:size], dtype=np.float32)
+        else:
+            success_ema = np.zeros((size,), dtype=np.float32)
+            success_obs_count = np.zeros((size,), dtype=np.float32)
 
         new_wall_maps, new_goal_pos, new_agent_pos, new_scores = [], [], [], []
+        new_success_ema, new_success_obs_count = [], []
         n_dup = 0
         for i in range(size):
             fp = _wall_map_fingerprint(wall_maps[i])
@@ -169,6 +202,8 @@ def extract(
             new_goal_pos.append(goal_pos[i])
             new_agent_pos.append(agent_pos[i])
             new_scores.append(scores[i])
+            new_success_ema.append(success_ema[i])
+            new_success_obs_count.append(success_obs_count[i])
 
         print(f"  Valid entries: {size}, new unique: {len(new_wall_maps)}, duplicates skipped: {n_dup}")
         if not new_wall_maps:
@@ -178,6 +213,8 @@ def extract(
         new_goal_pos   = np.stack(new_goal_pos)    # (M, 2)
         new_agent_pos  = np.stack(new_agent_pos)   # (M, 2)
         new_scores     = np.array(new_scores)      # (M,)
+        new_success_ema = np.array(new_success_ema, dtype=np.float32)
+        new_success_obs_count = np.array(new_success_obs_count, dtype=np.float32)
 
         # Build grid tensors
         grids = np.stack([
@@ -192,6 +229,8 @@ def extract(
         all_wall_counts.append(wall_counts)
         all_goal_pos.append(new_goal_pos)
         all_agent_pos.append(new_agent_pos)
+        all_p_ema.append(new_success_ema)
+        all_success_obs_count.append(new_success_obs_count)
 
     if not all_grids:
         print("ERROR: No data extracted. Check checkpoint directory and buffer contents.")
@@ -202,6 +241,8 @@ def extract(
     wall_counts = np.concatenate(all_wall_counts, axis=0)
     goal_pos    = np.concatenate(all_goal_pos,    axis=0)
     agent_pos   = np.concatenate(all_agent_pos,   axis=0)
+    p_ema = np.concatenate(all_p_ema, axis=0)
+    success_obs_count = np.concatenate(all_success_obs_count, axis=0)
 
     N = len(grids)
     print(f"\nTotal unique levels: {N}")
@@ -220,6 +261,15 @@ def extract(
           f"p90={np.percentile(bfs_lengths[solvable_mask], 90):.0f}, "
           f"max={bfs_lengths[solvable_mask].max()}")
 
+    print("\nComputing static targets s1..s7 ...")
+    static_targets = compute_static_targets_batch(
+        grids[..., 0] > 0.5,
+        goal_pos,
+        agent_pos,
+    )
+    l_ema = (p_ema * (1.0 - p_ema)).astype(np.float32)
+    dynamic_weight = np.minimum(1.0, success_obs_count / 20.0).astype(np.float32)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -227,12 +277,20 @@ def extract(
         scores=scores,
         wall_counts=wall_counts,
         bfs_lengths=bfs_lengths,
+        static_targets=static_targets,
+        p_ema=p_ema.astype(np.float32),
+        l_ema=l_ema,
+        success_obs_count=success_obs_count.astype(np.float32),
+        dynamic_weight=dynamic_weight,
     )
     print(f"\nSaved dataset → {output_path}")
     print(f"  grids:       {grids.shape}  (float32)")
     print(f"  scores:      {scores.shape}  (float32, raw PVL)")
     print(f"  wall_counts: {wall_counts.shape}  (int32)")
     print(f"  bfs_lengths: {bfs_lengths.shape}  (int32, {H*W}=unsolvable)")
+    print(f"  static_targets: {static_targets.shape}  (float32, [s1..s7])")
+    print(f"  p_ema: {p_ema.shape}  (float32)")
+    print(f"  success_obs_count: {success_obs_count.shape}  (float32)")
 
 
 # ---------------------------------------------------------------------------

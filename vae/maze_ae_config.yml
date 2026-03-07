@@ -1,14 +1,7 @@
-# Grid-based CNN Autoencoder with SIGReg — trained on PLR buffer levels.
+# Task-aware Maze beta-VAE configuration.
 #
-# Architecture: (13,13,3) grid -> Conv encoder -> z (latent_dim)
-#               z -> DeConv decoder -> wall_logits + goal_logits + agent_logits
-#
-# Latent regularization: SIGReg (Sketched Isotropic Gaussian Regularization)
-#   from LeJEPA (Balestriero & LeCun, 2025). Enforces z ~ N(0,I) via
-#   empirical characteristic functions along random projections.
-#   No KL term -> no posterior collapse. Full distribution matching.
-#
-# Paths (relative to working_path/vae_folder)
+# Stage 1: static-only supervision (train_stage: stage1)
+# Stage 2: include dynamic curriculum targets (train_stage: stage2)
 
 working_path: "/cs/student/project_msc/2025/csml/kdhanani/superintelligence"
 vae_folder: "vae"
@@ -21,11 +14,11 @@ seed: 42
 num_steps: 100000
 batch_size: 512
 learning_rate: 0.0003
-lr_decay_steps: 80000          # cosine decay starts here
 val_fraction: 0.05
 val_eval_size: 1024
 plot_freq: 500
 save_freq: 10000
+train_stage: "stage1"
 
 # Model
 latent_dim: 64
@@ -33,19 +26,26 @@ height: 13
 width: 13
 
 # Reconstruction loss weights
-wall_pos_weight: 7.0           # upweight wall positives (walls are minority cells)
+wall_pos_weight: 7.0
 wall_bce_weight: 1.0
 wall_dice_weight: 1.5
 goal_ce_weight: 2.0
 agent_ce_weight: 2.0
-overlap_penalty_weight: 0.5    # penalise goal/agent landing on same cell
+overlap_penalty_weight: 0.5
 
-# SIGReg hyperparameters (LeJEPA)
-sigreg_weight: 0.05            # lambda — theory-practice tradeoff (paper recommends 0.05)
-sigreg_directions: 64          # M — number of random projection directions
-sigreg_t_points: 64            # T — discrete t values for integral approximation
-sigreg_t_max: 4.0              # integration range [-t_max, t_max]
-sigreg_warmup_steps: 2000      # pure reconstruction warmup before enabling SIGReg
+# Task-aware objective weights
+beta: 0.05
+lambda_static: 1.0
+lambda_curriculum: 0.5
+lambda_metric: 0.2
+lambda_valid: 0.5
+
+# Dynamic curriculum confidence weight:
+# w_dyn = min(1, success_obs_count / dynamic_confidence_ref)
+dynamic_confidence_ref: 20.0
+
+# Metric loss semantic-difference weights for y=[s1..s7,c1,c2]
+metric_y_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 # Decoding thresholds (used during validation and PLWM)
 wall_threshold: 0.5

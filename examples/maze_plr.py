@@ -30,11 +30,12 @@ if ROOT_DIR not in sys.path:
 
 from es.vae_decoder import load_vae_params, extract_decoder_params, decode_latent_to_env, repair_cluttr_sequence
 from es.cluttr_encoder import extract_encoder_params, encode_levels_to_latents
-from es.env_bridge import level_to_cluttr_sequence, cluttr_sequence_to_level, bfs_path_length
+from es.env_bridge import level_to_cluttr_sequence, cluttr_sequence_to_level
 from es.maze_ae import (
     load_maze_ae_params, extract_maze_encoder_params, extract_maze_decoder_params,
-    maze_level_to_grid, encode_maze_levels, decode_maze_latents,
+    maze_level_to_grid, encode_maze_levels, decode_maze_latents, predict_task_targets,
 )
+from es import plwm_scoring
 from es.map_elites_mutation_service import (
     MapElitesArchive,
     OBS_BINS,
@@ -464,6 +465,22 @@ def compute_score(config, dones, values, max_returns, advantages):
         raise ValueError(f"Unknown score function: {config['score_function']}")
 
 
+def rollout_success_from_rewards(rewards: chex.Array) -> chex.Array:
+    """Binary success per environment from rollout rewards, shape (num_envs,)."""
+    return (jnp.max(rewards, axis=0) > 0.0).astype(jnp.float32)
+
+
+def update_success_ema(
+    old_ema: chex.Array,
+    old_count: chex.Array,
+    success: chex.Array,
+    alpha: float,
+) -> tuple[chex.Array, chex.Array]:
+    new_ema = (1.0 - alpha) * old_ema + alpha * success
+    new_count = old_count + 1.0
+    return new_ema, new_count
+
+
 def structural_difficulty_surrogate(
     wall_map: chex.Array,
     goal_pos: chex.Array,
@@ -476,49 +493,18 @@ def structural_difficulty_surrogate(
     weight_branches: float,
     require_solvable: bool,
 ) -> chex.Array:
-    """Structural difficulty proxy used for surrogate-guided PLWM candidate ranking.
-
-    Inputs are batched:
-      wall_map   : (B, H, W) bool
-      goal_pos   : (B, 2) [x, y]
-      agent_pos  : (B, 2) [x, y]
-    Returns:
-      surrogate score per candidate, shape (B,)
-    """
-    h = wall_map.shape[1]
-    w = wall_map.shape[2]
-    inf = h * w
-
-    bfs = jax.vmap(bfs_path_length)(wall_map, agent_pos, goal_pos).astype(jnp.float32)
-    manhattan = (
-        jnp.abs(goal_pos[:, 0].astype(jnp.int32) - agent_pos[:, 0].astype(jnp.int32))
-        + jnp.abs(goal_pos[:, 1].astype(jnp.int32) - agent_pos[:, 1].astype(jnp.int32))
-    ).astype(jnp.float32)
-    slack = bfs - manhattan
-
-    walls = wall_map.astype(jnp.bool_)
-    free = ~walls
-
-    up = jnp.roll(free, -1, axis=1).at[:, -1, :].set(False)
-    down = jnp.roll(free, 1, axis=1).at[:, 0, :].set(False)
-    left = jnp.roll(free, -1, axis=2).at[:, :, -1].set(False)
-    right = jnp.roll(free, 1, axis=2).at[:, :, 0].set(False)
-    degree = up.astype(jnp.int32) + down.astype(jnp.int32) + left.astype(jnp.int32) + right.astype(jnp.int32)
-
-    dead_ends = jnp.sum(free & (degree == 1), axis=(1, 2)).astype(jnp.float32)
-    branch_points = jnp.sum(free & (degree >= 3), axis=(1, 2)).astype(jnp.float32)
-    wall_count = jnp.sum(walls, axis=(1, 2)).astype(jnp.float32)
-
-    score = (
-        weight_bfs * bfs
-        + weight_slack * slack
-        + weight_dead_ends * dead_ends
-        + weight_walls * wall_count
-        + weight_branches * branch_points
+    """Structural difficulty proxy used for surrogate-guided PLWM candidate ranking."""
+    return plwm_scoring.structural_difficulty_surrogate(
+        wall_map,
+        goal_pos,
+        agent_pos,
+        weight_bfs=weight_bfs,
+        weight_slack=weight_slack,
+        weight_dead_ends=weight_dead_ends,
+        weight_walls=weight_walls,
+        weight_branches=weight_branches,
+        require_solvable=require_solvable,
     )
-    if require_solvable:
-        score = jnp.where(bfs < inf, score, -1e9)
-    return score
 
 def main(config=None, project="JAXUED_TEST"):
     tags = []
@@ -587,6 +573,7 @@ def main(config=None, project="JAXUED_TEST"):
     encoder_params = None
     maze_encoder_params = None
     maze_decoder_params = None
+    maze_full_params = None
     me_latent_dim = int(config["me_latent_dim"])
     me_descriptor_mode = str(config["me_descriptor_mode"]).lower()
     if me_descriptor_mode not in ("behavior", "latent", "hybrid", "bfs"):
@@ -654,6 +641,8 @@ def main(config=None, project="JAXUED_TEST"):
             raise ValueError("--use_plwm_mutation requires --use_accel")
         if config["use_map_elites_mutation"]:
             raise ValueError("--use_plwm_mutation and --use_map_elites_mutation are mutually exclusive")
+        if config["plwm_surrogate_guided"] and config["plwm_task_aware_guided"] and not config["plwm_use_maze_ae"]:
+            raise ValueError("--plwm_task_aware_guided currently requires --plwm_use_maze_ae")
 
         if config["plwm_use_maze_ae"]:
             # Grid-based CNN AE path — load only the MazeAE checkpoint
@@ -664,6 +653,15 @@ def main(config=None, project="JAXUED_TEST"):
                 mae_path = os.path.abspath(os.path.join(os.getcwd(), mae_path))
             print(f"Loading Maze AE from {mae_path}...")
             full_mae_params = load_maze_ae_params(mae_path)
+            if config["plwm_surrogate_guided"] and config["plwm_task_aware_guided"]:
+                required = ("StaticHead_0", "CurriculumHead_0", "ValidHead_0")
+                missing = [k for k in required if k not in full_mae_params]
+                if missing:
+                    raise ValueError(
+                        "Task-aware PLWM requires a task-aware MazeAE checkpoint with heads. "
+                        f"Missing keys: {missing}"
+                    )
+            maze_full_params = full_mae_params
             maze_encoder_params = extract_maze_encoder_params(full_mae_params)
             maze_decoder_params = extract_maze_decoder_params(full_mae_params)
             print(
@@ -691,6 +689,7 @@ def main(config=None, project="JAXUED_TEST"):
                 raise ValueError("--plwm_surrogate_num_candidates must be >= 1.")
             print(
                 "PLWM surrogate guidance enabled: "
+                f"mode={'task-aware' if config['plwm_task_aware_guided'] else 'structural'}, "
                 f"candidates={config['plwm_surrogate_num_candidates']}, "
                 f"weights(bfs={config['plwm_surrogate_weight_bfs']}, "
                 f"slack={config['plwm_surrogate_weight_slack']}, "
@@ -748,7 +747,14 @@ def main(config=None, project="JAXUED_TEST"):
             # optax.adam(learning_rate=config["lr"], eps=1e-5),
         )
         pholder_level = sample_random_level(jax.random.PRNGKey(0))
-        sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
+        sampler = level_sampler.initialize(
+            pholder_level,
+            {
+                "max_return": -jnp.inf,
+                "success_ema": jnp.array(0.0, dtype=jnp.float32),
+                "success_obs_count": jnp.array(0.0, dtype=jnp.float32),
+            },
+        )
         me_archive = init_map_elites_archive(me_latent_dim, cells=me_archive_cells)
         pholder_level_batch = jax.tree_util.tree_map(lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0), pholder_level)
         pholder_level_inds = jnp.zeros((config["num_train_envs"],), dtype=jnp.int32)
@@ -804,7 +810,17 @@ def main(config=None, project="JAXUED_TEST"):
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
             max_returns = compute_max_returns(dones, rewards)
             scores = compute_score(config, dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+            success = rollout_success_from_rewards(rewards)
+            sampler, _ = level_sampler.insert_batch(
+                sampler,
+                new_levels,
+                scores,
+                {
+                    "max_return": max_returns,
+                    "success_ema": success,
+                    "success_obs_count": jnp.ones_like(success),
+                },
+            )
             
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -862,9 +878,26 @@ def main(config=None, project="JAXUED_TEST"):
                 config["num_steps"],
             )
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
-            max_returns = jnp.maximum(level_sampler.get_levels_extra(sampler, level_inds)["max_return"], compute_max_returns(dones, rewards))
+            level_extras = level_sampler.get_levels_extra(sampler, level_inds)
+            max_returns = jnp.maximum(level_extras["max_return"], compute_max_returns(dones, rewards))
             scores = compute_score(config, dones, values, max_returns, advantages)
-            sampler = level_sampler.update_batch(sampler, level_inds, scores, {"max_return": max_returns})
+            success = rollout_success_from_rewards(rewards)
+            new_success_ema, new_success_obs_count = update_success_ema(
+                level_extras["success_ema"],
+                level_extras["success_obs_count"],
+                success,
+                float(config["success_ema_alpha"]),
+            )
+            sampler = level_sampler.update_batch(
+                sampler,
+                level_inds,
+                scores,
+                {
+                    "max_return": max_returns,
+                    "success_ema": new_success_ema,
+                    "success_obs_count": new_success_obs_count,
+                },
+            )
             
             # Update the policy using trajectories collected from replay levels
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -946,7 +979,7 @@ def main(config=None, project="JAXUED_TEST"):
 
                     if config["plwm_surrogate_guided"]:
                         # Sample multiple perturbation candidates per parent and keep the
-                        # structurally hardest one under a configurable surrogate.
+                        # highest-scoring candidate under the selected ranking objective.
                         candidate_noise = jax.random.normal(
                             rng_encode,
                             (batch_size, num_candidates, parent_latents.shape[-1]),
@@ -963,18 +996,48 @@ def main(config=None, project="JAXUED_TEST"):
                             wall_threshold=0.5,
                             temperature=float(config["plwm_decode_temperature"]),
                         )
-                        surrogate_scores_flat = structural_difficulty_surrogate(
-                            candidate_levels_flat.wall_map,
-                            candidate_levels_flat.goal_pos,
-                            candidate_levels_flat.agent_pos,
-                            weight_bfs=float(config["plwm_surrogate_weight_bfs"]),
-                            weight_slack=float(config["plwm_surrogate_weight_slack"]),
-                            weight_dead_ends=float(config["plwm_surrogate_weight_dead_ends"]),
-                            weight_walls=float(config["plwm_surrogate_weight_walls"]),
-                            weight_branches=float(config["plwm_surrogate_weight_branches"]),
-                            require_solvable=bool(config["plwm_surrogate_require_solvable"]),
-                        )
-                        surrogate_scores = surrogate_scores_flat.reshape((batch_size, num_candidates))
+
+                        if config["plwm_task_aware_guided"]:
+                            parent_preds = predict_task_targets(maze_full_params, parent_grids)
+                            candidate_grids_flat = jax.vmap(maze_level_to_grid)(
+                                candidate_levels_flat.wall_map,
+                                candidate_levels_flat.goal_pos,
+                                candidate_levels_flat.agent_pos,
+                            )
+                            cand_preds = predict_task_targets(maze_full_params, candidate_grids_flat)
+
+                            task_scores = plwm_scoring.task_aware_objective(
+                                p_pred=cand_preds["p_pred"].reshape((batch_size, num_candidates)),
+                                learnability_pred=cand_preds["l_pred"].reshape((batch_size, num_candidates)),
+                                invalid_prob=cand_preds["invalid_prob"].reshape((batch_size, num_candidates)),
+                                bfs_norm_pred=cand_preds["bfs_norm_pred"].reshape((batch_size, num_candidates)),
+                                wall_density_pred=cand_preds["wall_density_pred"].reshape((batch_size, num_candidates)),
+                                parent_bfs_norm=parent_preds["bfs_norm_pred"][:, None],
+                                parent_wall_density=parent_preds["wall_density_pred"][:, None],
+                                a=float(config["plwm_task_weight_a"]),
+                                b=float(config["plwm_task_weight_b"]),
+                                c=float(config["plwm_task_weight_c"]),
+                                d=float(config["plwm_task_weight_d"]),
+                                e=float(config["plwm_task_weight_e"]),
+                                low=float(config["plwm_target_success_low"]),
+                                high=float(config["plwm_target_success_high"]),
+                                delta_bfs_norm=float(config["plwm_task_delta_bfs_steps"]) / 169.0,
+                            )
+                            surrogate_scores = task_scores
+                        else:
+                            surrogate_scores_flat = structural_difficulty_surrogate(
+                                candidate_levels_flat.wall_map,
+                                candidate_levels_flat.goal_pos,
+                                candidate_levels_flat.agent_pos,
+                                weight_bfs=float(config["plwm_surrogate_weight_bfs"]),
+                                weight_slack=float(config["plwm_surrogate_weight_slack"]),
+                                weight_dead_ends=float(config["plwm_surrogate_weight_dead_ends"]),
+                                weight_walls=float(config["plwm_surrogate_weight_walls"]),
+                                weight_branches=float(config["plwm_surrogate_weight_branches"]),
+                                require_solvable=bool(config["plwm_surrogate_require_solvable"]),
+                            )
+                            surrogate_scores = surrogate_scores_flat.reshape((batch_size, num_candidates))
+
                         best_idx = jnp.argmax(surrogate_scores, axis=1)
                         row_idx = jnp.arange(batch_size)
 
@@ -1101,7 +1164,17 @@ def main(config=None, project="JAXUED_TEST"):
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
             max_returns = compute_max_returns(dones, rewards)
             scores = compute_score(config, dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+            success = rollout_success_from_rewards(rewards)
+            sampler, _ = level_sampler.insert_batch(
+                sampler,
+                child_levels,
+                scores,
+                {
+                    "max_return": max_returns,
+                    "success_ema": success,
+                    "success_obs_count": jnp.ones_like(success),
+                },
+            )
 
             # Track how often selected PLWM mutations improve over their replay parent score.
             plwm_batch_uphill_fraction = jnp.array(0.0, dtype=jnp.float32)
@@ -1418,9 +1491,30 @@ if __name__=="__main__":
     group.add_argument("--plwm_decode_temperature", type=float, default=0.25,
                        help="Gumbel-max sampling temperature for PLWM decoder. "
                             "Lower = more deterministic. Default 0.25.")
+    group.add_argument("--success_ema_alpha", type=float, default=0.1,
+                       help="EMA smoothing factor for per-level success labels in replay extras.")
     group.add_argument("--plwm_surrogate_guided", action=argparse.BooleanOptionalAction, default=False,
                        help="If set, sample multiple latent perturbation candidates per parent "
                             "and choose the best candidate using a structural difficulty surrogate.")
+    group.add_argument("--plwm_task_aware_guided", action=argparse.BooleanOptionalAction, default=True,
+                       help="When surrogate-guided PLWM is enabled, use task-aware beta-VAE head "
+                            "predictions for candidate ranking instead of the structural surrogate.")
+    group.add_argument("--plwm_target_success_low", type=float, default=0.3,
+                       help="Lower bound of the target success-probability band.")
+    group.add_argument("--plwm_target_success_high", type=float, default=0.7,
+                       help="Upper bound of the target success-probability band.")
+    group.add_argument("--plwm_task_delta_bfs_steps", type=float, default=2.0,
+                       help="Desired BFS-length increase relative to the parent in steps.")
+    group.add_argument("--plwm_task_weight_a", type=float, default=1.0,
+                       help="Weight on predicted learnability in task-aware PLWM objective.")
+    group.add_argument("--plwm_task_weight_b", type=float, default=2.0,
+                       help="Weight on invalidity penalty in task-aware PLWM objective.")
+    group.add_argument("--plwm_task_weight_c", type=float, default=0.5,
+                       help="Weight on success-band penalty in task-aware PLWM objective.")
+    group.add_argument("--plwm_task_weight_d", type=float, default=0.25,
+                       help="Weight on BFS-target deviation penalty in task-aware PLWM objective.")
+    group.add_argument("--plwm_task_weight_e", type=float, default=0.1,
+                       help="Weight on wall-density drift penalty in task-aware PLWM objective.")
     group.add_argument("--plwm_surrogate_num_candidates", type=int, default=8,
                        help="Number of latent perturbation candidates per parent when surrogate-guided "
                             "PLWM is enabled. Default 8.")
@@ -1438,7 +1532,7 @@ if __name__=="__main__":
                        help="If set, surrogate score for unsolvable candidate levels is forced to -inf "
                             "so only solvable candidates are selected.")
     group.add_argument("--plwm_use_maze_ae", action=argparse.BooleanOptionalAction, default=False,
-                       help="Use the grid-based CNN AE (SIGReg) instead of the CLUTTR sequence "
+                       help="Use the grid-based task-aware Maze beta-VAE instead of the CLUTTR sequence "
                             "VAE for PLWM encoding/decoding. Requires --use_plwm_mutation. "
                             "Supports any wall count (no 50-wall truncation).")
     group.add_argument("--plwm_mae_checkpoint", type=str, default=None,
