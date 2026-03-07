@@ -22,7 +22,12 @@ set -e
 cd /cs/student/project_msc/2025/csml/gmaralla/superintelligence
 unset XLA_FLAGS
 
-PYTHON=/cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env/bin/python
+CONDA_ENV=/cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env
+PYTHON=$CONDA_ENV/bin/python
+
+# Ensure conda env libs are in LD_LIBRARY_PATH so cuSolver can find libcublas.so.12
+# (required when invoking Python by full path without `conda activate`)
+export LD_LIBRARY_PATH=$CONDA_ENV/lib:$LD_LIBRARY_PATH
 SEED=42
 UPDATES=20000
 GROUP=phase5-comparison

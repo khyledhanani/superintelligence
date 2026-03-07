@@ -55,7 +55,8 @@ from ued_interface import load_vae, build_eval_fn
 from ppo_utils import compute_gae, sample_trajectories_rnn, update_actor_critic_rnn
 
 import wandb
-from regret_fitness import rollout_agent_on_levels_with_positions, extract_behavior_signature
+from regret_fitness import rollout_agent_on_levels, rollout_agent_on_levels_with_positions, extract_behavior_signature
+from jaxued.environments.maze import Level
 from accel_training.es_components import NSESStrategy, CMAESStrategy, SVCMAESStrategy
 
 
@@ -139,6 +140,27 @@ def train(config):
         wandb.define_metric(key, step_metric="update")
     for key in ["sv_behavior_dist_pre", "sv_behavior_dist_post"]:
         wandb.define_metric(key, step_metric="update")
+    wandb.define_metric("solve_rate/*", step_metric="update")
+    wandb.define_metric("return/*", step_metric="update")
+
+    # Paper benchmark levels for solve-rate eval (matches maze_plr.py dashboard)
+    BENCHMARK_NAMES = [
+        "SixteenRooms", "SixteenRooms2", "Labyrinth", "LabyrinthFlipped",
+        "Labyrinth2", "StandardMaze", "StandardMaze2", "StandardMaze3",
+    ]
+    benchmark_levels = Level.load_prefabs(BENCHMARK_NAMES)
+
+    @jax.jit
+    def eval_on_benchmark(rng, agent_params):
+        """Evaluate agent on 8-level DCD paper benchmark. Returns (solve_rates, mean_returns)."""
+        rewards, _, _ = rollout_agent_on_levels(
+            rng, env, env_params, agent_params, network,
+            benchmark_levels, num_steps=config["num_steps"],
+        )
+        # rewards: (num_steps, 8) — agent gets +1 on goal, 0 otherwise
+        cumulative = rewards.sum(axis=0)          # (8,)
+        solve_rates = (cumulative > 0).astype(jnp.float32)  # (8,)
+        return solve_rates, cumulative
     mean_novelty = 0.0           # tracked per-step for NS-ES
     sv_behavior_dist_pre = 0.0   # tracked per-step for SV-CMA-ES
     sv_behavior_dist_post = 0.0  # tracked per-step for SV-CMA-ES
@@ -326,28 +348,65 @@ def train(config):
         with open(os.path.join(ckpt_dir, "es_state.pkl"), "wb") as f:
             pickle.dump(es_stats, f)
 
-        # 3. Decode mean latent(s) and log as WandB image
+        # 3. Save PLR buffer snapshot (levels + scores + metadata)
+        buf_size = int(train_state.sampler["size"])
+        if buf_size > 0:
+            buf_snapshot = {
+                "size": buf_size,
+                "scores": np.asarray(train_state.sampler["scores"][:buf_size]),
+            }
+            # Save levels as numpy
+            buf_snapshot["levels"] = jax.tree_util.tree_map(
+                lambda x: np.asarray(x[:buf_size]), train_state.sampler["levels"]
+            )
+            if "levels_extra" in train_state.sampler:
+                buf_snapshot["levels_extra"] = jax.tree_util.tree_map(
+                    lambda x: np.asarray(x[:buf_size]), train_state.sampler["levels_extra"]
+                )
+            with open(os.path.join(ckpt_dir, "plr_buffer.pkl"), "wb") as f:
+                pickle.dump(buf_snapshot, f)
+
+        # 4. Log top-K hardest buffer mazes to WandB
         try:
-            rng, rng_img = jax.random.split(rng)
-            if es_strategy_name == "sv_cma_es":
-                for i, p in enumerate(es_stats["particles"]):
-                    mean = jnp.array(p["mean"]).reshape(1, 64)
-                    padded = jnp.concatenate([mean, jnp.zeros((pop_size_es - 1, 64))])
-                    _, levels, _, _, valid = eval_fn(rng_img, train_state.params, padded)
-                    if bool(valid[0]):
-                        level_i = jax.tree_util.tree_map(lambda x: x[0], levels)
-                        img = np.asarray(renderer.render_level(level_i, env_params))
-                        wandb.log({f"es/particle_{i}_maze": wandb.Image(img)}, step=update)
-            else:
-                mean = jnp.array(es_stats["mean"]).reshape(1, 64)
-                padded = jnp.concatenate([mean, jnp.zeros((pop_size_es - 1, 64))])
-                _, levels, _, _, valid = eval_fn(rng_img, train_state.params, padded)
-                if bool(valid[0]):
-                    level_i = jax.tree_util.tree_map(lambda x: x[0], levels)
-                    img = np.asarray(renderer.render_level(level_i, env_params))
-                    wandb.log({"es/mean_maze": wandb.Image(img)}, step=update)
+            N_HARD = min(6, buf_size)
+            if N_HARD > 0:
+                scores_np = np.asarray(train_state.sampler["scores"])
+                # Mask out empty slots
+                scores_masked = np.where(
+                    np.arange(level_sampler.capacity) < buf_size, scores_np, -np.inf
+                )
+                top_indices = np.argsort(-scores_masked)[:N_HARD]
+                images = []
+                for idx in top_indices:
+                    level_k = jax.tree_util.tree_map(
+                        lambda x: x[idx], train_state.sampler["levels"]
+                    )
+                    img = np.asarray(renderer.render_level(level_k, env_params))
+                    images.append(img)
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                cols = min(N_HARD, 6)
+                rows = (N_HARD + cols - 1) // cols
+                fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.2, rows * 2.4))
+                if rows == 1 and cols == 1:
+                    axes = [axes]
+                elif rows == 1:
+                    axes = list(axes)
+                else:
+                    axes = [ax for row in axes for ax in row]
+                for i, (img, idx) in enumerate(zip(images, top_indices)):
+                    axes[i].imshow(img)
+                    axes[i].set_title(f"#{i+1} score={scores_masked[idx]:.3f}", fontsize=7)
+                    axes[i].axis("off")
+                for i in range(len(images), len(axes)):
+                    axes[i].axis("off")
+                fig.suptitle(f"Top-{N_HARD} Hardest Buffer Mazes (update {update})", fontsize=10)
+                fig.tight_layout()
+                wandb.log({"buffer/hardest_mazes": wandb.Image(fig)}, step=update)
+                plt.close(fig)
         except Exception as e:
-            print(f"  [es_state] image logging skipped: {e}")
+            print(f"  [checkpoint] hardest-maze image skipped: {e}")
 
         print(f"  Saved checkpoint: {ckpt_dir}")
 
@@ -400,68 +459,73 @@ def train(config):
             float(np.nanmean(np.where(valid_np, regrets_np, np.nan)))
             if valid_np.any() else 0.0
         )
+        valid_jax = jnp.array(valid_np)    # JAX bool for jnp.where masking
+        INVALID_PENALTY = 10.0              # large positive = worst for evosax minimizer
 
-        if len(valid_indices) > 0:
-            # Pad/truncate to num_envs for LevelSampler
-            regrets_valid = jnp.array(regrets_np[valid_indices])
-            max_returns_valid = jnp.array(np.asarray(max_returns)[valid_indices])
-            candidate_sigs_valid = jnp.array(np.asarray(candidate_sigs)[valid_indices])
-            latents_valid = latents_jax[valid_indices]
-            levels_valid = jax.tree_util.tree_map(lambda x: x[valid_indices], levels)
+        # --- Helper: pad valid candidates to num_envs and insert into PLR buffer ---
+        def _insert_valid_into_plr(train_state, v_indices, v_regrets_np, v_max_returns,
+                                   v_sigs, v_latents, v_levels):
+            r_v = jnp.array(v_regrets_np[v_indices])
+            mr_v = jnp.array(np.asarray(v_max_returns)[v_indices])
+            bs_v = jnp.array(np.asarray(v_sigs)[v_indices])
+            lat_v = v_latents[v_indices]
+            lev_v = jax.tree_util.tree_map(lambda x: x[v_indices], v_levels)
 
-            n_valid = len(valid_indices)
-            tile_reps = (num_envs + n_valid - 1) // n_valid
-            regrets_pad = jnp.tile(regrets_valid, tile_reps)[:num_envs]
-            max_returns_pad = jnp.tile(max_returns_valid, tile_reps)[:num_envs]
-            candidate_sigs_pad = jnp.tile(candidate_sigs_valid, (tile_reps, 1))[:num_envs]
-            latents_pad = jnp.tile(latents_valid, (tile_reps, 1))[:num_envs]
-            levels_pad = jax.tree_util.tree_map(
-                lambda x: jnp.tile(x, (tile_reps,) + (1,) * (x.ndim - 1))[:num_envs],
-                levels_valid,
+            nv = len(v_indices)
+            tr = (num_envs + nv - 1) // nv
+            r_pad = jnp.tile(r_v, tr)[:num_envs]
+            mr_pad = jnp.tile(mr_v, tr)[:num_envs]
+            bs_pad = jnp.tile(bs_v, (tr, 1))[:num_envs]
+            lat_pad = jnp.tile(lat_v, (tr, 1))[:num_envs]
+            lev_pad = jax.tree_util.tree_map(
+                lambda x: jnp.tile(x, (tr,) + (1,) * (x.ndim - 1))[:num_envs],
+                lev_v,
             )
 
             level_extra = {
-                "max_return": max_returns_pad,
-                "latent": latents_pad,
-                "behavior_sig": candidate_sigs_pad,
+                "max_return": mr_pad,
+                "latent": lat_pad,
+                "behavior_sig": bs_pad,
             }
-            assert "behavior_sig" in level_extra, (
-                "All PLR buffer insertions must include 'behavior_sig'. "
-                "Call extract_behavior_signature() first."
-            )
             new_sampler, _ = level_sampler.insert_batch(
-                train_state.sampler, levels_pad, regrets_pad, level_extra
+                train_state.sampler, lev_pad, r_pad, level_extra
             )
-            train_state = train_state.replace(sampler=new_sampler)
-        else:
-            # No valid levels — keep sampler unchanged; use full latents for tell()
-            levels_pad = levels
-            regrets_pad = regrets
-            candidate_sigs_pad = candidate_sigs
-            latents_pad = latents_jax
+            return train_state.replace(sampler=new_sampler), lev_pad
 
-        # ES tell (strategy-specific)
+        # --- PLR BUFFER INSERT (padded to num_envs) ---
+        # All strategies insert valid first-pass levels.
+        # SV-CMA-ES also inserts valid second-pass levels below.
+        levels_pad = None  # for optional exploratory training
+        if len(valid_indices) > 0:
+            train_state, levels_pad = _insert_valid_into_plr(
+                train_state, valid_indices, regrets_np, max_returns,
+                candidate_sigs, latents_jax, levels,
+            )
+
+        # --- ES TELL (original pop_size shapes, validity-masked fitness) ---
+        # KEY FIX: tell() receives the original arrays from ask()/eval(), NOT
+        # the padded arrays used for insert_batch(). This ensures CMA-ES internal
+        # ranking and step-size adaptation see the correct population size.
         if es_strategy_name == "ns_es":
             buf_size_es = int(train_state.sampler["size"])
             all_buf_sigs = train_state.sampler["levels_extra"]["behavior_sig"]
             buf_valid_mask = jnp.arange(level_sampler.capacity) < buf_size_es
             es_state, mean_novelty = es_strategy.tell(
-                es_state, latents_pad, regrets_pad,
-                candidate_sigs_pad, all_buf_sigs, buf_valid_mask,
+                es_state, latents_jax, regrets,     # ORIGINAL shapes (pop_size)
+                candidate_sigs, all_buf_sigs, buf_valid_mask,
                 alpha=config.get("es_alpha", 0.8),
                 beta=config.get("es_beta", 0.2),
                 k=config.get("es_k_novelty", 5),
+                candidate_valid=valid_jax,           # validity mask
             )
 
         elif es_strategy_name == "sv_cma_es":
-            # SV-CMA-ES two-pass eval.
-            # First pass already done above: latents_jax, candidate_sigs, regrets (pre-repulsion).
-            # Step 4: nudge candidate latents by Stein repulsion for second eval pass.
             n_sv = len(es_state["particles"])
-            pop_sv = config.get("es_pop_size", 16)
+            pop_sv = pop_size_es  # true ES pop size, NOT num_envs
 
+            # Pre-repulsion bsigs per particle (ORIGINAL unpadded candidate_sigs)
             particle_bsigs_pre = jnp.stack([
-                jnp.mean(candidate_sigs_pad[i * pop_sv:(i + 1) * pop_sv], axis=0)
+                jnp.nanmean(candidate_sigs[i * pop_sv:(i + 1) * pop_sv], axis=0)
                 for i in range(n_sv)
             ])  # (N, D_bsig)
             particle_means_pre = jnp.stack([
@@ -481,7 +545,9 @@ def train(config):
 
             # Second eval pass on repelled latents
             rng, rng_eval2, rng_bsig2 = jax.random.split(rng, 3)
-            _, levels2, regrets2, max_returns2, _ = eval_fn(rng_eval2, train_state.params, post_latents)
+            _, levels2, regrets2, max_returns2, valid2 = eval_fn(
+                rng_eval2, train_state.params, post_latents
+            )
             _, _, _, agent_pos2 = rollout_agent_on_levels_with_positions(
                 rng_bsig2, eval_env, env_params,
                 train_state.params, network, levels2,
@@ -489,56 +555,48 @@ def train(config):
             )
             post_bsigs = extract_behavior_signature(agent_pos2, config["eval_rollout_steps"])
 
-            # PLR buffer receives post-repulsion data
-            n_post = n_sv * pop_sv
-            if n_post < num_envs:
-                tile_reps2 = (num_envs + n_post - 1) // n_post
-                regrets2_pad = jnp.tile(regrets2, tile_reps2)[:num_envs]
-                post_latents_pad = jnp.tile(post_latents, (tile_reps2, 1))[:num_envs]
-                post_bsigs_pad = jnp.tile(post_bsigs, (tile_reps2, 1))[:num_envs]
-                levels2_pad = jax.tree_util.tree_map(
-                    lambda x: jnp.tile(x, (tile_reps2, *([1] * (x.ndim - 1))))[:num_envs],
-                    levels2,
-                )
-                max_returns2_pad = jnp.tile(max_returns2, tile_reps2)[:num_envs]
-            else:
-                regrets2_pad = regrets2[:num_envs]
-                post_latents_pad = post_latents[:num_envs]
-                post_bsigs_pad = post_bsigs[:num_envs]
-                levels2_pad = jax.tree_util.tree_map(lambda x: x[:num_envs], levels2)
-                max_returns2_pad = max_returns2[:num_envs]
-
-            level_extra2 = {
-                "max_return": max_returns2_pad,
-                "latent": post_latents_pad,
-                "behavior_sig": post_bsigs_pad,
-            }
-            assert "behavior_sig" in level_extra2
-            sampler2, _ = level_sampler.insert_batch(
-                train_state.sampler, levels2_pad, regrets2_pad, level_extra2
+            # Second-pass validity gating (was missing — Bug 2)
+            regrets2_np = np.asarray(regrets2)
+            valid2_np = (
+                np.asarray(valid2)
+                & ~np.isnan(regrets2_np)
+                & ~np.any(np.isnan(np.asarray(post_bsigs)), axis=-1)
             )
-            train_state = train_state.replace(sampler=sampler2)
+            valid2_jax = jnp.array(valid2_np)
+            valid2_indices = np.where(valid2_np)[0]
 
-            # SV-CMA-ES tell()
+            # PLR insert: only VALID post-repulsion levels
+            if len(valid2_indices) > 0:
+                train_state, _ = _insert_valid_into_plr(
+                    train_state, valid2_indices, regrets2_np, max_returns2,
+                    post_bsigs, post_latents, levels2,
+                )
+
+            # SV-CMA-ES tell() with original shapes + validity mask
             es_state, sv_metrics = es_strategy.tell(
                 es_state,
-                latents_pad,       # pre_cands
-                candidate_sigs_pad, # pre_bsigs
-                post_latents,      # post_cands
-                regrets2,          # post_regrets
-                post_bsigs,        # post_bsigs
+                latents_jax[:n_sv * pop_sv],     # pre_cands (original, not padded)
+                candidate_sigs[:n_sv * pop_sv],   # pre_bsigs (original, not padded)
+                post_latents,                     # post_cands (N*pop_sv, param_dim)
+                regrets2,                         # post_regrets (N*pop_sv,)
+                post_bsigs,                       # post_bsigs (N*pop_sv, D_bsig)
                 sv_epsilon,
+                valid_mask=valid2_jax,            # validity mask
             )
             sv_behavior_dist_pre = sv_metrics["sv_behavior_dist_pre"]
             sv_behavior_dist_post = sv_metrics["sv_behavior_dist_post"]
 
         else:
-            # CMA-ES baseline: negate regret for evosax (minimizes)
-            fitness_for_cma = -(config.get("es_alpha", 0.8) * regrets_pad)
-            es_state = es_strategy.tell(es_state, latents_pad, fitness_for_cma)
+            # CMA-ES baseline: penalize invalid candidates instead of rewarding them
+            fitness = jnp.where(
+                valid_jax,
+                -(config.get("es_alpha", 0.8) * regrets),  # valid: negate regret
+                INVALID_PENALTY,                             # invalid: worst possible
+            )
+            es_state = es_strategy.tell(es_state, latents_jax, fitness)  # ORIGINAL shape
 
         # Exploratory grad updates (optional — train on ES levels too)
-        if exploratory and len(valid_indices) > 0:
+        if exploratory and levels_pad is not None:
             rng, rng_train = jax.random.split(rng)
             train_state, _, _, _ = _train_on_levels(rng_train, train_state, levels_pad)
 
@@ -572,7 +630,12 @@ def train(config):
     print(f"  ES strategy: {es_strategy_name}")
     print(f"  bootstrap_min={bootstrap_min}, replay_ratio={replay_ratio}")
     print(f"  n_envs={num_envs}, n_steps={num_steps}")
+    if es_strategy_name == "cma_es":
+        _thresh = config.get("cma_restart_threshold", 0.01)
+        print(f"  CMA-ES restarts enabled: threshold sigma < {_thresh}")
     print("-" * 80)
+
+    n_restarts = 0  # CMA-ES restart counter
 
     for update in range(config["num_updates"]):
         t_start = time.time()
@@ -598,6 +661,20 @@ def train(config):
                 mean_regret, valid_frac,
                 mean_novelty, sv_behavior_dist_pre, sv_behavior_dist_post,
             ) = _run_es_step(rng, train_state, es_state)
+
+            # CMA-ES restart: when sigma collapses, re-init from a new random mean.
+            # This prevents premature convergence to a single latent region.
+            if es_strategy_name == "cma_es":
+                restart_threshold = config.get("cma_restart_threshold", 0.01)
+                if float(es_state["es_state"].std) < restart_threshold:
+                    rng, rng_restart = jax.random.split(rng)
+                    sigma_init = config.get("es_sigma_init", 0.5)
+                    new_mean = jax.random.normal(rng_restart, (latent_dim_es,)) * sigma_init
+                    es_state = es_strategy.init_state(
+                        rng_restart, {**config, "mean": new_mean, "sigma_init": sigma_init}
+                    )
+                    n_restarts += 1
+                    print(f"  [update {update}] CMA-ES restart #{n_restarts} (sigma collapsed)")
 
         # =======================================================
         # REPLAY branch
@@ -640,6 +717,16 @@ def train(config):
 
         _log(update, mode, buf_size, mean_regret, valid_frac, mean_buf_score, t_elapsed)
 
+        # Benchmark eval — every eval_freq updates (matches maze_plr.py cadence)
+        if (update + 1) % config.get("eval_freq", 500) == 0:
+            rng, rng_bench = jax.random.split(rng)
+            bench_solve_rates, bench_returns = eval_on_benchmark(rng_bench, train_state.params)
+            bench_log = {f"solve_rate/{name}": float(s) for name, s in zip(BENCHMARK_NAMES, bench_solve_rates)}
+            bench_log["solve_rate/mean"] = float(bench_solve_rates.mean())
+            bench_log.update({f"return/{name}": float(r) for name, r in zip(BENCHMARK_NAMES, bench_returns)})
+            bench_log["return/mean"] = float(bench_returns.mean())
+            wandb.log(bench_log, step=update)
+
         if (update + 1) % config.get("wandb_log_freq", 10) == 0:
             log_dict = {
                 "update":                update,
@@ -653,6 +740,8 @@ def train(config):
                 "sv_behavior_dist_pre":  sv_behavior_dist_pre,
                 "sv_behavior_dist_post": sv_behavior_dist_post,
             }
+            if es_strategy_name == "cma_es":
+                log_dict["es/n_restarts"] = n_restarts
             # ES state scalar metrics (only meaningful after an es_step)
             if mode == "es_step":
                 if es_strategy_name in ("cma_es", "ns_es"):
