@@ -110,7 +110,9 @@ def load_agent(checkpoint_dir, checkpoint_step=-1):
     )
 
     models_dir = os.path.join(checkpoint_dir, "models")
-    checkpoint_manager = ocp.CheckpointManager(models_dir)
+    checkpoint_manager = ocp.CheckpointManager(
+        models_dir, item_handlers=ocp.StandardCheckpointHandler()
+    )
     available = sorted(checkpoint_manager.all_steps())
 
     if checkpoint_step == -1:

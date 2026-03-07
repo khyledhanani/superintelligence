@@ -18,7 +18,7 @@ set -e
 BUCKET="ucl-ued-project-bucket"
 PREFIX="accel"
 SEEDS=(0 1 2)
-TIMESTEPS=(10k 20k 30k 40k 50k)
+TIMESTEPS=(20k 30k 40k 50k)
 NUM_ATTEMPTS=10
 OUTPUT_DIR="results/cross_eval"
 
