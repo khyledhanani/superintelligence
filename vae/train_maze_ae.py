@@ -357,6 +357,7 @@ def run_training(config: dict) -> None:
         "val/goal_acc",
         "val/agent_acc",
         "val/p_mae",
+        "val/solvable_bce",
     ]}
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))

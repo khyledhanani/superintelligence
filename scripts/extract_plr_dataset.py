@@ -24,6 +24,11 @@ Usage:
       --output        vae/datasets/plr_pvl_dataset.npz \
       [--step_stride 5]        # only load every Nth checkpoint (saves RAM/time)
       [--max_steps 9999999]    # cap on steps to include
+
+Or aggregate across all runs:
+  python scripts/extract_plr_dataset.py \
+      --checkpoint_dir checkpoints/ \
+      --output        vae/datasets/plr_pvl_dataset.npz
 """
 
 from __future__ import annotations
@@ -138,6 +143,18 @@ def compute_static_targets_batch(
     return np.concatenate(out, axis=0)
 
 
+def discover_model_dirs(path: Path) -> list[Path]:
+    """Discover Orbax model dirs.
+
+    If `path` is already a models directory, return [path].
+    Otherwise, recursively find all directories named `models` under `path`.
+    """
+    resolved = path.resolve()
+    if resolved.name == "models":
+        return [resolved]
+    return sorted([p.resolve() for p in resolved.rglob("models") if p.is_dir()])
+
+
 # ---------------------------------------------------------------------------
 # Main extraction
 # ---------------------------------------------------------------------------
@@ -150,14 +167,11 @@ def extract(
     H: int = 13,
     W: int = 13,
 ) -> None:
-    ckpt_mgr = ocp.CheckpointManager(
-        str(checkpoint_dir.resolve()),
-        item_handlers=ocp.StandardCheckpointHandler(),
-    )
-    all_steps = sorted(ckpt_mgr.all_steps())
-    selected_steps = [s for i, s in enumerate(all_steps) if i % step_stride == 0 and s <= max_steps]
-    print(f"Found {len(all_steps)} checkpoints, loading {len(selected_steps)} "
-          f"(stride={step_stride}, max_step={max_steps})")
+    model_dirs = discover_model_dirs(checkpoint_dir)
+    if not model_dirs:
+        print(f"ERROR: No `models` directories found under: {checkpoint_dir}")
+        sys.exit(1)
+    print(f"Discovered {len(model_dirs)} models directories under: {checkpoint_dir}")
 
     seen_fingerprints: set[bytes] = set()
     all_grids: list[np.ndarray] = []
@@ -168,73 +182,101 @@ def extract(
     all_p_ema: list[np.ndarray] = []
     all_success_obs_count: list[np.ndarray] = []
 
-    for step_idx, step in enumerate(selected_steps):
-        print(f"[{step_idx+1}/{len(selected_steps)}] Loading step {step} ...", flush=True)
-        ckpt = ckpt_mgr.restore(step)
+    total_ckpts = 0
+    loaded_ckpts = 0
+    for model_dir_idx, model_dir in enumerate(model_dirs):
+        print(f"\n[{model_dir_idx+1}/{len(model_dirs)}] Scanning: {model_dir}", flush=True)
+        ckpt_mgr = ocp.CheckpointManager(
+            str(model_dir),
+            item_handlers=ocp.StandardCheckpointHandler(),
+        )
+        all_steps = sorted(ckpt_mgr.all_steps())
+        selected_steps = [s for i, s in enumerate(all_steps) if i % step_stride == 0 and s <= max_steps]
+        total_ckpts += len(selected_steps)
+        print(
+            f"  Found {len(all_steps)} checkpoints, loading {len(selected_steps)} "
+            f"(stride={step_stride}, max_step={max_steps})"
+        )
 
-        sampler = ckpt["sampler"]
-        size = int(np.array(sampler["size"]))
-        if size == 0:
-            print(f"  Buffer empty at step {step}, skipping.")
-            continue
-
-        wall_maps  = np.array(sampler["levels"]["wall_map"][:size], dtype=np.bool_)   # (size, H, W)
-        goal_pos   = np.array(sampler["levels"]["goal_pos"][:size],  dtype=np.int32)   # (size, 2)
-        agent_pos  = np.array(sampler["levels"]["agent_pos"][:size], dtype=np.int32)  # (size, 2)
-        scores     = np.array(sampler["scores"][:size],               dtype=np.float32) # (size,)
-        if "levels_extra" in sampler and "success_ema" in sampler["levels_extra"]:
-            success_ema = np.array(sampler["levels_extra"]["success_ema"][:size], dtype=np.float32)
-            success_obs_count = np.array(sampler["levels_extra"]["success_obs_count"][:size], dtype=np.float32)
-        else:
-            success_ema = np.zeros((size,), dtype=np.float32)
-            success_obs_count = np.zeros((size,), dtype=np.float32)
-
-        new_wall_maps, new_goal_pos, new_agent_pos, new_scores = [], [], [], []
-        new_success_ema, new_success_obs_count = [], []
-        n_dup = 0
-        for i in range(size):
-            fp = _wall_map_fingerprint(wall_maps[i])
-            if fp in seen_fingerprints:
-                n_dup += 1
+        for step_idx, step in enumerate(selected_steps):
+            print(f"  - Loading step {step} ({step_idx+1}/{len(selected_steps)}) ...", flush=True)
+            ckpt = ckpt_mgr.restore(step)
+            if ckpt is None:
+                print("    restore returned None, skipping.")
                 continue
-            seen_fingerprints.add(fp)
-            new_wall_maps.append(wall_maps[i])
-            new_goal_pos.append(goal_pos[i])
-            new_agent_pos.append(agent_pos[i])
-            new_scores.append(scores[i])
-            new_success_ema.append(success_ema[i])
-            new_success_obs_count.append(success_obs_count[i])
 
-        print(f"  Valid entries: {size}, new unique: {len(new_wall_maps)}, duplicates skipped: {n_dup}")
-        if not new_wall_maps:
-            continue
+            if "sampler" not in ckpt:
+                print("    checkpoint has no `sampler`, skipping.")
+                continue
+            loaded_ckpts += 1
 
-        new_wall_maps  = np.stack(new_wall_maps)   # (M, H, W)
-        new_goal_pos   = np.stack(new_goal_pos)    # (M, 2)
-        new_agent_pos  = np.stack(new_agent_pos)   # (M, 2)
-        new_scores     = np.array(new_scores)      # (M,)
-        new_success_ema = np.array(new_success_ema, dtype=np.float32)
-        new_success_obs_count = np.array(new_success_obs_count, dtype=np.float32)
+            sampler = ckpt["sampler"]
+            size = int(np.array(sampler["size"]))
+            if size == 0:
+                print("    buffer empty, skipping.")
+                continue
 
-        # Build grid tensors
-        grids = np.stack([
-            level_to_grid(new_wall_maps[i], new_goal_pos[i], new_agent_pos[i], H, W)
-            for i in range(len(new_wall_maps))
-        ])  # (M, H, W, 3)
+            wall_maps  = np.array(sampler["levels"]["wall_map"][:size], dtype=np.bool_)   # (size, H, W)
+            goal_pos   = np.array(sampler["levels"]["goal_pos"][:size],  dtype=np.int32)   # (size, 2)
+            agent_pos  = np.array(sampler["levels"]["agent_pos"][:size], dtype=np.int32)  # (size, 2)
+            scores     = np.array(sampler["scores"][:size],               dtype=np.float32) # (size,)
+            if "levels_extra" in sampler and "success_ema" in sampler["levels_extra"]:
+                success_ema = np.array(sampler["levels_extra"]["success_ema"][:size], dtype=np.float32)
+                success_obs_count = np.array(sampler["levels_extra"]["success_obs_count"][:size], dtype=np.float32)
+            else:
+                success_ema = np.zeros((size,), dtype=np.float32)
+                success_obs_count = np.zeros((size,), dtype=np.float32)
 
-        wall_counts = new_wall_maps.sum(axis=(1, 2)).astype(np.int32)  # (M,)
+            new_wall_maps, new_goal_pos, new_agent_pos, new_scores = [], [], [], []
+            new_success_ema, new_success_obs_count = [], []
+            n_dup = 0
+            for i in range(size):
+                fp = _wall_map_fingerprint(wall_maps[i])
+                if fp in seen_fingerprints:
+                    n_dup += 1
+                    continue
+                seen_fingerprints.add(fp)
+                new_wall_maps.append(wall_maps[i])
+                new_goal_pos.append(goal_pos[i])
+                new_agent_pos.append(agent_pos[i])
+                new_scores.append(scores[i])
+                new_success_ema.append(success_ema[i])
+                new_success_obs_count.append(success_obs_count[i])
 
-        all_grids.append(grids)
-        all_scores.append(new_scores)
-        all_wall_counts.append(wall_counts)
-        all_goal_pos.append(new_goal_pos)
-        all_agent_pos.append(new_agent_pos)
-        all_p_ema.append(new_success_ema)
-        all_success_obs_count.append(new_success_obs_count)
+            print(
+                f"    valid entries: {size}, new unique: {len(new_wall_maps)}, "
+                f"duplicates skipped: {n_dup}"
+            )
+            if not new_wall_maps:
+                continue
+
+            new_wall_maps  = np.stack(new_wall_maps)   # (M, H, W)
+            new_goal_pos   = np.stack(new_goal_pos)    # (M, 2)
+            new_agent_pos  = np.stack(new_agent_pos)   # (M, 2)
+            new_scores     = np.array(new_scores)      # (M,)
+            new_success_ema = np.array(new_success_ema, dtype=np.float32)
+            new_success_obs_count = np.array(new_success_obs_count, dtype=np.float32)
+
+            # Build grid tensors
+            grids = np.stack([
+                level_to_grid(new_wall_maps[i], new_goal_pos[i], new_agent_pos[i], H, W)
+                for i in range(len(new_wall_maps))
+            ])  # (M, H, W, 3)
+
+            wall_counts = new_wall_maps.sum(axis=(1, 2)).astype(np.int32)  # (M,)
+
+            all_grids.append(grids)
+            all_scores.append(new_scores)
+            all_wall_counts.append(wall_counts)
+            all_goal_pos.append(new_goal_pos)
+            all_agent_pos.append(new_agent_pos)
+            all_p_ema.append(new_success_ema)
+            all_success_obs_count.append(new_success_obs_count)
 
     if not all_grids:
         print("ERROR: No data extracted. Check checkpoint directory and buffer contents.")
         sys.exit(1)
+    print(f"\nLoaded {loaded_ckpts}/{total_ckpts} checkpoints.")
 
     grids       = np.concatenate(all_grids,       axis=0)
     scores      = np.concatenate(all_scores,      axis=0)
