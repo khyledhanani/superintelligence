@@ -11,9 +11,13 @@ Runs:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+from tqdm.auto import tqdm
 
 
 def build_runs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
@@ -108,12 +112,31 @@ def main() -> None:
     print(f"checkpoint: {Path(args.plwm_mae_checkpoint).resolve()}")
     print("-" * 80)
 
-    for i, (name, cmd) in enumerate(runs, start=1):
-        print(f"[{i}/{len(runs)}] {name}")
-        print("  " + " ".join([sys.executable] + cmd))
-        if args.dry_run:
-            continue
-        subprocess.run([sys.executable] + cmd, check=True)
+    if args.dry_run:
+        for i, (name, cmd) in enumerate(runs, start=1):
+            print(f"[{i}/{len(runs)}] {name}")
+            print("  " + " ".join([sys.executable] + cmd))
+        print("Done.")
+        return
+
+    env = os.environ.copy()
+    # Reduce warning noise from downstream libs while keeping run output visible.
+    env.setdefault("ABSL_MIN_LOG_LEVEL", "2")  # suppress WARNING:absl
+
+    durations: list[float] = []
+    with tqdm(total=len(runs), desc="Ablation runs", unit="run") as pbar:
+        for i, (name, cmd) in enumerate(runs, start=1):
+            pbar.set_postfix_str(name)
+            print(f"\n[{i}/{len(runs)}] {name}")
+            print("  " + " ".join([sys.executable] + cmd))
+            t0 = time.time()
+            subprocess.run([sys.executable] + cmd, check=True, env=env)
+            dt = time.time() - t0
+            durations.append(dt)
+            avg = sum(durations) / len(durations)
+            eta = avg * (len(runs) - i)
+            pbar.set_postfix_str(f"{name} ({dt/60:.1f}m, ETA {eta/60:.1f}m)")
+            pbar.update(1)
 
     print("Done.")
 
