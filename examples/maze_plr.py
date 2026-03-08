@@ -26,6 +26,11 @@ import pickle
 import sys
 from enum import IntEnum
 
+# Metrics imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from metrics.trajectory_metrics import compute_pairwise_metrics
+from metrics.trajectory_cache import TrajectoryCache
+
 # VAE + CMA-ES imports (conditional on --use_cmaes flag)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vae'))
 from vae_model import CluttrVAE
@@ -96,7 +101,7 @@ def sample_trajectories_rnn(
     init_env_state: EnvState,
     num_envs: int,
     max_episode_length: int,
-) -> Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict]]:
+) -> Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict, chex.Array]]:
     """This samples trajectories from the environment using the agent specified by the `train_state`.
 
     Args:
@@ -112,11 +117,14 @@ def sample_trajectories_rnn(
         max_episode_length (int): The maximum episode length, i.e., the number of steps to do the rollouts for.
 
     Returns:
-        Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict]]: (rng, train_state, hstate, last_obs, last_env_state, last_value), traj, where traj is (obs, action, reward, done, log_prob, value, info). The first element in the tuple consists of arrays that have shapes (NUM_ENVS, ...) (except `rng` and and `train_state` which are singleton). The second element in the tuple is of shape (NUM_STEPS, NUM_ENVS, ...), and it contains the trajectory.
+        Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict, chex.Array]]: (rng, train_state, hstate, last_obs, last_env_state, last_value), traj, where traj is (obs, action, reward, done, log_prob, value, info, agent_pos). agent_pos has shape (NUM_STEPS, NUM_ENVS, 2). The first element in the tuple consists of arrays that have shapes (NUM_ENVS, ...) (except `rng` and and `train_state` which are singleton). The second element in the tuple is of shape (NUM_STEPS, NUM_ENVS, ...), and it contains the trajectory.
     """
     def sample_step(carry, _):
         rng, train_state, hstate, obs, env_state, last_done = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
+
+        # Capture agent position before the step (matches obs)
+        agent_pos = env_state.env_state.agent_pos  # (num_envs, 2) — env_state is AutoReplayState
 
         x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, last_done))
         hstate, pi, value = train_state.apply_fn(train_state.params, x, hstate)
@@ -133,7 +141,7 @@ def sample_trajectories_rnn(
         )(jax.random.split(rng_step, num_envs), env_state, action, env_params)
 
         carry = (rng, train_state, hstate, next_obs, env_state, done)
-        return carry, (obs, action, reward, done, log_prob, value, info)
+        return carry, (obs, action, reward, done, log_prob, value, info, agent_pos)
 
     (rng, train_state, hstate, last_obs, last_env_state, last_done), traj = jax.lax.scan(
         sample_step,
@@ -464,6 +472,7 @@ def main(config=None, project="JAXUED_TEST"):
     wandb.define_metric("gen/*", step_metric="num_updates")
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
+    wandb.define_metric("diversity/*", step_metric="num_updates")
 
     # --- CMA-ES + VAE setup ---
     vae_decode_fn = None
@@ -667,7 +676,7 @@ def main(config=None, project="JAXUED_TEST"):
             # Rollout
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info),
+                (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
             ) = sample_trajectories_rnn(
                 rng,
                 env,
@@ -758,7 +767,7 @@ def main(config=None, project="JAXUED_TEST"):
             init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), levels, env_params)
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info),
+                (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
             ) = sample_trajectories_rnn(
                 rng,
                 env,
@@ -829,7 +838,7 @@ def main(config=None, project="JAXUED_TEST"):
             # rollout
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info),
+                (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
             ) = sample_trajectories_rnn(
                 rng,
                 env,
@@ -1037,6 +1046,90 @@ def main(config=None, project="JAXUED_TEST"):
             _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens{tag}.npy")
             _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump{tag}.npz")
 
+    # === Trajectory cache + diversity metrics ===
+    traj_cache = TrajectoryCache()
+    diversity_log_interval = config.get("diversity_log_interval", 100)  # every N eval_steps
+    diversity_sample_size = config.get("diversity_sample_size", 20)  # num levels to subsample
+
+    @jax.jit
+    def collect_buffer_trajectories(rng, train_state, level_indices):
+        """Run agent on buffer levels and return trajectory data for caching."""
+        sampler = train_state.sampler
+        levels = level_sampler.get_levels(sampler, level_indices)
+        num_levels = level_indices.shape[0]
+        rng, rng_reset = jax.random.split(rng)
+        init_obs, init_env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
+            jax.random.split(rng_reset, num_levels), levels, env_params
+        )
+        (
+            (rng, _, _, _, _, _),
+            (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
+        ) = sample_trajectories_rnn(
+            rng, env, env_params, train_state,
+            ActorCritic.initialize_carry((num_levels,)),
+            init_obs, init_env_state, num_levels,
+            env_params.max_steps_in_episode,
+        )
+        return obs.image, actions, rewards, dones, values, agent_positions
+
+    def update_cache_and_compute_metrics(rng, train_state):
+        """Collect trajectories on buffer subsample, update cache, compute pairwise metrics."""
+        sampler = train_state.sampler
+        size = int(sampler["size"])
+        if size < diversity_sample_size:
+            return {}
+
+        # Sample fixed number of indices from buffer (fixed shape for JIT stability)
+        n_sample = diversity_sample_size
+        rng_np = np.random.default_rng(int(jax.random.randint(rng, (), 0, 2**31)))
+        sample_indices = jnp.array(rng_np.choice(size, size=n_sample, replace=False))
+
+        # Collect trajectories (JIT'd)
+        rng, rng_collect = jax.random.split(rng)
+        obs, actions, rewards, dones, values, agent_positions = collect_buffer_trajectories(
+            rng_collect, train_state, sample_indices
+        )
+
+        # Move to numpy for cache + metrics
+        obs_np = np.asarray(obs)  # (T, N, *obs_shape)
+        actions_np = np.asarray(actions)  # (T, N)
+        dones_np = np.asarray(dones)  # (T, N)
+        values_np = np.asarray(values)  # (T, N)
+        positions_np = np.asarray(agent_positions)  # (T, N, 2)
+        indices_np = np.asarray(sample_indices)
+
+        # Update cache
+        traj_cache.update_batch(indices_np, obs_np, positions_np, values_np, dones_np, actions_np)
+
+        # Sync cache with buffer (evict stale entries)
+        active_indices = set(range(size))
+        traj_cache.sync_with_buffer(active_indices)
+
+        # Build trajectory list for pairwise metrics
+        trajectories = []
+        for i in range(n_sample):
+            trajectories.append({
+                "observations": obs_np[:, i],
+                "positions": positions_np[:, i],
+                "values": values_np[:, i],
+                "dones": dones_np[:, i],
+            })
+
+        # Compute pairwise metrics
+        pairwise = compute_pairwise_metrics(trajectories)
+
+        # Build wandb log dict
+        diversity_log = {}
+        for metric_name, values_arr in pairwise.items():
+            if len(values_arr) > 0:
+                diversity_log[f"diversity/{metric_name}/mean"] = float(values_arr.mean())
+                diversity_log[f"diversity/{metric_name}/std"] = float(values_arr.std())
+                diversity_log[f"diversity/{metric_name}/min"] = float(values_arr.min())
+                diversity_log[f"diversity/{metric_name}/max"] = float(values_arr.max())
+        diversity_log["diversity/cache_size"] = traj_cache.size
+
+        return diversity_log
+
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
@@ -1054,6 +1147,20 @@ def main(config=None, project="JAXUED_TEST"):
         updates_so_far = (eval_step + 1) * config["eval_freq"]
         if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
             dump_buffer(runner_state[1], updates_so_far // 1000)
+
+        # Periodic diversity metrics computation
+        if diversity_log_interval > 0 and (eval_step + 1) % diversity_log_interval == 0:
+            rng_diversity = jax.random.PRNGKey(eval_step + 9999)
+            diversity_metrics = update_cache_and_compute_metrics(rng_diversity, runner_state[1])
+            if diversity_metrics:
+                diversity_metrics["num_updates"] = int(updates_so_far)
+                wandb.log(diversity_metrics)
+                obs_dtw = diversity_metrics.get('diversity/obs_dtw_distances/mean', float('nan'))
+                pos_dtw = diversity_metrics.get('diversity/pos_dtw_distances/mean', float('nan'))
+                val_corr = diversity_metrics.get('diversity/value_correlations/mean', float('nan'))
+                jaccard = diversity_metrics.get('diversity/jaccard_indices/mean', float('nan'))
+                print(f"  [Diversity] obs_dtw={obs_dtw:.4f}, pos_dtw={pos_dtw:.4f}, "
+                      f"val_corr={val_corr:.4f}, jaccard={jaccard:.4f}")
 
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]
@@ -1341,6 +1448,11 @@ if __name__=="__main__":
                        help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
     group.add_argument("--skip_post_eval", action="store_true", default=False,
                        help="Skip post-training buffer evaluation, rendering, and PCA (run evaluate_buffer.py separately)")
+    # === DIVERSITY METRICS CONFIG ===
+    group.add_argument("--diversity_log_interval", type=int, default=100,
+                       help="Compute diversity metrics every N eval steps (0 to disable)")
+    group.add_argument("--diversity_sample_size", type=int, default=20,
+                       help="Number of buffer levels to subsample for pairwise diversity metrics")
 
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
