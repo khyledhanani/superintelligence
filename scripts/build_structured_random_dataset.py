@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated wall_density bin edges (inclusive outer bounds).",
     )
     p.add_argument(
+        "--uns-wall-bin-edges",
+        type=str,
+        default="0.0,0.22,0.30,0.40,1.0",
+        help="Comma-separated wall_density bin edges for unsolvable subset.",
+    )
+    p.add_argument(
         "--bfs-bin-edges",
         type=str,
         default="0.0,0.03,0.06,0.10,0.16,0.25,1.0",
@@ -111,6 +117,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="0.0,0.005,0.015,0.03,0.06,0.12,1.0",
         help="Comma-separated slack_norm bin edges for solvable subset.",
+    )
+    p.add_argument(
+        "--coverage-strict",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If set, fail when per-bin minimum coverage is impossible. Otherwise clip to available.",
     )
     p.add_argument(
         "--seed",
@@ -314,6 +326,7 @@ def _select_with_min_bin_coverage(
     min_per_bin: int,
     rng: np.random.Generator,
     tag: str,
+    strict: bool,
 ) -> np.ndarray:
     """Select indices with guaranteed minimum count per bin for each bin-array."""
     if target_n <= 0 or len(candidate_idx) == 0:
@@ -333,13 +346,22 @@ def _select_with_min_bin_coverage(
                 continue
             mask = (~sel_mask[candidate_idx]) & (bins[candidate_idx] == b)
             cand = candidate_idx[mask]
+            take = need
             if len(cand) < need:
-                raise ValueError(
-                    f"{tag}: insufficient data for coverage in view={view_id}, bin={b}. "
-                    f"need={need}, available={len(cand)}. Increase --augment-synthetic or "
-                    "relax --coverage-min-per-bin-* / bin edges."
+                if strict:
+                    raise ValueError(
+                        f"{tag}: insufficient data for coverage in view={view_id}, bin={b}. "
+                        f"need={need}, available={len(cand)}. Increase --augment-synthetic or "
+                        "relax --coverage-min-per-bin-* / bin edges."
+                    )
+                take = len(cand)
+                print(
+                    f"[warn] {tag} coverage clipped: view={view_id}, bin={b}, "
+                    f"requested={need}, available={len(cand)}"
                 )
-            picks = rng.choice(cand, size=need, replace=False)
+            if take == 0:
+                continue
+            picks = rng.choice(cand, size=take, replace=False)
             sel_mask[picks] = True
             selected.append(picks)
             for k, b_arr in enumerate(bin_arrays):
@@ -406,6 +428,7 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     wall_edges = parse_edges(args.wall_bin_edges)
+    uns_wall_edges = parse_edges(args.uns_wall_bin_edges)
     bfs_edges = parse_edges(args.bfs_bin_edges)
     slack_edges = parse_edges(args.slack_bin_edges)
 
@@ -461,6 +484,7 @@ def main() -> None:
         )
 
     wall_bin = _bin_ids(static_targets[:, 1], wall_edges)
+    uns_wall_bin = _bin_ids(static_targets[:, 1], uns_wall_edges)
     bfs_bin = _bin_ids(static_targets[:, 2], bfs_edges)
     slack_bin = _bin_ids(static_targets[:, 4], slack_edges)
 
@@ -472,15 +496,17 @@ def main() -> None:
         min_per_bin=int(args.coverage_min_per_bin_solv),
         rng=rng,
         tag="solvable",
+        strict=bool(args.coverage_strict),
     )
     pick_uns = _select_with_min_bin_coverage(
         candidate_idx=uns_idx,
-        bin_arrays=[wall_bin],
-        n_bins_list=[len(wall_edges) - 1],
+        bin_arrays=[uns_wall_bin],
+        n_bins_list=[len(uns_wall_edges) - 1],
         target_n=target_unsolvable_n,
         min_per_bin=int(args.coverage_min_per_bin_uns),
         rng=rng,
         tag="unsolvable",
+        strict=bool(args.coverage_strict),
     )
 
     picked = np.concatenate([pick_solv, pick_uns], axis=0)
@@ -513,9 +539,11 @@ def main() -> None:
     print(f"  bfs_norm mean/std: {out_static[:,2].mean():.4f}/{out_static[:,2].std():.4f}")
     print(f"  slack_norm mean/std: {out_static[:,4].mean():.4f}/{out_static[:,4].std():.4f}")
     out_wall_bin = _bin_ids(out_static[:, 1], wall_edges)
+    out_uns_wall_bin = _bin_ids(out_static[:, 1], uns_wall_edges)
     out_bfs_bin = _bin_ids(out_static[:, 2], bfs_edges)
     out_slack_bin = _bin_ids(out_static[:, 4], slack_edges)
     print(f"  wall_bin_counts: {np.bincount(out_wall_bin, minlength=len(wall_edges)-1).tolist()}")
+    print(f"  uns_wall_bin_counts: {np.bincount(out_uns_wall_bin, minlength=len(uns_wall_edges)-1).tolist()}")
     print(f"  bfs_bin_counts: {np.bincount(out_bfs_bin, minlength=len(bfs_edges)-1).tolist()}")
     print(f"  slack_bin_counts: {np.bincount(out_slack_bin, minlength=len(slack_edges)-1).tolist()}")
 
