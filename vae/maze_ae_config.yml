@@ -45,6 +45,7 @@ lambda_valid: 0.5
 dynamic_confidence_ref: 20.0
 
 # Metric loss semantic-difference weights for y=[s1..s7,c1,c2]
+# Stage-1 training code hard-zeros c1,c2 weights regardless of this value.
 metric_y_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 # Decoding thresholds (used during validation and PLWM)

@@ -343,8 +343,11 @@ def predict_task_targets(full_params: dict, grids: jnp.ndarray) -> Dict[str, jnp
         "p_pred": p_pred,
         "l_pred": l_pred,
         "invalid_prob": invalid_prob,
+        "valid_prob": valid_prob,
         "bfs_norm_pred": bfs_norm_pred,
         "wall_density_pred": wall_density_pred,
+        "static_reg": static_reg,
+        "z": out["z"],
     }
 
 

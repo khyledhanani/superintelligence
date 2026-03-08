@@ -69,6 +69,12 @@ class TrainState(BaseTrainState):
     replay_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     replay_last_level_inds: chex.Array = struct.field(pytree_node=True)
     mutation_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
+    # Online frontier estimator (run-local, task-specific).
+    frontier_w: chex.Array = struct.field(pytree_node=True)
+    frontier_b: chex.Array = struct.field(pytree_node=True)
+    frontier_updates: int
+    frontier_last_loss: chex.Array
+    frontier_last_p_mae: chex.Array
 
 # region PPO helper functions
 def compute_gae(
@@ -446,6 +452,9 @@ def train_state_to_log_dict(
         log["plwm/cumulative_uphill_fraction"] = log["mutation/cumulative_uphill_fraction"]
         log["plwm/num_compared"] = log["mutation/num_compared"]
         log["plwm/num_improved"] = log["mutation/num_improved"]
+        log["plwm/frontier_updates"] = train_state.frontier_updates
+        log["plwm/frontier_last_loss"] = train_state.frontier_last_loss
+        log["plwm/frontier_last_p_mae"] = train_state.frontier_last_p_mae
 
     return {
         "log": log,
@@ -479,6 +488,55 @@ def update_success_ema(
     new_ema = (1.0 - alpha) * old_ema + alpha * success
     new_count = old_count + 1.0
     return new_ema, new_count
+
+
+def build_frontier_features(
+    latents: chex.Array,
+    static_reg: chex.Array,
+    valid_prob: chex.Array,
+) -> chex.Array:
+    """Construct estimator features from frozen VAE latents + static/valid outputs."""
+    z = jnp.clip(latents, -4.0, 4.0)
+    s = jnp.clip(static_reg, 0.0, 1.0)
+    v = jnp.clip(valid_prob, 0.0, 1.0)[:, None]
+    return jnp.concatenate([z, s, v], axis=-1)
+
+
+def frontier_predict_prob(
+    features: chex.Array,
+    w: chex.Array,
+    b: chex.Array,
+) -> chex.Array:
+    logits = jnp.matmul(features, w) + b
+    return jax.nn.sigmoid(logits)
+
+
+def frontier_update_step(
+    w: chex.Array,
+    b: chex.Array,
+    features: chex.Array,
+    targets: chex.Array,
+    weights: chex.Array,
+    lr: float,
+    l2: float,
+) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+    """Single weighted SGD update for online logistic frontier estimator."""
+    logits = jnp.matmul(features, w) + b
+    preds = jax.nn.sigmoid(logits)
+    denom = jnp.maximum(weights.sum(), 1e-6)
+
+    # d/dlogit BCE(sigmoid(logit), y) = sigmoid(logit) - y
+    err = (preds - targets) * weights
+    grad_w = jnp.matmul(features.T, err) / denom + l2 * w
+    grad_b = err.sum() / denom
+
+    new_w = w - lr * grad_w
+    new_b = b - lr * grad_b
+
+    bce = optax.sigmoid_binary_cross_entropy(logits, targets)
+    loss = (weights * bce).sum() / denom
+    p_mae = (weights * jnp.abs(preds - targets)).sum() / denom
+    return new_w, new_b, loss, p_mae
 
 
 def structural_difficulty_surrogate(
@@ -529,6 +587,7 @@ def main(config=None, project="JAXUED_TEST"):
     wandb.define_metric("return/*", step_metric="num_updates")
     wandb.define_metric("eval_ep_lengths/*", step_metric="num_updates")
     wandb.define_metric("mutation/*", step_metric="num_updates")
+    wandb.define_metric("plwm/*", step_metric="num_updates")
 
     def log_eval(stats, train_state_info):
         print(f"Logging update: {stats['update_count']}")
@@ -574,6 +633,7 @@ def main(config=None, project="JAXUED_TEST"):
     maze_encoder_params = None
     maze_decoder_params = None
     maze_full_params = None
+    frontier_feature_dim = 1
     me_latent_dim = int(config["me_latent_dim"])
     me_descriptor_mode = str(config["me_descriptor_mode"]).lower()
     if me_descriptor_mode not in ("behavior", "latent", "hybrid", "bfs"):
@@ -641,8 +701,12 @@ def main(config=None, project="JAXUED_TEST"):
             raise ValueError("--use_plwm_mutation requires --use_accel")
         if config["use_map_elites_mutation"]:
             raise ValueError("--use_plwm_mutation and --use_map_elites_mutation are mutually exclusive")
+        if config["plwm_online_frontier_guided"] and config["plwm_task_aware_guided"]:
+            raise ValueError("--plwm_online_frontier_guided and --plwm_task_aware_guided are mutually exclusive.")
         if config["plwm_surrogate_guided"] and config["plwm_task_aware_guided"] and not config["plwm_use_maze_ae"]:
             raise ValueError("--plwm_task_aware_guided currently requires --plwm_use_maze_ae")
+        if config["plwm_surrogate_guided"] and config["plwm_online_frontier_guided"] and not config["plwm_use_maze_ae"]:
+            raise ValueError("--plwm_online_frontier_guided currently requires --plwm_use_maze_ae")
 
         if config["plwm_use_maze_ae"]:
             # Grid-based CNN AE path — load only the MazeAE checkpoint
@@ -664,6 +728,10 @@ def main(config=None, project="JAXUED_TEST"):
             maze_full_params = full_mae_params
             maze_encoder_params = extract_maze_encoder_params(full_mae_params)
             maze_decoder_params = extract_maze_decoder_params(full_mae_params)
+            if "mean_layer" in maze_encoder_params:
+                frontier_feature_dim = int(maze_encoder_params["mean_layer"]["kernel"].shape[-1]) + 6 + 1
+            else:
+                frontier_feature_dim = int(me_latent_dim) + 6 + 1
             print(
                 f"PLWM mutation enabled (Maze AE, grid-based): "
                 f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
@@ -687,9 +755,14 @@ def main(config=None, project="JAXUED_TEST"):
         if config["plwm_surrogate_guided"]:
             if int(config["plwm_surrogate_num_candidates"]) < 1:
                 raise ValueError("--plwm_surrogate_num_candidates must be >= 1.")
+            mode = (
+                "online-frontier"
+                if config["plwm_online_frontier_guided"]
+                else ("task-aware" if config["plwm_task_aware_guided"] else "structural")
+            )
             print(
                 "PLWM surrogate guidance enabled: "
-                f"mode={'task-aware' if config['plwm_task_aware_guided'] else 'structural'}, "
+                f"mode={mode}, "
                 f"candidates={config['plwm_surrogate_num_candidates']}, "
                 f"weights(bfs={config['plwm_surrogate_weight_bfs']}, "
                 f"slack={config['plwm_surrogate_weight_slack']}, "
@@ -697,6 +770,11 @@ def main(config=None, project="JAXUED_TEST"):
                 f"walls={config['plwm_surrogate_weight_walls']}, "
                 f"branch={config['plwm_surrogate_weight_branches']}), "
                 f"require_solvable={config['plwm_surrogate_require_solvable']}"
+            )
+        elif config["plwm_online_frontier_guided"] or config["plwm_task_aware_guided"]:
+            raise ValueError(
+                "--plwm_online_frontier_guided and --plwm_task_aware_guided require "
+                "--plwm_surrogate_guided."
             )
 
     # Setup the environment
@@ -775,6 +853,11 @@ def main(config=None, project="JAXUED_TEST"):
             replay_last_level_batch=pholder_level_batch,
             replay_last_level_inds=pholder_level_inds,
             mutation_last_level_batch=pholder_level_batch,
+            frontier_w=jnp.zeros((frontier_feature_dim,), dtype=jnp.float32),
+            frontier_b=jnp.array(0.0, dtype=jnp.float32),
+            frontier_updates=0,
+            frontier_last_loss=jnp.array(0.0, dtype=jnp.float32),
+            frontier_last_p_mae=jnp.array(0.0, dtype=jnp.float32),
         )
 
     def train_step(carry: Tuple[chex.PRNGKey, TrainState], _):
@@ -888,6 +971,46 @@ def main(config=None, project="JAXUED_TEST"):
                 success,
                 float(config["success_ema_alpha"]),
             )
+
+            frontier_w = train_state.frontier_w
+            frontier_b = train_state.frontier_b
+            frontier_updates_inc = jnp.array(0, dtype=jnp.int32)
+            frontier_last_loss = train_state.frontier_last_loss
+            frontier_last_p_mae = train_state.frontier_last_p_mae
+            if (
+                config["use_plwm_mutation"]
+                and config["plwm_surrogate_guided"]
+                and config["plwm_online_frontier_guided"]
+                and config["plwm_use_maze_ae"]
+            ):
+                replay_grids = jax.vmap(maze_level_to_grid)(
+                    levels.wall_map,
+                    levels.goal_pos,
+                    levels.agent_pos,
+                )
+                replay_latents = encode_maze_levels(maze_encoder_params, replay_grids)
+                replay_preds = predict_task_targets(maze_full_params, replay_grids)
+                replay_features = build_frontier_features(
+                    replay_latents,
+                    replay_preds["static_reg"],
+                    replay_preds["valid_prob"],
+                )
+                frontier_targets = new_success_ema
+                frontier_weights = jnp.minimum(
+                    1.0,
+                    new_success_obs_count / float(config["plwm_frontier_conf_ref"]),
+                )
+                frontier_w, frontier_b, frontier_last_loss, frontier_last_p_mae = frontier_update_step(
+                    frontier_w,
+                    frontier_b,
+                    replay_features,
+                    frontier_targets,
+                    frontier_weights,
+                    lr=float(config["plwm_frontier_lr"]),
+                    l2=float(config["plwm_frontier_l2"]),
+                )
+                frontier_updates_inc = jnp.array(1, dtype=jnp.int32)
+
             sampler = level_sampler.update_batch(
                 sampler,
                 level_inds,
@@ -928,6 +1051,11 @@ def main(config=None, project="JAXUED_TEST"):
                 num_replay_updates=train_state.num_replay_updates + 1,
                 replay_last_level_batch=levels,
                 replay_last_level_inds=level_inds,
+                frontier_w=frontier_w,
+                frontier_b=frontier_b,
+                frontier_updates=train_state.frontier_updates + frontier_updates_inc,
+                frontier_last_loss=frontier_last_loss,
+                frontier_last_p_mae=frontier_last_p_mae,
             )
             return (rng, train_state), metrics
         
@@ -997,7 +1125,46 @@ def main(config=None, project="JAXUED_TEST"):
                             temperature=float(config["plwm_decode_temperature"]),
                         )
 
-                        if config["plwm_task_aware_guided"]:
+                        if config["plwm_online_frontier_guided"]:
+                            parent_preds = predict_task_targets(maze_full_params, parent_grids)
+                            candidate_grids_flat = jax.vmap(maze_level_to_grid)(
+                                candidate_levels_flat.wall_map,
+                                candidate_levels_flat.goal_pos,
+                                candidate_levels_flat.agent_pos,
+                            )
+                            cand_preds = predict_task_targets(maze_full_params, candidate_grids_flat)
+
+                            cand_features = build_frontier_features(
+                                flat_latents,
+                                cand_preds["static_reg"],
+                                cand_preds["valid_prob"],
+                            )
+                            p_frontier = frontier_predict_prob(
+                                cand_features,
+                                train_state.frontier_w,
+                                train_state.frontier_b,
+                            ).reshape((batch_size, num_candidates))
+                            l_frontier = p_frontier * (1.0 - p_frontier)
+
+                            task_scores = plwm_scoring.task_aware_objective(
+                                p_pred=p_frontier,
+                                learnability_pred=l_frontier,
+                                invalid_prob=cand_preds["invalid_prob"].reshape((batch_size, num_candidates)),
+                                bfs_norm_pred=cand_preds["bfs_norm_pred"].reshape((batch_size, num_candidates)),
+                                wall_density_pred=cand_preds["wall_density_pred"].reshape((batch_size, num_candidates)),
+                                parent_bfs_norm=parent_preds["bfs_norm_pred"][:, None],
+                                parent_wall_density=parent_preds["wall_density_pred"][:, None],
+                                a=float(config["plwm_task_weight_a"]),
+                                b=float(config["plwm_task_weight_b"]),
+                                c=float(config["plwm_task_weight_c"]),
+                                d=float(config["plwm_task_weight_d"]),
+                                e=float(config["plwm_task_weight_e"]),
+                                low=float(config["plwm_target_success_low"]),
+                                high=float(config["plwm_target_success_high"]),
+                                delta_bfs_norm=float(config["plwm_task_delta_bfs_steps"]) / 169.0,
+                            )
+                            surrogate_scores = task_scores
+                        elif config["plwm_task_aware_guided"]:
                             parent_preds = predict_task_targets(maze_full_params, parent_grids)
                             candidate_grids_flat = jax.vmap(maze_level_to_grid)(
                                 candidate_levels_flat.wall_map,
@@ -1496,9 +1663,18 @@ if __name__=="__main__":
     group.add_argument("--plwm_surrogate_guided", action=argparse.BooleanOptionalAction, default=False,
                        help="If set, sample multiple latent perturbation candidates per parent "
                             "and choose the best candidate using a structural difficulty surrogate.")
-    group.add_argument("--plwm_task_aware_guided", action=argparse.BooleanOptionalAction, default=True,
+    group.add_argument("--plwm_task_aware_guided", action=argparse.BooleanOptionalAction, default=False,
                        help="When surrogate-guided PLWM is enabled, use task-aware beta-VAE head "
                             "predictions for candidate ranking instead of the structural surrogate.")
+    group.add_argument("--plwm_online_frontier_guided", action=argparse.BooleanOptionalAction, default=False,
+                       help="When surrogate-guided PLWM is enabled, rank candidates with an online "
+                            "run-local frontier estimator trained on replay success labels.")
+    group.add_argument("--plwm_frontier_lr", type=float, default=1e-2,
+                       help="Learning rate for online frontier estimator SGD updates.")
+    group.add_argument("--plwm_frontier_l2", type=float, default=1e-4,
+                       help="L2 regularization for online frontier estimator weights.")
+    group.add_argument("--plwm_frontier_conf_ref", type=float, default=20.0,
+                       help="Confidence reference count in w=min(1,count/ref) for online frontier updates.")
     group.add_argument("--plwm_target_success_low", type=float, default=0.3,
                        help="Lower bound of the target success-probability band.")
     group.add_argument("--plwm_target_success_high", type=float, default=0.7,

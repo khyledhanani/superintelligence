@@ -141,6 +141,9 @@ def compute_loss(
 
     y = jnp.concatenate([static_targets, c1[:, None], c2[:, None]], axis=-1)
     y_weights = jnp.asarray(config["metric_y_weights"], dtype=jnp.float32)
+    if config["train_stage"] == "stage1":
+        # Stage 1 must stay task-agnostic: never let dynamic labels shape latent geometry.
+        y_weights = y_weights.at[7:].set(0.0)
     l_metric = pairwise_metric_loss(z, y, y_weights)
 
     l_valid = optax.sigmoid_binary_cross_entropy(out["valid_logit"], solvable_target).mean()
