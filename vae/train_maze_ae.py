@@ -271,7 +271,17 @@ def save_checkpoint(state: train_state.TrainState, step: int | str, checkpoint_d
 def load_checkpoint(path: str) -> tuple[dict, int]:
     with open(path, "rb") as f:
         data = pickle.load(f)
-    return data["params"], data.get("step", 0)
+    raw_step = data.get("step", 0)
+    if isinstance(raw_step, (int, np.integer)):
+        step = int(raw_step)
+    elif isinstance(raw_step, str):
+        step = int(raw_step) if raw_step.isdigit() else 0
+    else:
+        try:
+            step = int(raw_step)
+        except (TypeError, ValueError):
+            step = 0
+    return data["params"], step
 
 
 # ---------------------------------------------------------------------------
