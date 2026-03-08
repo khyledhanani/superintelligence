@@ -488,6 +488,66 @@ plt.tight_layout()
 savefig(fig, "05_buffer_evolution_pca.png")
 
 
+# ── 5b. PCA Axis Traversal (decode along PC1 and PC2) ───────────────────
+print("\n" + "=" * 60)
+print("5b. PCA Axis Traversal — what do the axes control?")
+print("=" * 60)
+
+from jaxued.environments import Maze, MazeRenderer
+from vae_level_utils import tokens_to_level, repair_tokens
+import jax
+import jax.numpy as jnp
+
+# Mean latent vector in buffer PCA space (origin = mean of all buffer latents)
+latent_mean = combined_evo_latents.mean(axis=0)
+latent_std = combined_evo_latents.std(axis=0)
+
+# Project mean to PCA to get the center
+center_pca = pca_evo.transform(latent_mean[None, :])[0]
+
+# Traversal points along each PC axis: -2σ, -1σ, 0, +1σ, +2σ in PCA space
+n_steps_trav = 7
+sigma_range = np.linspace(-2.5, 2.5, n_steps_trav)
+
+# Get the std of the projected data to scale traversals
+projected_all = pca_evo.transform(combined_evo_latents)
+pc_stds = projected_all.std(axis=0)  # std along PC1, PC2
+
+renderer = MazeRenderer(Maze(max_height=13, max_width=13, agent_view_size=5, normalize_obs=True), tile_size=16)
+env_params_render = Maze(max_height=13, max_width=13, agent_view_size=5, normalize_obs=True).default_params
+
+for pc_idx, pc_name in enumerate(["PC1", "PC2"]):
+    fig, axes_trav = plt.subplots(1, n_steps_trav, figsize=(3 * n_steps_trav, 3))
+
+    for i, sigma in enumerate(sigma_range):
+        # Start from center in PCA space, move along this PC axis
+        pca_point = center_pca.copy()
+        pca_point[pc_idx] = center_pca[pc_idx] + sigma * pc_stds[pc_idx]
+
+        # Inverse transform back to latent space
+        z = pca_evo.inverse_transform(pca_point[None, :])[0]
+
+        # Decode through VAE
+        z_jnp = jnp.array(z[None, :])
+        logits = vae.apply({"params": vae_params}, z_jnp, method=vae.decode)
+        tokens = jnp.argmax(logits[0], axis=-1)
+        tokens = repair_tokens(tokens)
+        level = tokens_to_level(tokens)
+
+        # Render
+        img = np.asarray(renderer.render_level(level, env_params_render))
+        axes_trav[i].imshow(img)
+        axes_trav[i].set_title(f"{sigma:+.1f}σ", fontsize=10)
+        axes_trav[i].axis("off")
+
+    fig.suptitle(f"Traversal along {pc_name} ({pca_evo.explained_variance_ratio_[pc_idx]:.1%} var) — buffer PCA",
+                 fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    savefig(fig, f"05b_pca_traversal_{pc_name.lower()}.png")
+
+print("  Saved PC1 and PC2 traversal plots")
+
+
 # ── 6. Solve Rate Analysis ───────────────────────────────────────────────
 print("\n" + "=" * 60)
 print("6. Solve Rate Analysis")
