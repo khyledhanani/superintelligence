@@ -395,7 +395,8 @@ fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 for run_name, cfg in CONDITIONS.items():
     mask = combined_labels == run_name
     axes[0].scatter(projected[mask, 0], projected[mask, 1],
-                    c=cfg["color"], alpha=0.3, s=6, label=cfg["label"])
+                    c=cfg["color"], alpha=0.3, s=6, label=cfg["label"],
+                    marker=cfg["marker"])
 
 axes[0].set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
 axes[0].set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
@@ -416,52 +417,73 @@ savefig(fig, "04_cross_condition_pca.png")
 
 # ── 5. Buffer Evolution PCA ──────────────────────────────────────────────
 print("\n" + "=" * 60)
-print("5. Buffer Evolution PCA")
+print("5. Buffer Evolution PCA (all seeds)")
 print("=" * 60)
 
-evolution_data = {}
+# Encode all conditions × all seeds × all timesteps
+evolution_data = {}  # evolution_data[run_name][seed][ts] = latents
+all_latents_for_pca = []
 for run_name in CONDITIONS:
     evolution_data[run_name] = {}
-    dumps = all_data[run_name][0]["dumps"]  # seed 0 as representative
-    for ts in sorted(dumps.keys()):
-        d = dumps[ts]
-        size = int(d.get("size", len(d["tokens"])))
-        tokens = d["tokens"][:size]
-        latents = encode_tokens(vae, vae_params, tokens, batch_size=512)
-        evolution_data[run_name][ts] = latents
-    print(f"  {run_name}/seed0: encoded {len(dumps)} snapshots")
+    for seed in SEEDS:
+        evolution_data[run_name][seed] = {}
+        dumps = all_data[run_name][seed]["dumps"]
+        for ts in sorted(dumps.keys()):
+            d = dumps[ts]
+            size = int(d.get("size", len(d["tokens"])))
+            tokens = d["tokens"][:size]
+            latents = encode_tokens(vae, vae_params, tokens, batch_size=512)
+            evolution_data[run_name][seed][ts] = latents
+            all_latents_for_pca.append(latents)
+        print(f"  {run_name}/seed{seed}: encoded {len(dumps)} snapshots")
 
+# Fit shared PCA across ALL conditions, seeds, and timesteps
+combined_evo_latents = np.concatenate(all_latents_for_pca, axis=0)
+pca_evo = PCA(n_components=2)
+pca_evo.fit(combined_evo_latents)
+print(f"Shared PCA on {combined_evo_latents.shape[0]} vectors: "
+      f"PC1={pca_evo.explained_variance_ratio_[0]:.1%}, PC2={pca_evo.explained_variance_ratio_[1]:.1%}")
+
+# Plot: rows=seeds, columns=conditions
 n_conds = len(CONDITIONS)
-fig, axes = plt.subplots(1, n_conds, figsize=(6 * n_conds, 6))
+n_seeds = len(SEEDS)
+fig, axes = plt.subplots(n_seeds, n_conds, figsize=(5 * n_conds, 5 * n_seeds))
+if n_seeds == 1:
+    axes = axes[None, :]
 if n_conds == 1:
-    axes = [axes]
+    axes = axes[:, None]
 
-for ax, (run_name, cfg) in zip(axes, CONDITIONS.items()):
-    snapshots = evolution_data[run_name]
-    if not snapshots:
-        ax.set_title(f"{cfg['label']} (no data)")
-        continue
+cmap = plt.cm.viridis
 
-    all_snap_latents = np.concatenate(list(snapshots.values()), axis=0)
-    pca_evo = PCA(n_components=2)
-    pca_evo.fit(all_snap_latents)
+for col, (run_name, cfg) in enumerate(CONDITIONS.items()):
+    for row, seed in enumerate(SEEDS):
+        ax = axes[row, col]
+        snapshots = evolution_data[run_name][seed]
+        if not snapshots:
+            ax.set_title(f"{cfg['label']} seed {seed} (no data)")
+            continue
 
-    cmap = plt.cm.viridis
-    ts_keys = sorted(snapshots.keys(),
-                     key=lambda x: int(x.replace("k", "").replace("final", "999")))
-    n_ts = len(ts_keys)
+        ts_keys = sorted(snapshots.keys(),
+                         key=lambda x: int(x.replace("k", "").replace("final", "999")))
+        n_ts = len(ts_keys)
 
-    for i, ts in enumerate(ts_keys):
-        proj = pca_evo.transform(snapshots[ts])
-        color = cmap(i / max(n_ts - 1, 1))
-        ax.scatter(proj[:, 0], proj[:, 1], c=[color], alpha=0.3, s=6, label=ts)
+        for i, ts in enumerate(ts_keys):
+            proj = pca_evo.transform(snapshots[ts])
+            color = cmap(i / max(n_ts - 1, 1))
+            ax.scatter(proj[:, 0], proj[:, 1], c=[color], alpha=0.3, s=4, label=ts)
 
-    ax.set_xlabel(f"PC1 ({pca_evo.explained_variance_ratio_[0]:.1%})")
-    ax.set_ylabel(f"PC2 ({pca_evo.explained_variance_ratio_[1]:.1%})")
-    ax.set_title(f"{cfg['label']} (seed 0)", fontweight="bold")
-    ax.legend(markerscale=3, fontsize=7, ncol=2)
+        ax.set_xlabel(f"PC1 ({pca_evo.explained_variance_ratio_[0]:.1%})")
+        ax.set_ylabel(f"PC2 ({pca_evo.explained_variance_ratio_[1]:.1%})")
+        if row == 0:
+            ax.set_title(f"{cfg['label']}", fontweight="bold")
+        if col == 0:
+            ax.annotate(f"Seed {seed}", xy=(0, 0.5), xytext=(-ax.yaxis.labelpad - 15, 0),
+                        xycoords=ax.yaxis.label, textcoords="offset points",
+                        fontsize=12, fontweight="bold", ha="right", va="center")
+        if row == 0 and col == n_conds - 1:
+            ax.legend(markerscale=3, fontsize=7, ncol=2, loc="upper right")
 
-plt.suptitle("Buffer Evolution in VAE Latent Space", fontsize=14, fontweight="bold")
+plt.suptitle("Buffer Evolution in Shared VAE Latent Space (PCA)", fontsize=14, fontweight="bold", y=1.01)
 plt.tight_layout()
 savefig(fig, "05_buffer_evolution_pca.png")
 
