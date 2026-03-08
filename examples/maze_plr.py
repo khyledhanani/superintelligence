@@ -432,7 +432,18 @@ def main(config=None, project="JAXUED_TEST"):
         log_dict.update({f"return/{name}": ret for name, ret in zip(config["eval_levels"], returns)})
         log_dict.update({"return/mean": returns.mean()})
         log_dict.update({"eval_ep_lengths/mean": stats['eval_ep_lengths'].mean()})
-        
+
+        # random eval levels (50 levels, uniform wall density 0-49)
+        rand_sr = stats["rand_eval_solve_rates"]
+        rand_ret = stats["rand_eval_returns"]
+        log_dict.update({"rand_eval/solve_rate_mean": rand_sr.mean()})
+        log_dict.update({"rand_eval/return_mean": rand_ret.mean()})
+        # Log per-wall-count solve rates in bins of 10
+        for bin_start in range(0, 50, 10):
+            bin_end = min(bin_start + 10, 50)
+            bin_sr = rand_sr[bin_start:bin_end].mean()
+            log_dict.update({f"rand_eval/solve_rate_{bin_start}-{bin_end-1}_walls": bin_sr})
+
         # level sampler
         log_dict.update(train_state_info["log"])
 
@@ -460,6 +471,31 @@ def main(config=None, project="JAXUED_TEST"):
     env = AutoReplayWrapper(env)
     env_params = env.default_params
     mutate_level = make_level_mutator_minimax(100)
+
+    # Generate 50 fixed solvable random eval levels with uniform wall density (0-49 walls)
+    from jaxued.environments.maze import MazeSolved
+    _solved_env = MazeSolved(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
+
+    def _generate_solvable_level(n_walls, rng, max_attempts=1000):
+        gen = make_level_generator(13, 13, n_walls)
+        for _ in range(max_attempts):
+            rng, rng_level, rng_reset = jax.random.split(rng, 3)
+            level = gen(rng_level)
+            _, state = _solved_env.reset_to_level(rng_reset, level, env_params)
+            if _solved_env.is_solveable(state, env_params):
+                return level, rng
+        print(f"  [warn] Could not find solvable level with {n_walls} walls after {max_attempts} attempts")
+        return level, rng  # return last attempt anyway
+
+    print("[Eval] Generating 50 solvable random eval levels (0-49 walls)...")
+    _rng_gen = jax.random.PRNGKey(12345)
+    _random_levels_list = []
+    for _nw in range(50):
+        _lvl, _rng_gen = _generate_solvable_level(_nw, _rng_gen)
+        _random_levels_list.append(_lvl)
+    random_eval_levels = Level.stack(_random_levels_list)
+    num_random_eval_levels = 50
+    print(f"[Eval] Generated {num_random_eval_levels} random eval levels")
 
     # And the level sampler    
     level_sampler = LevelSampler(
@@ -739,7 +775,22 @@ def main(config=None, project="JAXUED_TEST"):
         mask = jnp.arange(env_params.max_steps_in_episode)[..., None] < episode_lengths
         cum_rewards = (rewards * mask).sum(axis=0)
         return states, cum_rewards, episode_lengths # (num_steps, num_eval_levels, ...), (num_eval_levels,), (num_eval_levels,)
-    
+
+    def eval_random(rng: chex.PRNGKey, train_state: TrainState):
+        """Evaluate on the 50 fixed random levels with uniform wall density."""
+        rng, rng_reset = jax.random.split(rng)
+        init_obs, init_env_state = jax.vmap(eval_env.reset_to_level, (0, 0, None))(
+            jax.random.split(rng_reset, num_random_eval_levels), random_eval_levels, env_params
+        )
+        _, rewards, episode_lengths = evaluate_rnn(
+            rng, eval_env, env_params, train_state,
+            ActorCritic.initialize_carry((num_random_eval_levels,)),
+            init_obs, init_env_state, env_params.max_steps_in_episode,
+        )
+        mask = jnp.arange(env_params.max_steps_in_episode)[..., None] < episode_lengths
+        cum_rewards = (rewards * mask).sum(axis=0)
+        return cum_rewards, episode_lengths
+
     @jax.jit
     def train_and_eval_step(runner_state, _):
         """
@@ -749,24 +800,35 @@ def main(config=None, project="JAXUED_TEST"):
         # Train
         (rng, train_state), metrics = jax.lax.scan(train_step, runner_state, None, config["eval_freq"])
 
-        # Eval
+        # Eval (prefab levels)
         rng, rng_eval = jax.random.split(rng)
         states, cum_rewards, episode_lengths = jax.vmap(eval, (0, None))(jax.random.split(rng_eval, config["eval_num_attempts"]), train_state)
-        
+
         # Collect Metrics
         eval_solve_rates = jnp.where(cum_rewards > 0, 1., 0.).mean(axis=0) # (num_eval_levels,)
         eval_returns = cum_rewards.mean(axis=0) # (num_eval_levels,)
-        
+
+        # Eval (random levels with uniform wall density)
+        rng, rng_eval_rand = jax.random.split(rng)
+        rand_cum_rewards, rand_ep_lengths = jax.vmap(eval_random, (0, None))(
+            jax.random.split(rng_eval_rand, config["eval_num_attempts"]), train_state
+        )
+        # rand_cum_rewards: (num_attempts, 50), rand_ep_lengths: (num_attempts, 50)
+        rand_solve_rates = jnp.where(rand_cum_rewards > 0, 1., 0.).mean(axis=0)  # (50,)
+        rand_returns = rand_cum_rewards.mean(axis=0)  # (50,)
+
         # just grab the first run
         states, episode_lengths = jax.tree_util.tree_map(lambda x: x[0], (states, episode_lengths)) # (num_steps, num_eval_levels, ...), (num_eval_levels,)
         images = jax.vmap(jax.vmap(env_renderer.render_state, (0, None)), (0, None))(states, env_params) # (num_steps, num_eval_levels, ...)
         frames = images.transpose(0, 1, 4, 2, 3) # WandB expects color channel before image dimensions when dealing with animations for some reason
-        
+
         metrics["update_count"] = train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
         metrics["eval_returns"] = eval_returns
         metrics["eval_solve_rates"] = eval_solve_rates
         metrics["eval_ep_lengths"]  = episode_lengths
         metrics["eval_animation"] = (frames, episode_lengths)
+        metrics["rand_eval_solve_rates"] = rand_solve_rates
+        metrics["rand_eval_returns"] = rand_returns
         metrics["dr_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.dr_last_level_batch, env_params)
         metrics["replay_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.replay_last_level_batch, env_params)
         metrics["mutation_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.mutation_last_level_batch, env_params)

@@ -78,21 +78,22 @@ def main():
         batch_np = np.array(batch)
         total_generated += len(batch_np)
 
-        batch_valid = []
-        for seq in batch_np:
+        #batch_valid = []
+        #for seq in batch_np:
 
-            walls = seq[:-2]
-            goal = seq[-2]
-            agent = seq[-1]
+        #   walls = seq[:-2]
+        #    goal = seq[-2]
+        #    agent = seq[-1]
 
-            if is_reachable_bfs(grid_size=args.inner_dim, walls=walls, start_idx=agent, goal_idx=goal):
-                batch_valid.append(seq)
+        #    if is_reachable_bfs(grid_size=args.inner_dim, walls=walls, start_idx=agent, goal_idx=goal):
+        #        batch_valid.append(seq)
 
 
-        if batch_valid:
-            valid_sequences.extend(batch_valid)
+        #if batch_valid:
+        #    valid_sequences.extend(batch_valid)
 
-            print(f'{len(valid_sequences)}/{args.num_envs}')
+        #    print(f'{len(valid_sequences)}/{args.num_envs}')
+        valid_sequences.extend(batch_np)
 
     #if remainder > 0:
         #key, batch = generate_cluttr_batch_jax(key, remainder, args.max_obs, args.inner_dim)

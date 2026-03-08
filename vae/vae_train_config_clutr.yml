@@ -1,0 +1,76 @@
+# ==========================================
+# CLUTR-aligned VAE Training Configuration
+# ==========================================
+# Key changes from previous configs:
+#   1. recon_weight: 1000 (matching CLUTR MiniGrid flexible objective)
+#   2. beta_max: 1.0 (Bowman et al. default, giving ratio 1000:1)
+#   3. Larger dataset: generate 1M training samples to match CLUTR
+#   4. Longer anneal: 400k steps so KL doesn't kick in too early
+#   5. num_steps: 1000000 (CLUTR trained for 1M-10M steps)
+#
+# Previous best (beta=2.0, recon_weight=500) had ratio 250:1
+# CLUTR uses ratio ~1000:1 — heavily favoring reconstruction
+#
+# TODO before running:
+#   - Generate 1M training dataset (see datasets/ scripts)
+#     or update train_data_path to your existing 200k dataset
+#     for a quick test run first
+
+# --- Platform Selection ---
+platform: "local"  # "local" | "gcp"
+
+# --- Local Paths (UCL GPUs) ---
+working_path: "/cs/student/project_msc/2025/csml/rhautier"
+vae_folder: "vae"
+
+# --- GCP Settings ---
+gcp_project: "open-endedness-ued-project"
+gcp_bucket: "ucl-ued-project-bucket"
+gcp_bucket_prefix: "vae"
+
+# --- Vertex AI Experiment Tracking ---
+vertex_experiment_name: "projects/852796889575/locations/europe-west4/tensorboards/7623353920022118400"
+vertex_experiment_region: "europe-west4"
+enable_vertex_tracking: true
+
+# --- Data ---
+# Option A: Use existing 200k dataset for quick test
+train_data_path: "datasets/new_train_200k_envs.npy"
+validation_data_path: "datasets/new_val_20k_envs.npy"
+# Option B: Generate 1M dataset first (recommended, matching CLUTR)
+# train_data_path: "datasets/train_1M_envs.npy"
+# validation_data_path: "datasets/new_val_20k_envs.npy"
+
+checkpoint_dir: "checkpoints_clutr_aligned"
+KL_recon_plot_name: "plot.png"
+
+# --- Run Management ---
+resume_run_id: null
+run_tag: "clutr_aligned_rw1000_beta1.0"
+
+# --- Training Hyperparameters ---
+num_steps: 1000000        # CLUTR: 1M steps (standard), 10M (flexible)
+batch_size: 32            # per-device batch size (same as CLUTR)
+learning_rate: 0.00005    # same as CLUTR
+recon_weight: 1000        # CLUTR MiniGrid flexible objective = 1000
+wall_weight: 1
+agent_goal_weight: 5
+recon_added_weight_factor: 1.0
+beta_max: 1.0             # Bowman default; ratio = 1000:1
+anneal_steps: 400000      # longer anneal to let decoder learn before KL kicks in
+
+# --- Dataset parameters ---
+algo_data_path: 'datasets/algo_mazes_50_walls.npy'
+algo_mix_ratio: 0.0       # pure random mazes first; add algo mix in follow-up
+
+# --- Model Architecture ---
+embed_dim: 300
+vocab_size: 170
+latent_dim: 64
+scale_latent: true
+
+# --- Logging / Saving ---
+plot_freq: 1000
+save_freq: 20000
+eval_metric_freq: 5000
+seq_len: 52
