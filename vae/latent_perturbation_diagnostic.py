@@ -46,10 +46,11 @@ from jaxued.environments.maze.env import EnvParams
 from jaxued.environments.maze.util import make_level_generator
 
 # --- Import VAE ---
-import importlib
-import train_vae
-importlib.reload(train_vae)
-from train_vae import CluttrVAE
+try:
+    from vae_model import CluttrVAE
+except ImportError:
+    import train_vae
+    from train_vae import CluttrVAE
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -265,13 +266,22 @@ def load_vae(vae_config_path, vae_checkpoint_path):
     with open(vae_config_path) as f:
         vae_cfg = yaml.safe_load(f)
 
-    # Update module-level config
-    train_vae.CONFIG['latent_dim'] = vae_cfg['latent_dim']
-    train_vae.CONFIG['embed_dim'] = vae_cfg['embed_dim']
-    train_vae.CONFIG['vocab_size'] = vae_cfg['vocab_size']
-    train_vae.CONFIG['seq_len'] = vae_cfg['seq_len']
-
-    model = CluttrVAE()
+    # Try vae_model.py style (constructor args) first, fall back to train_vae.py style (global CONFIG)
+    try:
+        model = CluttrVAE(
+            vocab_size=vae_cfg['vocab_size'],
+            embed_dim=vae_cfg['embed_dim'],
+            latent_dim=vae_cfg['latent_dim'],
+            seq_len=vae_cfg['seq_len'],
+        )
+    except TypeError:
+        # train_vae.py version uses global CONFIG, no constructor args
+        import train_vae
+        train_vae.CONFIG['latent_dim'] = vae_cfg['latent_dim']
+        train_vae.CONFIG['embed_dim'] = vae_cfg['embed_dim']
+        train_vae.CONFIG['vocab_size'] = vae_cfg['vocab_size']
+        train_vae.CONFIG['seq_len'] = vae_cfg['seq_len']
+        model = CluttrVAE()
 
     with open(vae_checkpoint_path, "rb") as f:
         ckpt = pickle.load(f)
