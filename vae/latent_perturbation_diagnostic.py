@@ -346,7 +346,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 
-def render_maze_from_tokens(ax, tokens, solvability=None, title=None):
+def render_maze_from_tokens(ax, tokens, solvability=None, mean_return=None, title=None):
     """Render a maze from a 52-token sequence onto a matplotlib axis."""
     tokens = np.array(tokens).flatten().astype(int)
     agent_idx = int(tokens[-1])
@@ -370,10 +370,11 @@ def render_maze_from_tokens(ax, tokens, solvability=None, title=None):
         ax.scatter(gc, gr, color='lime', s=40, marker='*', zorder=3, edgecolors='darkgreen', linewidths=0.5)
 
     if title:
-        ax.set_title(title, fontsize=7)
+        ax.set_title(title, fontsize=6)
     elif solvability is not None:
         color = 'green' if solvability > 0.5 else 'red'
-        ax.set_title(f"solv={solvability:.0%}", fontsize=7, color=color)
+        ret_str = f"\nr={mean_return:.2f}" if mean_return is not None else ""
+        ax.set_title(f"solv={solvability:.0%}{ret_str}", fontsize=6, color=color)
     ax.axis('off')
 
 
@@ -389,7 +390,8 @@ def plot_maze_panels(all_results, all_repaired_tokens, plot_dir, n_base, n_pert,
         render_maze_from_tokens(
             axes[i, 0], tokens_batch[0],
             solvability=result["base_solvability"],
-            title=f"Original\nsolv={result['base_solvability']:.0%}"
+            mean_return=result["base_mean_return"],
+            title=f"Original\nsolv={result['base_solvability']:.0%} r={result['base_mean_return']:.2f}"
         )
         axes[i, 0].patch.set_edgecolor('blue')
         axes[i, 0].patch.set_linewidth(2)
@@ -399,6 +401,7 @@ def plot_maze_panels(all_results, all_repaired_tokens, plot_dir, n_base, n_pert,
             render_maze_from_tokens(
                 axes[i, j + 1], tokens_batch[j + 1],
                 solvability=result["pert_solvabilities"][j],
+                mean_return=result["pert_mean_returns"][j],
             )
 
     fig.suptitle(
@@ -413,98 +416,126 @@ def plot_maze_panels(all_results, all_repaired_tokens, plot_dir, n_base, n_pert,
     print(f"[Plot] Maze panels -> {path}")
 
 
-def plot_solvability_scatter(all_results, plot_dir, n_base, eps):
-    """Plot 2: Original solvability vs perturbation solvabilities."""
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+def plot_regret_scatter(all_results, plot_dir, n_base, eps):
+    """Plot 2: Original vs perturbed — solvability (left) and mean return (right)."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     colors = plt.cm.tab10(np.linspace(0, 1, n_base))
 
+    # Left: solvability
+    ax = axes[0]
     for i, result in enumerate(all_results):
         base_s = result["base_solvability"]
         pert_s = result["pert_solvabilities"]
         ax.scatter(
             [base_s] * len(pert_s), pert_s,
             color=colors[i], alpha=0.7, s=30,
-            label=f"Level {i+1} (buf={result['base_idx']})"
+            label=f"Level {i+1}"
         )
-
-    # Diagonal line (perfect consistency)
-    lims = [0, 1]
-    ax.plot(lims, lims, 'k--', alpha=0.3, label='Perfect consistency')
-
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
     ax.set_xlabel("Original Solvability", fontsize=11)
     ax.set_ylabel("Perturbed Solvability", fontsize=11)
-    ax.set_title(f"Original vs Perturbed Solvability (eps={eps})", fontsize=12, fontweight='bold')
-    ax.legend(fontsize=7, loc='lower right')
+    ax.set_title("Solvability (coarse regret proxy)", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=6, loc='lower right')
     ax.grid(alpha=0.3)
     ax.set_xlim(-0.05, 1.05)
     ax.set_ylim(-0.05, 1.05)
 
+    # Right: mean return
+    ax = axes[1]
+    for i, result in enumerate(all_results):
+        base_r = result["base_mean_return"]
+        pert_r = result["pert_mean_returns"]
+        ax.scatter(
+            [base_r] * len(pert_r), pert_r,
+            color=colors[i], alpha=0.7, s=30,
+            label=f"Level {i+1}"
+        )
+    all_returns = [r["base_mean_return"] for r in all_results]
+    for r in all_results:
+        all_returns.extend(r["pert_mean_returns"])
+    rmin, rmax = min(all_returns) - 0.05, max(all_returns) + 0.05
+    ax.plot([rmin, rmax], [rmin, rmax], 'k--', alpha=0.3)
+    ax.set_xlabel("Original Mean Return", fontsize=11)
+    ax.set_ylabel("Perturbed Mean Return", fontsize=11)
+    ax.set_title("Mean Return (continuous regret proxy)", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=6, loc='lower right')
+    ax.grid(alpha=0.3)
+
+    fig.suptitle(f"Original vs Perturbed Regret Proxies (eps={eps})", fontsize=12, fontweight='bold')
     plt.tight_layout()
-    path = os.path.join(plot_dir, "solvability_scatter.png")
+    path = os.path.join(plot_dir, "regret_scatter.png")
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"[Plot] Solvability scatter -> {path}")
+    print(f"[Plot] Regret scatter -> {path}")
 
 
-def plot_jaccard_vs_solvability(all_results, plot_dir, eps):
-    """Plot 3: Wall Jaccard similarity vs |solvability change| and solve agreement."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+def plot_jaccard_vs_regret(all_results, plot_dir, eps):
+    """Plot 3: Wall Jaccard vs |solvability change| and |return change|."""
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
     all_jaccards = []
     all_solv_diffs = []
-    all_solve_match = []
+    all_ret_diffs = []
 
     for result in all_results:
         base_s = result["base_solvability"]
-        for jr, ps in zip(result["pert_wall_jaccard"], result["pert_solvabilities"]):
+        base_r = result["base_mean_return"]
+        for jr, ps, pr in zip(
+            result["pert_wall_jaccard"],
+            result["pert_solvabilities"],
+            result["pert_mean_returns"],
+        ):
             all_jaccards.append(jr)
             all_solv_diffs.append(abs(ps - base_s))
-            all_solve_match.append(int((ps > 0.5) == (base_s > 0.5)))
+            all_ret_diffs.append(abs(pr - base_r))
 
     all_jaccards = np.array(all_jaccards)
     all_solv_diffs = np.array(all_solv_diffs)
-    all_solve_match = np.array(all_solve_match)
+    all_ret_diffs = np.array(all_ret_diffs)
+
+    def _scatter_with_fit(ax, x, y, xlabel, ylabel, title):
+        ax.scatter(x, y, alpha=0.5, s=20, c='steelblue')
+        if len(x) > 2:
+            corr = np.corrcoef(x, y)[0, 1]
+            z = np.polyfit(x, y, 1)
+            p = np.poly1d(z)
+            xs = np.linspace(x.min(), x.max(), 50)
+            ax.plot(xs, p(xs), 'r--', alpha=0.5, label=f'r={corr:.3f}')
+            ax.legend(fontsize=9)
+        ax.set_xlabel(xlabel, fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_title(title, fontsize=10, fontweight='bold')
+        ax.grid(alpha=0.3)
 
     # Left: Jaccard vs |solvability change|
-    ax = axes[0]
-    ax.scatter(all_jaccards, all_solv_diffs, alpha=0.5, s=20, c='steelblue')
-    if len(all_jaccards) > 2:
-        corr = np.corrcoef(all_jaccards, all_solv_diffs)[0, 1]
-        z = np.polyfit(all_jaccards, all_solv_diffs, 1)
-        p = np.poly1d(z)
-        xs = np.linspace(all_jaccards.min(), all_jaccards.max(), 50)
-        ax.plot(xs, p(xs), 'r--', alpha=0.5, label=f'r={corr:.3f}')
-        ax.legend(fontsize=9)
-    ax.set_xlabel("Wall Jaccard Similarity", fontsize=11)
-    ax.set_ylabel("|Solvability Change|", fontsize=11)
-    ax.set_title("Structural Similarity vs Solvability Change", fontsize=11, fontweight='bold')
-    ax.grid(alpha=0.3)
+    _scatter_with_fit(axes[0], all_jaccards, all_solv_diffs,
+                      "Wall Jaccard", "|Solvability Change|",
+                      "Jaccard vs Solvability Change")
 
-    # Right: Jaccard vs solve agreement (binned bar chart)
-    ax = axes[1]
-    bins = np.linspace(0, 1, 11)
-    bin_indices = np.digitize(all_jaccards, bins) - 1
-    bin_centers = []
-    bin_agreement = []
-    for b in range(len(bins) - 1):
-        mask = bin_indices == b
-        if mask.sum() > 0:
-            bin_centers.append((bins[b] + bins[b + 1]) / 2)
-            bin_agreement.append(all_solve_match[mask].mean())
-    ax.bar(bin_centers, bin_agreement, width=0.08, color='steelblue', alpha=0.7, edgecolor='white')
-    ax.set_xlabel("Wall Jaccard Similarity", fontsize=11)
-    ax.set_ylabel("Solve Agreement Rate", fontsize=11)
-    ax.set_title("Does Higher Similarity = Same Solvability?", fontsize=11, fontweight='bold')
-    ax.set_ylim(0, 1.05)
-    ax.grid(alpha=0.3, axis='y')
+    # Middle: Jaccard vs |return change|
+    _scatter_with_fit(axes[1], all_jaccards, all_ret_diffs,
+                      "Wall Jaccard", "|Mean Return Change|",
+                      "Jaccard vs Return Change")
 
-    fig.suptitle(f"Jaccard vs Solvability (eps={eps})", fontsize=12, fontweight='bold')
+    # Right: L2 distance vs |return change|
+    all_l2 = []
+    all_ret_diffs2 = []
+    for result in all_results:
+        base_r = result["base_mean_return"]
+        for d, pr in zip(result["pert_l2_dists"], result["pert_mean_returns"]):
+            all_l2.append(d)
+            all_ret_diffs2.append(abs(pr - base_r))
+    _scatter_with_fit(axes[2], np.array(all_l2), np.array(all_ret_diffs2),
+                      "Latent L2 Distance", "|Mean Return Change|",
+                      "Latent Distance vs Return Change")
+
+    fig.suptitle(f"Structure & Latent Distance vs Regret Proxies (eps={eps})", fontsize=12, fontweight='bold')
     plt.tight_layout()
-    path = os.path.join(plot_dir, "jaccard_vs_solvability.png")
+    path = os.path.join(plot_dir, "jaccard_vs_regret.png")
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"[Plot] Jaccard vs solvability -> {path}")
+    print(f"[Plot] Jaccard vs regret -> {path}")
 
 
 def upload_to_gcs(local_path, gcs_dir):
@@ -625,6 +656,7 @@ def run_diagnostic(args):
         n_rollouts = args.num_eval_rollouts
         num_levels_here = 1 + n_pert
         all_solved_rollouts = np.zeros((n_rollouts, num_levels_here), dtype=bool)
+        all_reward_rollouts = np.zeros((n_rollouts, num_levels_here))
 
         for r in range(n_rollouts):
             rng, rng_eval = jax.random.split(rng)
@@ -633,11 +665,16 @@ def run_diagnostic(args):
                 max_steps=env_params.max_steps_in_episode,
             )
             all_solved_rollouts[r] = np.array(solved_r)
+            all_reward_rollouts[r] = np.array(cum_rewards_r)
 
-        # Mean solvability per level across rollouts
+        # Mean solvability and mean return per level across rollouts
         solvability = all_solved_rollouts.mean(axis=0)  # (1+n_pert,)
+        mean_returns = all_reward_rollouts.mean(axis=0)  # (1+n_pert,)
+
         base_solvability = float(solvability[0])
         pert_solvabilities = solvability[1:]
+        base_mean_return = float(mean_returns[0])
+        pert_mean_returns = mean_returns[1:]
 
         # Solve agreement: does perturbation solvability stay close to original?
         # Use threshold: if both > 0.5 or both <= 0.5, they agree
@@ -647,19 +684,24 @@ def run_diagnostic(args):
             "base_idx": int(indices[i]),
             "base_buffer_score": float(base_scores[i]),
             "base_solvability": base_solvability,
+            "base_mean_return": base_mean_return,
             "pert_solvabilities": pert_solvabilities.tolist(),
+            "pert_mean_returns": pert_mean_returns.tolist(),
             "pert_l2_dists": l2_dists.tolist(),
             "pert_wall_jaccard": token_sims,
             "mean_pert_solvability": float(pert_solvabilities.mean()),
             "solvability_std": float(pert_solvabilities.std()),
+            "mean_pert_return": float(pert_mean_returns.mean()),
+            "return_std": float(pert_mean_returns.std()),
             "solve_agreement": float(solve_agreement.mean()),
         }
         all_results.append(result)
 
         print(f"\n--- Base level {i+1}/{n_base} (buffer idx {indices[i]}) ---")
         print(f"  Buffer score: {base_scores[i]:.3f}")
-        print(f"  Original solvability:  {base_solvability:.0%} ({n_rollouts} rollouts)")
-        print(f"  Pert mean solvability: {pert_solvabilities.mean():.0%} +/- {pert_solvabilities.std():.2f}")
+        print(f"  Original:  solvability={base_solvability:.0%}  mean_return={base_mean_return:.3f}  ({n_rollouts} rollouts)")
+        print(f"  Perturbed: solvability={pert_solvabilities.mean():.0%} +/- {pert_solvabilities.std():.2f}")
+        print(f"  Perturbed: mean_return={pert_mean_returns.mean():.3f} +/- {pert_mean_returns.std():.3f}")
         print(f"  Solve agreement:       {solve_agreement.mean():.0%}")
         print(f"  Wall Jaccard:          {np.mean(token_sims):.3f} +/- {np.std(token_sims):.3f}")
         print(f"  L2 distances:          {l2_dists.mean():.3f} +/- {l2_dists.std():.3f}")
@@ -672,15 +714,24 @@ def run_diagnostic(args):
     all_base_solv = [r["base_solvability"] for r in all_results]
     all_pert_solv = [r["mean_pert_solvability"] for r in all_results]
     all_solv_stds = [r["solvability_std"] for r in all_results]
+    all_base_ret = [r["base_mean_return"] for r in all_results]
+    all_pert_ret = [r["mean_pert_return"] for r in all_results]
+    all_ret_stds = [r["return_std"] for r in all_results]
     all_solve_agreements = [r["solve_agreement"] for r in all_results]
     all_jaccards = [np.mean(r["pert_wall_jaccard"]) for r in all_results]
 
     n_rollouts = args.num_eval_rollouts
     print(f"\n  Across {n_base} base levels, {n_pert} perturbations each, {n_rollouts} rollouts (eps={eps}):")
+    print(f"  --- Solvability (coarse regret proxy) ---")
     print(f"  Mean base solvability:     {np.mean(all_base_solv):.1%}")
     print(f"  Mean pert solvability:     {np.mean(all_pert_solv):.1%}")
     print(f"  Mean pert solvability std: {np.mean(all_solv_stds):.3f}")
     print(f"  Mean solve agreement:      {np.mean(all_solve_agreements):.1%}")
+    print(f"  --- Mean Return (continuous regret proxy) ---")
+    print(f"  Mean base return:          {np.mean(all_base_ret):.3f}")
+    print(f"  Mean pert return:          {np.mean(all_pert_ret):.3f}")
+    print(f"  Mean pert return std:      {np.mean(all_ret_stds):.3f}")
+    print(f"  --- Structure ---")
     print(f"  Mean wall Jaccard:         {np.mean(all_jaccards):.3f}")
     print()
 
@@ -711,8 +762,8 @@ def run_diagnostic(args):
     plot_dir = os.path.dirname(args.output_path) or "."
     os.makedirs(plot_dir, exist_ok=True)
     plot_maze_panels(all_results, all_repaired_tokens, plot_dir, n_base, n_pert, eps, args)
-    plot_solvability_scatter(all_results, plot_dir, n_base, eps)
-    plot_jaccard_vs_solvability(all_results, plot_dir, eps)
+    plot_regret_scatter(all_results, plot_dir, n_base, eps)
+    plot_jaccard_vs_regret(all_results, plot_dir, eps)
 
     # Save results
     output_path = args.output_path
@@ -733,6 +784,9 @@ def run_diagnostic(args):
                 "mean_pert_solvability": float(np.mean(all_pert_solv)),
                 "mean_solvability_std": float(np.mean(all_solv_stds)),
                 "mean_solve_agreement": float(np.mean(all_solve_agreements)),
+                "mean_base_return": float(np.mean(all_base_ret)),
+                "mean_pert_return": float(np.mean(all_pert_ret)),
+                "mean_return_std": float(np.mean(all_ret_stds)),
                 "mean_wall_jaccard": float(np.mean(all_jaccards)),
             },
             "per_level": all_results,
@@ -743,7 +797,7 @@ def run_diagnostic(args):
     if args.gcs_output_dir:
         gcs_dir = args.gcs_output_dir
         upload_to_gcs(output_path, gcs_dir)
-        for fname in ["perturbation_mazes.png", "solvability_scatter.png", "jaccard_vs_solvability.png"]:
+        for fname in ["perturbation_mazes.png", "regret_scatter.png", "jaccard_vs_regret.png"]:
             local = os.path.join(plot_dir, fname)
             if os.path.exists(local):
                 upload_to_gcs(local, gcs_dir)
