@@ -758,9 +758,37 @@ def run_diagnostic(args):
         print("  -> LOW wall overlap ({:.3f})".format(np.mean(all_jaccards)))
         print("     VAE produces structurally different mazes under perturbation.")
 
-    # --- Plots ---
+    # --- Save readable summary ---
     plot_dir = os.path.dirname(args.output_path) or "."
     os.makedirs(plot_dir, exist_ok=True)
+    summary_path = os.path.join(plot_dir, "summary.txt")
+    with open(summary_path, "w") as f:
+        f.write("LATENT PERTURBATION DIAGNOSTIC - SUMMARY\n")
+        f.write("=" * 55 + "\n\n")
+        f.write(f"Config: {n_base} base levels, {n_pert} perturbations, {n_rollouts} rollouts, eps={eps}\n")
+        f.write(f"VAE:    {args.vae_checkpoint_path}\n")
+        f.write(f"Agent:  {args.agent_checkpoint_dir or args.agent_params_pkl}\n\n")
+        f.write("--- Solvability (coarse regret proxy) ---\n")
+        f.write(f"  Mean base solvability:     {np.mean(all_base_solv):.1%}\n")
+        f.write(f"  Mean pert solvability:     {np.mean(all_pert_solv):.1%}\n")
+        f.write(f"  Mean pert solvability std: {np.mean(all_solv_stds):.3f}\n")
+        f.write(f"  Mean solve agreement:      {np.mean(all_solve_agreements):.1%}\n\n")
+        f.write("--- Mean Return (continuous regret proxy) ---\n")
+        f.write(f"  Mean base return:          {np.mean(all_base_ret):.3f}\n")
+        f.write(f"  Mean pert return:          {np.mean(all_pert_ret):.3f}\n")
+        f.write(f"  Mean pert return std:      {np.mean(all_ret_stds):.3f}\n\n")
+        f.write("--- Structure ---\n")
+        f.write(f"  Mean wall Jaccard:         {np.mean(all_jaccards):.3f}\n\n")
+        f.write("--- Per Level ---\n")
+        for i, r in enumerate(all_results):
+            f.write(f"\n  Level {i+1} (buffer idx {r['base_idx']}, score {r['base_buffer_score']:.3f}):\n")
+            f.write(f"    Base:  solv={r['base_solvability']:.0%}  return={r['base_mean_return']:.3f}\n")
+            f.write(f"    Perts: solv={r['mean_pert_solvability']:.0%}+/-{r['solvability_std']:.2f}  ")
+            f.write(f"return={r['mean_pert_return']:.3f}+/-{r['return_std']:.3f}\n")
+            f.write(f"    Jaccard={np.mean(r['pert_wall_jaccard']):.3f}  agree={r['solve_agreement']:.0%}\n")
+    print(f"[Save] Summary -> {summary_path}")
+
+    # --- Plots ---
     plot_maze_panels(all_results, all_repaired_tokens, plot_dir, n_base, n_pert, eps, args)
     plot_regret_scatter(all_results, plot_dir, n_base, eps)
     plot_jaccard_vs_regret(all_results, plot_dir, eps)
@@ -797,7 +825,7 @@ def run_diagnostic(args):
     if args.gcs_output_dir:
         gcs_dir = args.gcs_output_dir
         upload_to_gcs(output_path, gcs_dir)
-        for fname in ["perturbation_mazes.png", "regret_scatter.png", "jaccard_vs_regret.png"]:
+        for fname in ["summary.txt", "perturbation_mazes.png", "regret_scatter.png", "jaccard_vs_regret.png"]:
             local = os.path.join(plot_dir, fname)
             if os.path.exists(local):
                 upload_to_gcs(local, gcs_dir)
