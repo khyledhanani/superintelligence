@@ -290,22 +290,26 @@ def load_vae(vae_config_path, vae_checkpoint_path):
     return model, params, vae_cfg
 
 
-@jax.jit
 def vae_encode(model, params, tokens):
     """Encode a batch of token sequences to latent means."""
-    mean, logvar = model.apply(
-        {"params": params}, tokens, train=False,
-        method=CluttrVAE.encode,
-        rngs={"dropout": jax.random.key(0)},
-    )
-    return mean
+    @jax.jit
+    def _encode(params, tokens):
+        mean, logvar = model.apply(
+            {"params": params}, tokens, train=False,
+            method=CluttrVAE.encode,
+            rngs={"dropout": jax.random.key(0)},
+        )
+        return mean
+    return _encode(params, tokens)
 
 
-@jax.jit
 def vae_decode(model, params, z):
     """Decode latent vectors to token sequences."""
-    logits = model.apply({"params": params}, z, method=CluttrVAE.decode)
-    return jnp.argmax(logits, axis=-1)
+    @jax.jit
+    def _decode(params, z):
+        logits = model.apply({"params": params}, z, method=CluttrVAE.decode)
+        return jnp.argmax(logits, axis=-1)
+    return _decode(params, z)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
