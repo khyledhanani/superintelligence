@@ -142,10 +142,74 @@ def load_agent(checkpoint_dir, checkpoint_step=-1):
 
     print(f"[Agent] Loading step {step} (~{updates_at_step} updates) from {models_dir}")
     print(f"[Agent] Available steps: {available[0]}..{available[-1]} ({len(available)} total)")
-    restored = checkpoint_manager.restore(step)
+
+    # Try standard restore first; fall back to tensorstore for TPU->CPU
+    try:
+        restored = checkpoint_manager.restore(step)
+    except ValueError as e:
+        if "was not found in jax.local_devices()" in str(e) or "Topology mismatch" in str(e):
+            print("[Agent] TPU checkpoint detected, restoring params via tensorstore...")
+            restored = {"params": _restore_params_from_ocdbt(
+                os.path.join(models_dir, str(step), "default"),
+                network_params,
+            )}
+        else:
+            raise
 
     train_state = template_state.replace(params=restored["params"])
     return train_state, config, env, env_params
+
+
+def _restore_params_from_ocdbt(ckpt_default_dir, template_params):
+    """Restore network params from OCDBT checkpoint, bypassing TPU sharding.
+
+    Reads the _METADATA JSON for tree structure, then uses tensorstore
+    with the zarr driver to read each array from the ocdbt.process_0 store.
+    """
+    import ast
+    import tensorstore as ts
+
+    ckpt_dir = os.path.abspath(ckpt_default_dir)
+    ocdbt_base = "file://" + os.path.join(ckpt_dir, "ocdbt.process_0")
+
+    # Read tree metadata
+    with open(os.path.join(ckpt_dir, "_METADATA"), "r") as f:
+        meta = json.load(f)
+
+    # Extract param entries: keys like "('params', 'params', 'Conv_0', 'bias')"
+    param_entries = {
+        k: v for k, v in meta["tree_metadata"].items()
+        if k.startswith("('params',")
+    }
+
+    params = {}
+    for key_str in sorted(param_entries.keys()):
+        key_tuple = ast.literal_eval(key_str)
+        # key_tuple = ('params', 'params', 'Conv_0', 'bias')
+        # tensorstore path uses dot-separated full key
+        ts_path = ".".join(key_tuple)
+
+        spec = {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "ocdbt",
+                "base": ocdbt_base,
+                "path": ts_path,
+            },
+        }
+        store = ts.open(spec, read=True, open=True).result()
+        arr = jnp.array(store.read().result())
+
+        # Build nested dict: skip first 'params' (TrainState.params), keep rest
+        path = key_tuple[1:]  # ('params', 'Conv_0', 'bias')
+        d = params
+        for p in path[:-1]:
+            if p not in d:
+                d[p] = {}
+            d = d[p]
+        d[path[-1]] = arr
+
+    return params
 
 
 def tokens_to_levels_batch(tokens):
