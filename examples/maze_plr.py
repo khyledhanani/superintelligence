@@ -36,6 +36,11 @@ from es.maze_ae import (
     maze_level_to_grid, encode_maze_levels, decode_maze_latents, predict_task_targets,
 )
 from es import plwm_scoring
+from es.online_level_model import (
+    compute_pca_from_latents,
+    encode_batch_np,
+    extract_buffer_grids,
+)
 from es.map_elites_mutation_service import (
     MapElitesArchive,
     OBS_BINS,
@@ -75,6 +80,9 @@ class TrainState(BaseTrainState):
     frontier_updates: int
     frontier_last_loss: chex.Array
     frontier_last_p_mae: chex.Array
+    # PCA directions over buffer latents (for --plwm_use_pca_mutation)
+    plwm_pca_eigvecs: chex.Array = struct.field(pytree_node=True)   # (D, D)
+    plwm_pca_eigvals: chex.Array = struct.field(pytree_node=True)   # (D,)
 
 # region PPO helper functions
 def compute_gae(
@@ -777,6 +785,21 @@ def main(config=None, project="JAXUED_TEST"):
                 "--plwm_surrogate_guided."
             )
 
+    # Latent dim for PLWM PCA (derived from loaded checkpoint; 1 when unused)
+    plwm_latent_dim = 1
+    if config["plwm_use_pca_mutation"] and config["use_plwm_mutation"]:
+        if config["plwm_use_maze_ae"] and maze_encoder_params is not None:
+            if "mean_layer" in maze_encoder_params:
+                # Variational encoder: use mean_layer output dim
+                plwm_latent_dim = int(maze_encoder_params["mean_layer"]["kernel"].shape[-1])
+            elif "Dense_1" in maze_encoder_params:
+                # Deterministic legacy encoder: use last Dense output dim
+                plwm_latent_dim = int(maze_encoder_params["Dense_1"]["kernel"].shape[-1])
+        elif not config["plwm_use_maze_ae"] and encoder_params is not None:
+            # CLUTTR VAE encoder also has mean_layer key
+            if "mean_layer" in encoder_params:
+                plwm_latent_dim = int(encoder_params["mean_layer"]["kernel"].shape[-1])
+
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
@@ -858,6 +881,8 @@ def main(config=None, project="JAXUED_TEST"):
             frontier_updates=0,
             frontier_last_loss=jnp.array(0.0, dtype=jnp.float32),
             frontier_last_p_mae=jnp.array(0.0, dtype=jnp.float32),
+            plwm_pca_eigvecs=jnp.eye(plwm_latent_dim, dtype=jnp.float32),
+            plwm_pca_eigvals=jnp.ones(plwm_latent_dim, dtype=jnp.float32),
         )
 
     def train_step(carry: Tuple[chex.PRNGKey, TrainState], _):
@@ -1112,9 +1137,13 @@ def main(config=None, project="JAXUED_TEST"):
                             rng_encode,
                             (batch_size, num_candidates, parent_latents.shape[-1]),
                         )
-                        candidate_latents = (
-                            parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
-                        )
+                        if config["plwm_use_pca_mutation"]:
+                            scaled = candidate_noise * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8)) * float(config["plwm_sigma"])
+                            candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                        else:
+                            candidate_latents = (
+                                parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
+                            )
                         flat_latents = candidate_latents.reshape((batch_size * num_candidates, -1))
 
                         candidate_levels_flat = decode_maze_latents(
@@ -1218,9 +1247,12 @@ def main(config=None, project="JAXUED_TEST"):
                             candidate_levels,
                         )
                     else:
-                        # Perturb once per parent (legacy PLWM behavior).
                         noise = jax.random.normal(rng_encode, parent_latents.shape)
-                        child_latents = parent_latents + float(config["plwm_sigma"]) * noise
+                        if config["plwm_use_pca_mutation"]:
+                            scaled = noise * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals, 1e-8)) * float(config["plwm_sigma"])
+                            child_latents = parent_latents + scaled @ train_state.plwm_pca_eigvecs
+                        else:
+                            child_latents = parent_latents + float(config["plwm_sigma"]) * noise
 
                         # Decode -> Level (with Gumbel-max sampling + repair)
                         child_levels = decode_maze_latents(
@@ -1245,9 +1277,13 @@ def main(config=None, project="JAXUED_TEST"):
                             rng_encode,
                             (batch_size, num_candidates, parent_latents.shape[-1]),
                         )
-                        candidate_latents = (
-                            parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
-                        )
+                        if config["plwm_use_pca_mutation"]:
+                            scaled = candidate_noise * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8)) * float(config["plwm_sigma"])
+                            candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                        else:
+                            candidate_latents = (
+                                parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
+                            )
                         flat_latents = candidate_latents.reshape((batch_size * num_candidates, -1))
 
                         child_sequences_flat = decode_latent_to_env(
@@ -1288,7 +1324,11 @@ def main(config=None, project="JAXUED_TEST"):
                         )
                     else:
                         noise = jax.random.normal(rng_encode, parent_latents.shape)
-                        child_latents = parent_latents + float(config["plwm_sigma"]) * noise
+                        if config["plwm_use_pca_mutation"]:
+                            scaled = noise * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals, 1e-8)) * float(config["plwm_sigma"])
+                            child_latents = parent_latents + scaled @ train_state.plwm_pca_eigvecs
+                        else:
+                            child_latents = parent_latents + float(config["plwm_sigma"]) * noise
 
                         child_sequences = decode_latent_to_env(
                             decoder_params, child_latents,
@@ -1543,6 +1583,43 @@ def main(config=None, project="JAXUED_TEST"):
         runner_state, metrics = train_and_eval_step(runner_state, None)
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
+
+        # Recompute PCA directions over encoded buffer latents
+        if (
+            config["plwm_use_pca_mutation"]
+            and config["use_plwm_mutation"]
+            and eval_step % config["plwm_pca_update_every"] == 0
+        ):
+            _buf_size = int(runner_state[1].sampler["size"])
+            if _buf_size >= plwm_latent_dim + 1:
+                _chunk_size = 256
+                _latent_chunks = []
+                if config["plwm_use_maze_ae"]:
+                    _grids = extract_buffer_grids(runner_state[1].sampler, eval_env.max_height, eval_env.max_width)
+                    # encode_maze_levels handles both variational and legacy deterministic encoders
+                    for _i in range(0, len(_grids), _chunk_size):
+                        _chunk = jnp.array(_grids[_i : _i + _chunk_size])
+                        _latent_chunks.append(np.array(encode_maze_levels(maze_encoder_params, _chunk)))
+                else:
+                    # CLUTTR VAE path: extract sequences from buffer and encode
+                    _lvls = runner_state[1].sampler["levels"]
+                    _wall_maps = jnp.array(np.array(_lvls.wall_map[:_buf_size]))
+                    _goal_pos  = jnp.array(np.array(_lvls.goal_pos[:_buf_size]))
+                    _agent_pos = jnp.array(np.array(_lvls.agent_pos[:_buf_size]))
+                    _seqs = jax.jit(jax.vmap(level_to_cluttr_sequence))(_wall_maps, _goal_pos, _agent_pos)
+                    for _i in range(0, _buf_size, _chunk_size):
+                        _chunk_seqs = _seqs[_i : _i + _chunk_size]
+                        _latent_chunks.append(np.array(encode_levels_to_latents(encoder_params, _chunk_seqs)))
+                _latents = np.concatenate(_latent_chunks, axis=0)
+                _eigvecs, _eigvals = compute_pca_from_latents(_latents)
+                runner_state = (
+                    runner_state[0],
+                    runner_state[1].replace(
+                        plwm_pca_eigvecs=jnp.array(_eigvecs),
+                        plwm_pca_eigvals=jnp.array(_eigvals),
+                    ),
+                )
+
         log_eval(
             metrics,
             train_state_to_log_dict(
@@ -1714,6 +1791,12 @@ if __name__=="__main__":
     group.add_argument("--plwm_mae_checkpoint", type=str, default=None,
                        help="Path to the MazeAE checkpoint pickle. Defaults to "
                             "vae/model_maze_ae/checkpoint_final.pkl relative to project root.")
+    group.add_argument("--plwm_use_pca_mutation", action=argparse.BooleanOptionalAction, default=False,
+                       help="Scale PLWM latent perturbations along PCA directions of the replay buffer "
+                            "latents instead of isotropic Gaussian. Requires --use_plwm_mutation "
+                            "--plwm_use_maze_ae.")
+    group.add_argument("--plwm_pca_update_every", type=int, default=1,
+                       help="Recompute buffer-latent PCA every N eval cycles. Default 1 (every eval).")
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
