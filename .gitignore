@@ -162,3 +162,15 @@ cython_debug/
 wandb
 checkpoints
 results
+
+# macOS
+.DS_Store
+
+# Test logs and generated plots
+test_log/
+
+# VAE model checkpoints (large binary files)
+vae/model/*.pkl
+
+# GCS artifacts
+gcs_artifacts/
