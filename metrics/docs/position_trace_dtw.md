@@ -4,15 +4,16 @@
 
 ## What it measures
 
-How different the agent's navigation paths are in absolute grid coordinates. This captures the structural diversity of the agent's movement patterns -- whether it takes similar routes, visits similar areas, or follows fundamentally different paths.
+How different the agent's navigation paths are in terms of movement pattern. Positions are made relative to the agent's start position, making this metric **translation invariant** -- two agents taking the same shaped path from different starting positions will score as identical.
 
 ## How it works
 
 1. Truncate each position trace `(T, 2)` at the first `done=True` flag.
-2. Compute DTW between the two 2D position sequences using Euclidean distance as the pointwise cost.
-3. Normalize by dividing total warping path cost by path length.
+2. Subtract the start position from each trace (`pos -= pos[0]`), converting absolute coordinates to relative displacements from the agent's starting cell.
+3. Compute DTW between the two relative 2D position sequences using Euclidean distance as the pointwise cost.
+4. Normalize by dividing total warping path cost by path length.
 
-The cost between two positions is simply `||pos_a[i] - pos_b[j]||_2`, the Euclidean distance in grid-cell units. A cost of 1.0 means the positions are one cell apart; a cost of 5.0 means they are 5 cells apart.
+The cost between two relative positions is `||pos_a[i] - pos_b[j]||_2`, the Euclidean distance in grid-cell units. A cost of 1.0 means the relative positions are one cell apart; a cost of 5.0 means they are 5 cells apart.
 
 Complexity: `O(T1 * T2)` -- much faster than Observation DTW since positions are only 2D.
 
@@ -35,9 +36,9 @@ Complexity: `O(T1 * T2)` -- much faster than Observation DTW since positions are
 
 ## Relationship to other metrics
 
-- **vs Observation DTW:** Position DTW operates in absolute coordinates; Observation DTW operates in the agent's egocentric frame. Two levels can have high position DTW (agent goes to different places) but low observation DTW (the local wall patterns look similar). Conversely, the same position path through two different mazes would have low position DTW but potentially high observation DTW.
-- **vs Spatial Jaccard:** Position DTW preserves the temporal ordering and speed of traversal. Jaccard only cares about *which* cells were visited, not *when* or *in what order*. Position DTW will distinguish two trajectories that visit the same cells in reverse order; Jaccard will not.
-- **vs Value Correlation:** Position DTW captures the physical path; Value Correlation captures the agent's internal difficulty assessment along that path.
+- **vs Observation DTW:** Position DTW operates in start-relative coordinates; Observation DTW operates in the agent's egocentric frame. Two levels can have high position DTW (agent takes different shaped paths) but low observation DTW (the local wall patterns look similar). Conversely, the same movement pattern through two different mazes would have low position DTW but potentially high observation DTW.
+- **vs Spatial Jaccard:** Position DTW uses start-relative coordinates and preserves temporal ordering. Jaccard uses absolute coordinates and only cares about *which* cells were visited, not *when* or *in what order*. Two agents taking the same path from different starting positions would have low position DTW but potentially low Jaccard (different absolute cells).
+- **vs Value DTW:** Position DTW captures the physical path shape; Value DTW captures the agent's internal difficulty assessment along that path.
 
 ## Use cases
 

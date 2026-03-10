@@ -53,9 +53,9 @@ Complexity: `O(T)` -- the fastest metric. Set construction is linear in trajecto
 
 ## Relationship to other metrics
 
-- **vs Position DTW:** Position DTW preserves temporal ordering and traversal speed. Jaccard is a strict information reduction of the position trace -- it keeps only the set of unique cells. Use Position DTW when *how* the agent traverses matters; use Jaccard when only *where* matters.
+- **vs Position DTW:** Position DTW uses start-relative coordinates and preserves temporal ordering. Jaccard uses absolute coordinates and discards order. Two agents taking the same shaped path from different starting positions would have low Position DTW but potentially low Jaccard (different absolute cells). Conversely, two agents visiting the same cells in different order would have high Jaccard but potentially high Position DTW.
 - **vs Observation DTW:** Observation DTW operates in the agent's egocentric frame; Jaccard operates in absolute grid coordinates. Two levels with identical Jaccard scores can have very different observation DTW if the wall patterns around the shared cells differ.
-- **vs Value Correlation:** These are nearly orthogonal. Jaccard is purely spatial; Value Correlation is purely temporal. A pair with high Jaccard but low Value Correlation visits the same cells but with different difficulty progressions.
+- **vs Value DTW:** These are nearly orthogonal. Jaccard is purely spatial; Value DTW is purely temporal. A pair with high Jaccard but high Value DTW distance visits the same cells but with different difficulty progressions.
 
 ## Use cases
 

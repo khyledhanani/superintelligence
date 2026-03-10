@@ -7,7 +7,7 @@ All metrics truncate trajectories at the first `done=True` flag to compare only 
 ## Individual Metric Documentation
 
 1. [Observation Sequence DTW](observation_sequence_dtw.md) -- visual experience similarity via flattened egocentric observations
-2. [Position Trace DTW](position_trace_dtw.md) -- navigation path similarity in absolute grid coordinates
+2. [Position Trace DTW](position_trace_dtw.md) -- navigation path similarity in start-relative coordinates (translation invariant)
 3. [Value Trajectory DTW](value_trajectory_dtw.md) -- difficulty profile similarity via DTW on raw value sequences
 4. [Spatial Footprint Jaccard](spatial_footprint_jaccard.md) -- coarse visited-cell set overlap
 

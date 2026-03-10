@@ -77,11 +77,12 @@ def test_position_trace_dtw():
     result = position_trace_dtw(pos_a, dones_a, pos_b, dones_b)
     assert result["distance"] < 1e-6, f"Same path should give ~0 distance, got {result['distance']}"
 
-    pos_c = np.array([[5, 5], [5, 6], [6, 6], [7, 6], [7, 7], [8, 8]])
+    # Different shape: pos_a goes right then down, pos_c goes down then left
+    pos_c = np.array([[3, 3], [3, 4], [3, 5], [3, 6], [2, 6], [1, 6]])
     dones_c = np.array([False, False, False, False, False, True])
 
     result2 = position_trace_dtw(pos_a, dones_a, pos_c, dones_c)
-    assert result2["distance"] > 2.0, f"Different path should give high distance, got {result2['distance']}"
+    assert result2["distance"] > 0.5, f"Different-shape path should give non-trivial distance, got {result2['distance']}"
     print("PASS: position_trace_dtw")
 
 

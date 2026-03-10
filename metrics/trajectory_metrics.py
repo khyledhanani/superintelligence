@@ -143,6 +143,10 @@ def position_trace_dtw(pos_a: np.ndarray, dones_a: np.ndarray,
     pos_a = truncate_at_first_done(pos_a, dones_a).astype(np.float32)
     pos_b = truncate_at_first_done(pos_b, dones_b).astype(np.float32)
 
+    # Relative to start position (translation invariant)
+    pos_a = pos_a - pos_a[0]
+    pos_b = pos_b - pos_b[0]
+
     distance, path, local_costs = dtw_with_path(pos_a, pos_b)
     return {
         "distance": distance,
