@@ -1157,10 +1157,10 @@ def main(config=None, project="JAXUED_TEST"):
                 wandb.log(diversity_metrics)
                 obs_dtw = diversity_metrics.get('diversity/obs_dtw_distances/mean', float('nan'))
                 pos_dtw = diversity_metrics.get('diversity/pos_dtw_distances/mean', float('nan'))
-                val_corr = diversity_metrics.get('diversity/value_correlations/mean', float('nan'))
+                val_dtw = diversity_metrics.get('diversity/value_dtw_distances/mean', float('nan'))
                 jaccard = diversity_metrics.get('diversity/jaccard_indices/mean', float('nan'))
                 print(f"  [Diversity] obs_dtw={obs_dtw:.4f}, pos_dtw={pos_dtw:.4f}, "
-                      f"val_corr={val_corr:.4f}, jaccard={jaccard:.4f}")
+                      f"val_dtw={val_dtw:.4f}, jaccard={jaccard:.4f}")
 
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]

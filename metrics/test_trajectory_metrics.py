@@ -9,7 +9,7 @@ from trajectory_metrics import (
     dtw_with_path,
     observation_dtw,
     position_trace_dtw,
-    value_trajectory_correlation,
+    value_trajectory_dtw,
     spatial_footprint_jaccard,
     compute_pairwise_metrics,
 )
@@ -85,26 +85,27 @@ def test_position_trace_dtw():
     print("PASS: position_trace_dtw")
 
 
-def test_value_trajectory_correlation():
-    """Test value trajectory correlation."""
+def test_value_trajectory_dtw():
+    """Test value trajectory DTW."""
     values = np.linspace(0, 1, 20).astype(np.float64)
     dones = np.zeros(20, dtype=bool)
     dones[19] = True
 
-    result = value_trajectory_correlation(values, dones, values, dones)
-    assert abs(result["correlation"] - 1.0) < 1e-6, f"Same curves should correlate at ~1.0, got {result['correlation']}"
-    assert result["l2_distance"] < 1e-6, f"Same curves should have ~0 L2 distance, got {result['l2_distance']}"
+    result = value_trajectory_dtw(values, dones, values, dones)
+    assert result["distance"] < 1e-6, f"Same curves should have ~0 DTW distance, got {result['distance']}"
+    assert "local_costs" in result, "Should return local_costs from DTW"
+    assert "path" in result, "Should return warping path from DTW"
 
     values_inv = 1.0 - values
-    result2 = value_trajectory_correlation(values, dones, values_inv, dones)
-    assert result2["correlation"] < -0.9, f"Inverted curves should anti-correlate, got {result2['correlation']}"
+    result2 = value_trajectory_dtw(values, dones, values_inv, dones)
+    assert result2["distance"] > 0.1, f"Inverted curves should have non-zero DTW distance, got {result2['distance']}"
 
     values_const = np.ones(15) * 0.5
     dones_const = np.zeros(15, dtype=bool)
     dones_const[14] = True
-    result3 = value_trajectory_correlation(values, dones, values_const, dones_const)
-    assert result3["correlation"] == 0.0, f"Constant vs ramp should give 0 correlation, got {result3['correlation']}"
-    print("PASS: value_trajectory_correlation")
+    result3 = value_trajectory_dtw(values, dones, values_const, dones_const)
+    assert result3["distance"] > 0, f"Ramp vs constant should have non-zero DTW distance, got {result3['distance']}"
+    print("PASS: value_trajectory_dtw")
 
 
 def test_spatial_footprint_jaccard():
@@ -147,7 +148,7 @@ def test_compute_pairwise_metrics():
     n_pairs = 4 * 3 // 2  # 6 pairs
     assert len(pairwise["obs_dtw_distances"]) == n_pairs
     assert len(pairwise["pos_dtw_distances"]) == n_pairs
-    assert len(pairwise["value_correlations"]) == n_pairs
+    assert len(pairwise["value_dtw_distances"]) == n_pairs
     assert len(pairwise["jaccard_indices"]) == n_pairs
     print(f"PASS: compute_pairwise_metrics (obs_dtw_mean={pairwise['obs_dtw_distances'].mean():.4f}, "
           f"pos_dtw_mean={pairwise['pos_dtw_distances'].mean():.4f})")
@@ -173,7 +174,7 @@ if __name__ == "__main__":
     test_dtw_different_speeds()
     test_observation_dtw()
     test_position_trace_dtw()
-    test_value_trajectory_correlation()
+    test_value_trajectory_dtw()
     test_spatial_footprint_jaccard()
     test_compute_pairwise_metrics()
     test_truncation()

@@ -4,7 +4,7 @@ Trajectory-based diversity metrics for ACCEL replay buffer analysis.
 Four metrics that measure diversity from the agent's perspective:
 1. Observation Sequence DTW - ground truth of agent experience
 2. Position Trace DTW - navigation path structure
-3. Value Trajectory Correlation - difficulty fingerprint
+3. Value Trajectory DTW - difficulty fingerprint
 4. Spatial Footprint Jaccard - coarse set-based measure
 """
 
@@ -152,54 +152,36 @@ def position_trace_dtw(pos_a: np.ndarray, dones_a: np.ndarray,
 
 
 # ============================================================
-# Metric 3: Value Trajectory Correlation
+# Metric 3: Value Trajectory DTW
 # ============================================================
 
-def value_trajectory_correlation(values_a: np.ndarray, dones_a: np.ndarray,
-                                 values_b: np.ndarray, dones_b: np.ndarray,
-                                 num_points: int = 100) -> Dict:
-    """Compute correlation between two value trajectories.
+def value_trajectory_dtw(values_a: np.ndarray, dones_a: np.ndarray,
+                         values_b: np.ndarray, dones_b: np.ndarray) -> Dict:
+    """Compare two value trajectories using DTW.
 
-    Resamples both value curves to a fixed number of points via linear
-    interpolation, then computes Pearson correlation and L2 distance.
+    DTW captures shape, magnitude, and timing differences with a local cost
+    profile that an LLM can reason over directly.
 
     Args:
         values_a: (T1,) value estimates for trajectory A
         dones_a: (T1,) done flags for trajectory A
         values_b: (T2,) value estimates for trajectory B
         dones_b: (T2,) done flags for trajectory B
-        num_points: Number of interpolation points (default 100)
 
     Returns:
-        Dict with 'correlation' (Pearson r), 'l2_distance', 'resampled_a', 'resampled_b'
+        Dict with 'distance' (normalized DTW), 'path', 'local_costs'
     """
     values_a = truncate_at_first_done(values_a, dones_a).astype(np.float64)
     values_b = truncate_at_first_done(values_b, dones_b).astype(np.float64)
 
-    # Resample to fixed length
-    t_uniform = np.linspace(0, 1, num_points)
-    t_a = np.linspace(0, 1, len(values_a))
-    t_b = np.linspace(0, 1, len(values_b))
-    resampled_a = np.interp(t_uniform, t_a, values_a)
-    resampled_b = np.interp(t_uniform, t_b, values_b)
-
-    # Pearson correlation
-    std_a = np.std(resampled_a)
-    std_b = np.std(resampled_b)
-    if std_a < 1e-8 or std_b < 1e-8:
-        # Constant value trajectory — correlation undefined
-        correlation = 0.0
-    else:
-        correlation = float(np.corrcoef(resampled_a, resampled_b)[0, 1])
-
-    # L2 distance
-    l2_distance = float(np.sqrt(np.mean((resampled_a - resampled_b) ** 2)))
+    distance, path, local_costs = dtw_with_path(
+        values_a.reshape(-1, 1), values_b.reshape(-1, 1)
+    )
 
     return {
-        "correlation": correlation,
-        "l2_distance": l2_distance,
-        "resampled_a": resampled_a,
-        "resampled_b": resampled_b,
+        "distance": distance,
+        "path": path,
+        "local_costs": local_costs,
     }
 
 
@@ -259,15 +241,13 @@ def compute_pairwise_metrics(trajectories: list) -> Dict:
         Dict with arrays of pairwise metric values:
             'obs_dtw_distances': (N*(N-1)/2,)
             'pos_dtw_distances': (N*(N-1)/2,)
-            'value_correlations': (N*(N-1)/2,)
-            'value_l2_distances': (N*(N-1)/2,)
+            'value_dtw_distances': (N*(N-1)/2,)
             'jaccard_indices': (N*(N-1)/2,)
     """
     n = len(trajectories)
     obs_dtw_dists = []
     pos_dtw_dists = []
-    value_corrs = []
-    value_l2s = []
+    value_dtw_dists = []
     jaccards = []
 
     for i in range(n):
@@ -286,12 +266,11 @@ def compute_pairwise_metrics(trajectories: list) -> Dict:
             )
             pos_dtw_dists.append(pos_result["distance"])
 
-            val_result = value_trajectory_correlation(
+            val_result = value_trajectory_dtw(
                 ti["values"], ti["dones"],
                 tj["values"], tj["dones"],
             )
-            value_corrs.append(val_result["correlation"])
-            value_l2s.append(val_result["l2_distance"])
+            value_dtw_dists.append(val_result["distance"])
 
             jac_result = spatial_footprint_jaccard(
                 ti["positions"], ti["dones"],
@@ -302,7 +281,6 @@ def compute_pairwise_metrics(trajectories: list) -> Dict:
     return {
         "obs_dtw_distances": np.array(obs_dtw_dists),
         "pos_dtw_distances": np.array(pos_dtw_dists),
-        "value_correlations": np.array(value_corrs),
-        "value_l2_distances": np.array(value_l2s),
+        "value_dtw_distances": np.array(value_dtw_dists),
         "jaccard_indices": np.array(jaccards),
     }
