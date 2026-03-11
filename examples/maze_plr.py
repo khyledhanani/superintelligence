@@ -21,7 +21,7 @@ from jaxued.linen import ResetRNN
 from jaxued.environments import Maze, MazeRenderer
 from jaxued.environments.maze import Level, make_level_generator, make_level_mutator_minimax
 from jaxued.level_sampler import LevelSampler
-from jaxued.utils import compute_max_returns, max_mc, positive_value_loss
+from jaxued.utils import compute_max_returns, max_mc, positive_value_loss, accumulate_rollout_stats
 from jaxued.wrappers import AutoReplayWrapper
 import chex
 import yaml
@@ -438,13 +438,27 @@ def train_state_to_log_dict(train_state: TrainState, level_sampler: LevelSampler
         }
     }
 
+def mna_score(dones, advantages, incomplete_value=-jnp.inf):
+    """Maximum Novelty Approximation: mean of clipped negative advantages.
+
+    MNA = mean(-min(advantages, 0)) over the trajectory.
+    High score = agent performs worse than expected = novel/challenging level.
+    From: "Dynamic Environment Generation for UED" (Mead et al.)
+    """
+    mean_scores, _, episode_count = accumulate_rollout_stats(
+        dones, -jnp.minimum(advantages, 0), time_average=True
+    )
+    return jnp.where(episode_count > 0, mean_scores, incomplete_value)
+
 def compute_score(config, dones, values, max_returns, advantages):
-    """Compute regret-based scores (MaxMC or PVL). Used directly or as regret component for CENIE."""
+    """Compute regret-based scores (MaxMC, PVL, or MNA). Used directly or as regret component for CENIE."""
     if config['score_function'] in ("MaxMC", "cenie"):
         # CENIE uses MaxMC as its regret component
         return max_mc(dones, values, max_returns)
     elif config['score_function'] == "pvl":
         return positive_value_loss(dones, advantages)
+    elif config['score_function'] == "mna":
+        return mna_score(dones, advantages)
     elif config['score_function'] == "sfl":
         # SFL doesn't use regret-based scores; return zeros as placeholder
         # (actual SFL scores computed separately via multi-rollout eval)
@@ -468,6 +482,8 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("SFL")
     elif config.get("score_function") == "cenie":
         tags.append("CENIE")
+    elif config.get("score_function") == "mna":
+        tags.append("MNA")
     run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
     config = wandb.config
     
@@ -1612,7 +1628,7 @@ if __name__=="__main__":
     group.add_argument("--critic_coeff", type=float, default=0.5)
     # === PLR ===
     group.add_argument("--score_function", type=str, default="MaxMC",
-                       choices=["MaxMC", "pvl", "sfl", "cenie"],
+                       choices=["MaxMC", "pvl", "sfl", "cenie", "mna"],
                        help="Level scoring function: MaxMC (regret), pvl (positive value loss), "
                             "sfl (learnability p*(1-p)), cenie (novelty+regret)")
     group.add_argument("--num_sfl_rollouts", type=int, default=10,

@@ -10,6 +10,10 @@
 
 set -e
 
+# Prevent OpenBLAS thread explosion on high-core-count TPU VMs
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
 # --- Parse arguments ---
 METHOD="both"
 RUN_ACCEL=true
