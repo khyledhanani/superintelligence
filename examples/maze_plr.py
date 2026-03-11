@@ -673,11 +673,6 @@ def main(config=None, project="JAXUED_TEST"):
     else:
         cenie_gmm_init = None
 
-    def _add_to_cenie_buffer(obs_actions):
-        """Fire-and-forget callback to accumulate trajectory data in host buffer."""
-        if cenie_scorer is not None:
-            cenie_scorer.add_to_buffer(obs_actions)
-
     def _gmm_log_likelihood_diag(x, means, log_vars, log_weights):
         """Compute log p(x) under a diagonal-covariance GMM. Pure JAX.
 
@@ -705,14 +700,15 @@ def main(config=None, project="JAXUED_TEST"):
         return ranks.astype(jnp.float32)
 
     def compute_cenie_scores(obs, actions, regret_scores, cenie_params):
-        """Compute CENIE combined novelty+regret scores. Pure JAX, no host callbacks."""
+        """Compute CENIE combined novelty+regret scores. Pure JAX, zero callbacks.
+
+        Buffer accumulation happens via metrics pipeline (between eval steps on host).
+        Only the NLL scoring runs inside JIT.
+        """
         # Flatten obs to (T, N, D) and concatenate with actions
         obs_flat = obs.image.reshape(config["num_steps"], config["num_train_envs"], -1)
         actions_float = actions[..., None].astype(jnp.float32)
         obs_actions = jnp.concatenate([obs_flat, actions_float], axis=-1)  # (T, N, D)
-
-        # Fire-and-forget: send trajectory data to host buffer for GMM fitting
-        jax.debug.callback(_add_to_cenie_buffer, obs_actions)
 
         # Compute per-env novelty as mean NLL under GMM (pure JAX)
         means = cenie_params['means']
@@ -998,6 +994,12 @@ def main(config=None, project="JAXUED_TEST"):
                 # Mean norm of latent vectors (how far from origin)
                 metrics["cmaes/mean_z_norm"] = jnp.linalg.norm(z_population, axis=-1).mean()
 
+            # CENIE: pass subsampled obs_actions through metrics (no callbacks)
+            if config["score_function"] == "cenie":
+                obs_flat_last = obs.image[-1].reshape(config["num_train_envs"], -1)
+                act_last = actions[-1, ..., None].astype(jnp.float32)
+                metrics["cenie_sample"] = jnp.concatenate([obs_flat_last, act_last], axis=-1)  # (N, D)
+
             train_state = train_state.replace(
                 sampler=sampler,
                 update_state=UpdateState.DR,
@@ -1070,6 +1072,12 @@ def main(config=None, project="JAXUED_TEST"):
                 metrics["cmaes/sigma"] = jnp.float32(0.0)
                 metrics["cmaes/pop_spread"] = jnp.float32(0.0)
                 metrics["cmaes/mean_z_norm"] = jnp.float32(0.0)
+
+            # CENIE: pass subsampled obs_actions through metrics (no callbacks)
+            if config["score_function"] == "cenie":
+                obs_flat_last = obs.image[-1].reshape(config["num_train_envs"], -1)
+                act_last = actions[-1, ..., None].astype(jnp.float32)
+                metrics["cenie_sample"] = jnp.concatenate([obs_flat_last, act_last], axis=-1)
 
             train_state = train_state.replace(
                 sampler=sampler,
@@ -1150,6 +1158,12 @@ def main(config=None, project="JAXUED_TEST"):
                 metrics["cmaes/sigma"] = jnp.float32(0.0)
                 metrics["cmaes/pop_spread"] = jnp.float32(0.0)
                 metrics["cmaes/mean_z_norm"] = jnp.float32(0.0)
+
+            # CENIE: pass subsampled obs_actions through metrics (no callbacks)
+            if config["score_function"] == "cenie":
+                obs_flat_last = obs.image[-1].reshape(config["num_train_envs"], -1)
+                act_last = actions[-1, ..., None].astype(jnp.float32)
+                metrics["cenie_sample"] = jnp.concatenate([obs_flat_last, act_last], axis=-1)
 
             train_state = train_state.replace(
                 sampler=sampler,
@@ -1323,8 +1337,13 @@ def main(config=None, project="JAXUED_TEST"):
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
 
-        # CENIE: refit GMM between eval steps and inject updated params into train_state
+        # CENIE: accumulate obs_actions from metrics, refit GMM, inject params
         if config["score_function"] == "cenie" and cenie_scorer is not None:
+            # Extract subsampled obs_actions from metrics (stacked by scan: eval_freq x N x D)
+            if "cenie_sample" in metrics:
+                cenie_samples = np.asarray(metrics["cenie_sample"])  # (eval_freq, N, D)
+                # Reshape to (eval_freq * N, D) and add to buffer
+                cenie_scorer.add_to_buffer(cenie_samples.reshape(1, -1, cenie_samples.shape[-1]))
             if (eval_step + 1) % config["cenie_refit_interval"] == 0:
                 cenie_scorer.refit_gmm()
             if cenie_scorer.gmm is not None:
