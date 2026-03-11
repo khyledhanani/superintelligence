@@ -41,6 +41,7 @@ class TrainState(BaseTrainState):
     sampler: core.FrozenDict[str, chex.ArrayTree] = struct.field(pytree_node=True)
     update_state: UpdateState = struct.field(pytree_node=True)
     es_state: chex.ArrayTree = struct.field(pytree_node=True)
+    cenie_gmm_params: chex.ArrayTree = struct.field(pytree_node=True)
     # === Below is used for logging ===
     num_dr_updates: int
     num_replay_updates: int
@@ -649,8 +650,9 @@ def main(config=None, project="JAXUED_TEST"):
         p = all_successes.mean(axis=0)
         return p * (1 - p)
 
-    # --- CENIE: novelty + regret scoring ---
+    # --- CENIE: novelty + regret scoring (pure JAX) ---
     cenie_scorer = None
+    cenie_obs_act_dim = config["agent_view_size"] ** 2 * 3 + 1  # flattened obs image + 1 action
     if config["score_function"] == "cenie":
         cenie_scorer = CENIEScorer(
             buffer_size=config["cenie_buffer_size"],
@@ -659,23 +661,86 @@ def main(config=None, project="JAXUED_TEST"):
             temperature=config["temperature"],
         )
 
-    def compute_cenie_scores(obs, actions, regret_scores):
-        """Compute CENIE combined novelty+regret scores via io_callback."""
+    # Initialize CENIE GMM params (placeholder zeros; updated on host between eval steps)
+    if config["score_function"] == "cenie":
+        cenie_gmm_init = {
+            'means': jnp.zeros((config["cenie_num_components"], cenie_obs_act_dim)),
+            'log_vars': jnp.zeros((config["cenie_num_components"], cenie_obs_act_dim)),
+            'log_weights': jnp.full((config["cenie_num_components"],),
+                                     -jnp.log(config["cenie_num_components"])),  # uniform
+            'fitted': jnp.bool_(False),
+        }
+    else:
+        cenie_gmm_init = None
+
+    def _add_to_cenie_buffer(obs_actions):
+        """Fire-and-forget callback to accumulate trajectory data in host buffer."""
+        if cenie_scorer is not None:
+            cenie_scorer.add_to_buffer(obs_actions)
+
+    def _gmm_log_likelihood_diag(x, means, log_vars, log_weights):
+        """Compute log p(x) under a diagonal-covariance GMM. Pure JAX.
+
+        Args:
+            x: (D,) single data point
+            means: (K, D) component means
+            log_vars: (K, D) log-variances per component
+            log_weights: (K,) log mixing weights (log-normalized)
+        Returns:
+            scalar log p(x)
+        """
+        diff = x[None, :] - means  # (K, D)
+        inv_vars = jnp.exp(-log_vars)  # (K, D)
+        D = means.shape[1]
+        log_norm = -0.5 * (D * jnp.log(2 * jnp.pi) + log_vars.sum(axis=-1))  # (K,)
+        log_exp = -0.5 * (diff ** 2 * inv_vars).sum(axis=-1)  # (K,)
+        return jax.scipy.special.logsumexp(log_weights + log_norm + log_exp)
+
+    def _jax_rankdata(scores):
+        """Rank scores descending (highest score = rank 1). Pure JAX."""
+        order = jnp.argsort(-scores)
+        ranks = jnp.zeros_like(order).at[order].set(jnp.arange(1, scores.shape[0] + 1))
+        return ranks.astype(jnp.float32)
+
+    def compute_cenie_scores(obs, actions, regret_scores, cenie_params):
+        """Compute CENIE combined novelty+regret scores. Pure JAX, no host callbacks."""
         # Flatten obs to (T, N, D) and concatenate with actions
         obs_flat = obs.image.reshape(config["num_steps"], config["num_train_envs"], -1)
         actions_float = actions[..., None].astype(jnp.float32)
-        obs_actions = jnp.concatenate([obs_flat, actions_float], axis=-1)
+        obs_actions = jnp.concatenate([obs_flat, actions_float], axis=-1)  # (T, N, D)
 
-        # Use io_callback for host-side computation that returns values
-        def _cenie_host_fn(obs_actions, regret_scores):
-            cenie_scorer.add_to_buffer(obs_actions)
-            return cenie_scorer.compute_combined_score(obs_actions, regret_scores)
+        # Fire-and-forget: send trajectory data to host buffer for GMM fitting
+        jax.debug.callback(_add_to_cenie_buffer, obs_actions)
 
-        return jax.experimental.io_callback(
-            _cenie_host_fn,
-            jax.ShapeDtypeStruct((config["num_train_envs"],), jnp.float32),
-            obs_actions, regret_scores,
-        )
+        # Compute per-env novelty as mean NLL under GMM (pure JAX)
+        means = cenie_params['means']
+        log_vars = cenie_params['log_vars']
+        log_weights = cenie_params['log_weights']
+        fitted = cenie_params['fitted']
+
+        # Compute NLL for each (timestep, env) pair, then average over timesteps per env
+        T, N, D = config["num_steps"], config["num_train_envs"], cenie_obs_act_dim
+        flat_points = obs_actions.reshape(-1, D)  # (T*N, D)
+        nll_flat = -jax.vmap(
+            lambda x: _gmm_log_likelihood_diag(x, means, log_vars, log_weights)
+        )(flat_points)  # (T*N,)
+        nll_per_env = nll_flat.reshape(T, N).mean(axis=0)  # (N,)
+
+        # Rank-based combination (CENIE Eq. 4-5)
+        alpha = config["cenie_alpha"]
+        temperature = config["temperature"]
+        r_regret = _jax_rankdata(regret_scores)
+        r_novelty = _jax_rankdata(nll_per_env)
+
+        p_r = (1.0 / r_regret) ** (1.0 / temperature)
+        p_r = p_r / p_r.sum()
+        p_n = (1.0 / r_novelty) ** (1.0 / temperature)
+        p_n = p_n / p_n.sum()
+
+        combined = alpha * p_n + (1 - alpha) * p_r
+
+        # If GMM not fitted yet, fall back to pure regret
+        return jnp.where(fitted, combined, regret_scores)
 
     def compute_level_scores(rng, train_state, levels, obs, actions,
                              dones, values, max_returns, advantages):
@@ -684,7 +749,7 @@ def main(config=None, project="JAXUED_TEST"):
             return compute_sfl_scores(rng, train_state, levels, max_returns)
         elif config["score_function"] == "cenie":
             regret_scores = compute_score(config, dones, values, max_returns, advantages)
-            return compute_cenie_scores(obs, actions, regret_scores)
+            return compute_cenie_scores(obs, actions, regret_scores, train_state.cenie_gmm_params)
         else:
             return compute_score(config, dones, values, max_returns, advantages)
 
@@ -754,6 +819,7 @@ def main(config=None, project="JAXUED_TEST"):
             sampler=sampler,
             update_state=0,
             es_state=es_state_init,
+            cenie_gmm_params=cenie_gmm_init,
             num_dr_updates=0,
             num_replay_updates=0,
             num_mutation_updates=0,
@@ -1255,10 +1321,15 @@ def main(config=None, project="JAXUED_TEST"):
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
 
-        # CENIE: refit GMM between eval steps
+        # CENIE: refit GMM between eval steps and inject updated params into train_state
         if config["score_function"] == "cenie" and cenie_scorer is not None:
             if (eval_step + 1) % config["cenie_refit_interval"] == 0:
                 cenie_scorer.refit_gmm()
+            if cenie_scorer.gmm is not None:
+                new_gmm_params = cenie_scorer.get_jax_params(config["cenie_num_components"])
+                rng_cur, ts_cur = runner_state
+                ts_cur = ts_cur.replace(cenie_gmm_params=new_gmm_params)
+                runner_state = (rng_cur, ts_cur)
 
         # Periodic buffer dump at configured intervals
         updates_so_far = (eval_step + 1) * config["eval_freq"]

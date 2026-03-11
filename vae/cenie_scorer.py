@@ -7,13 +7,14 @@ Implements the novelty scoring component from:
 
 Maintains a FIFO buffer of (state, action) pairs from training trajectories.
 Periodically fits a diagonal-covariance GMM on the buffer.
-Scores new levels by the average negative log-likelihood of their trajectory
-under the GMM (higher NLL = more novel experience).
+GMM parameters are extracted as JAX arrays for pure-JAX NLL computation
+inside the JIT'd training loop (avoids host callbacks that segfault on TPU).
 
 The final score combines novelty and regret via rank-based weighting:
   P_replay = alpha * P_novelty + (1 - alpha) * P_regret
 """
 import numpy as np
+import jax.numpy as jnp
 
 
 class CENIEScorer:
@@ -56,6 +57,36 @@ class CENIEScorer:
         self.gmm.fit(data)
         print(f"[CENIE] GMM refit: {n_components} components, {len(data)} samples, "
               f"buffer={len(self.buffer)}/{self.buffer_size}")
+
+    def get_jax_params(self, max_components):
+        """Extract fitted GMM parameters as JAX arrays for pure-JAX NLL computation.
+
+        Args:
+            max_components: Fixed array size (padded if GMM has fewer components).
+
+        Returns:
+            Dict with 'means' (K, D), 'log_vars' (K, D), 'log_weights' (K,), 'fitted' (bool).
+        """
+        if self.gmm is None:
+            return None
+        K_actual = self.gmm.n_components
+        D = self.gmm.means_.shape[1]
+        K = max_components
+
+        means = np.zeros((K, D), dtype=np.float32)
+        log_vars = np.zeros((K, D), dtype=np.float32)
+        log_weights = np.full(K, -1e10, dtype=np.float32)  # near-zero weight for padding
+
+        means[:K_actual] = self.gmm.means_
+        log_vars[:K_actual] = np.log(self.gmm.covariances_ + 1e-30)
+        log_weights[:K_actual] = np.log(self.gmm.weights_ + 1e-30)
+
+        return {
+            'means': jnp.array(means),
+            'log_vars': jnp.array(log_vars),
+            'log_weights': jnp.array(log_weights),
+            'fitted': jnp.bool_(True),
+        }
 
     def compute_combined_score(self, obs_actions, regret_scores):
         """Compute CENIE combined score: alpha * novelty_rank + (1-alpha) * regret_rank.
