@@ -39,7 +39,9 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. `level.to_str()` visual output confirms goal and agent are placed at non-wall cells and their coordinates are not row/col inverted
   3. A batch of 1000 random-z decodes produces zero goal-agent collisions (same flat index) and zero wall-cell placements
   4. `jax.jit(decode_latent_to_levels_grid)` compiles and runs without error (JIT compatibility confirmed)
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 02-01-PLAN.md — Implement vae/cnn_vae_level_utils.py with decode_latent_to_levels_grid (GRID-01..08)
+- [ ] 02-02-PLAN.md — Write and run scripts/test_grid_adapter.py verifying all GRID-01..09 against real checkpoint
 
 ### Phase 3: Integration
 **Goal**: CNN-VAE is the default decode path in `maze_plr.py`, CluttrVAE fallback is preserved, and a 1000-step CMA-ES run passes with no errors and acceptable valid-structure rate
@@ -70,6 +72,6 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Checkpoint | 1/1 | Complete | 2026-03-11 |
-| 2. Grid Adapter | 0/? | Not started | - |
+| 2. Grid Adapter | 0/2 | Not started | - |
 | 3. Integration | 0/? | Not started | - |
 | 4. Experiment | 0/? | Not started | - |
