@@ -10,7 +10,7 @@ Requires: jax_env conda environment, CNN-VAE checkpoint at vae/checkpoints/cnn_v
 import sys
 import os
 
-PROJECT_ROOT = '/cs/student/project_msc/2025/csml/gmaralla/superintelligence'
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 import jax
