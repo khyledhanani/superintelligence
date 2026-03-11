@@ -52,7 +52,9 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. `python examples/maze_plr.py --use_cmaes --use_clutr_vae` launches with original CluttrVAE token decoder and completes without error
   3. A 1000-step CMA-ES run with CNN-VAE decoder completes with `cmaes/valid_structure_pct > 90%` and no NaN fitness values logged to WandB
   4. BFS solvability check confirms generated levels are navigable (at least one path from agent to goal exists)
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 03-01-PLAN.md — Add --use_clutr_vae flag, CNN-VAE conditional setup block, and decode dispatch in maze_plr.py
+- [ ] 03-02-PLAN.md — Write and run scripts/smoke_test_integration.py (VALD-01/03/04) + 1000-step CMA-ES run (VALD-02)
 
 ### Phase 4: Experiment
 **Goal**: A full 20k-update CNN-VAE CMA-ES vs ACCEL comparison run completes and results are logged to WandB for write-up
@@ -73,5 +75,5 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Checkpoint | 1/1 | Complete | 2026-03-11 |
 | 2. Grid Adapter | 2/2 | Complete | 2026-03-11 |
-| 3. Integration | 0/? | Not started | - |
+| 3. Integration | 0/2 | Not started | - |
 | 4. Experiment | 0/? | Not started | - |
