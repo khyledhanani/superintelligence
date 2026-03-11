@@ -1,3 +1,6 @@
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+
 import json
 import time
 from typing import Sequence, Tuple
