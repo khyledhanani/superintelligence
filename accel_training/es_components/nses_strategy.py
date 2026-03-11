@@ -93,6 +93,7 @@ class NSESStrategy:
         alpha: float,
         beta: float,
         k: int = 5,
+        candidate_valid: jnp.ndarray | None = None,
     ) -> tuple[dict, float]:
         """Update ES state using composite fitness F = alpha*regret + beta*novelty.
 
@@ -112,6 +113,9 @@ class NSESStrategy:
             alpha:          float — weight for regret component.
             beta:           float — weight for novelty component.
             k:              int — number of nearest neighbors for novelty (default 5).
+            candidate_valid: (pop_size,) bool or None — True for valid candidates.
+                            Invalid candidates receive worst composite fitness so
+                            CMA-ES ranks them last.
 
         Returns:
             (new_state, mean_novelty_float) where:
@@ -127,6 +131,12 @@ class NSESStrategy:
 
         # Step 2: compute composite fitness F = alpha*regret + beta*novelty.
         composite = compute_fitness_batch(regrets, novelties, alpha=alpha, beta=beta)
+
+        # Step 2b: validity masking — penalize invalid candidates.
+        # composite is "higher = better". Invalid get -10.0 (worst).
+        # After negation: invalid → +10.0 = worst for evosax minimizer.
+        if candidate_valid is not None:
+            composite = jnp.where(candidate_valid, composite, -10.0)
 
         # Step 3: negate for evosax (which minimizes; we want to MAXIMIZE composite).
         fitness_for_evosax = -composite

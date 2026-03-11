@@ -1,0 +1,43 @@
+{
+  "accel": [
+    {
+      "step": 0,
+      "mean_solve_rate": 0.0,
+      "mean_return": 0.0,
+      "per_level": {
+        "SixteenRooms": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        },
+        "SixteenRooms2": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        },
+        "Labyrinth": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        },
+        "LabyrinthFlipped": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        },
+        "Labyrinth2": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        },
+        "StandardMaze": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        },
+        "StandardMaze2": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        },
+        "StandardMaze3": {
+          "solve_rate": 0.0,
+          "mean_return": 0.0
+        }
+      }
+    }
+  ]
+}

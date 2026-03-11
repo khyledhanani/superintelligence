@@ -1,0 +1,10 @@
+n_samples: 10000
+temperature: 0.25
+vae_checkpoint: vae/model/vae_runs_20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0_checkpoints_checkpoint_980000.pkl
+pct_solvable: 98.37
+pct_complex: 87.53
+pct_valid: 85.93
+n_unique_valid: 8593
+mean_shortest_path: 9.245704991359155
+median_shortest_path: 9.0
+mean_obstacles: 28.112184336087513

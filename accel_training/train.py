@@ -134,14 +134,14 @@ def train(config):
         group=config.get("wandb_group", "phase5-comparison"),
         tags=[config.get("es_strategy", "cma_es").upper()],
     )
-    wandb.define_metric("update")
+    wandb.define_metric("num_updates")
     for key in ["regret", "novelty_score", "replay_buffer_size", "buffer_occupied",
                 "valid_fraction", "mean_buffer_score"]:
-        wandb.define_metric(key, step_metric="update")
+        wandb.define_metric(key, step_metric="num_updates")
     for key in ["sv_behavior_dist_pre", "sv_behavior_dist_post"]:
-        wandb.define_metric(key, step_metric="update")
-    wandb.define_metric("solve_rate/*", step_metric="update")
-    wandb.define_metric("return/*", step_metric="update")
+        wandb.define_metric(key, step_metric="num_updates")
+    wandb.define_metric("solve_rate/*", step_metric="num_updates")
+    wandb.define_metric("return/*", step_metric="num_updates")
 
     # Paper benchmark levels for solve-rate eval (matches maze_plr.py dashboard)
     BENCHMARK_NAMES = [
@@ -150,17 +150,28 @@ def train(config):
     ]
     benchmark_levels = Level.load_prefabs(BENCHMARK_NAMES)
 
+    N_EVAL_ATTEMPTS = 10  # match maze_plr.py: average over multiple stochastic rollouts
+
     @jax.jit
     def eval_on_benchmark(rng, agent_params):
-        """Evaluate agent on 8-level DCD paper benchmark. Returns (solve_rates, mean_returns)."""
-        rewards, _, _ = rollout_agent_on_levels(
-            rng, env, env_params, agent_params, network,
-            benchmark_levels, num_steps=config["num_steps"],
-        )
-        # rewards: (num_steps, 8) — agent gets +1 on goal, 0 otherwise
-        cumulative = rewards.sum(axis=0)          # (8,)
-        solve_rates = (cumulative > 0).astype(jnp.float32)  # (8,)
-        return solve_rates, cumulative
+        """Evaluate agent on 8-level DCD paper benchmark (stochastic, multi-attempt).
+
+        Matches maze_plr.py evaluation protocol: N stochastic rollouts averaged.
+        """
+        def _single_eval(rng_i):
+            rewards, _, _ = rollout_agent_on_levels(
+                rng_i, env, env_params, agent_params, network,
+                benchmark_levels, num_steps=config["num_steps"],
+                deterministic=False,  # stochastic sampling, same as maze_plr.py
+            )
+            cumulative = rewards.sum(axis=0)  # (8,)
+            return cumulative
+
+        rngs = jax.random.split(rng, N_EVAL_ATTEMPTS)
+        all_cum = jax.vmap(_single_eval)(rngs)             # (N_EVAL_ATTEMPTS, 8)
+        solve_rates = (all_cum > 0).astype(jnp.float32).mean(axis=0)  # (8,)
+        mean_returns = all_cum.mean(axis=0)                 # (8,)
+        return solve_rates, mean_returns
     mean_novelty = 0.0           # tracked per-step for NS-ES
     sv_behavior_dist_pre = 0.0   # tracked per-step for SV-CMA-ES
     sv_behavior_dist_post = 0.0  # tracked per-step for SV-CMA-ES
@@ -636,6 +647,7 @@ def train(config):
     print("-" * 80)
 
     n_restarts = 0  # CMA-ES restart counter
+    restart_history = []  # track convergence points for anti-clustering restarts
 
     for update in range(config["num_updates"]):
         t_start = time.time()
@@ -662,19 +674,48 @@ def train(config):
                 mean_novelty, sv_behavior_dist_pre, sv_behavior_dist_post,
             ) = _run_es_step(rng, train_state, es_state)
 
-            # CMA-ES restart: when sigma collapses, re-init from a new random mean.
-            # This prevents premature convergence to a single latent region.
+            # CMA-ES restart: when sigma collapses, re-init with anti-clustering.
+            # Instead of random normal, pick a new mean that is far from all
+            # previous convergence points (explores different VAE regions).
             if es_strategy_name == "cma_es":
                 restart_threshold = config.get("cma_restart_threshold", 0.01)
                 if float(es_state["es_state"].std) < restart_threshold:
                     rng, rng_restart = jax.random.split(rng)
                     sigma_init = config.get("es_sigma_init", 0.5)
-                    new_mean = jax.random.normal(rng_restart, (latent_dim_es,)) * sigma_init
+
+                    # Record where CMA-ES converged before restarting
+                    converged_mean = np.asarray(es_state["es_state"].mean)
+                    restart_history.append(converged_mean)
+
+                    # Anti-clustering restart: sample K candidates, pick the one
+                    # farthest from all previous convergence points.
+                    K_CANDIDATES = 50
+                    candidates = jax.random.normal(
+                        rng_restart, (K_CANDIDATES, latent_dim_es)
+                    ) * sigma_init * 2.0  # sample wider than sigma_init
+                    candidates_np = np.asarray(candidates)
+                    if len(restart_history) > 0:
+                        history_arr = np.stack(restart_history)  # (n_prev, dim)
+                        # Min distance from each candidate to any previous convergence point
+                        dists = np.array([
+                            np.min(np.linalg.norm(history_arr - c, axis=1))
+                            for c in candidates_np
+                        ])
+                        best_idx = int(np.argmax(dists))
+                        new_mean = candidates[best_idx]
+                        min_dist = float(dists[best_idx])
+                    else:
+                        new_mean = candidates[0]
+                        min_dist = float('inf')
+
                     es_state = es_strategy.init_state(
                         rng_restart, {**config, "mean": new_mean, "sigma_init": sigma_init}
                     )
                     n_restarts += 1
-                    print(f"  [update {update}] CMA-ES restart #{n_restarts} (sigma collapsed)")
+                    new_norm = float(jnp.linalg.norm(new_mean))
+                    print(f"  [update {update}] CMA-ES restart #{n_restarts} "
+                          f"(sigma collapsed -> anti-cluster: ||new_mean||={new_norm:.2f}, "
+                          f"dist_to_nearest_prev={min_dist:.2f})")
 
         # =======================================================
         # REPLAY branch
@@ -729,7 +770,7 @@ def train(config):
 
         if (update + 1) % config.get("wandb_log_freq", 10) == 0:
             log_dict = {
-                "update":                update,
+                "num_updates":           update,
                 "regret":                mean_regret,
                 "novelty_score":         mean_novelty,
                 "replay_buffer_size":    buf_size,
@@ -742,6 +783,8 @@ def train(config):
             }
             if es_strategy_name == "cma_es":
                 log_dict["es/n_restarts"] = n_restarts
+                if len(restart_history) > 0:
+                    log_dict["es/restart_history_size"] = len(restart_history)
             # ES state scalar metrics (only meaningful after an es_step)
             if mode == "es_step":
                 if es_strategy_name in ("cma_es", "ns_es"):

@@ -69,14 +69,13 @@ $PYTHON accel_training/train.py --config $CONFIG \
 echo "SV-CMA-ES complete."
 echo ""
 
-# Step 5: ACCEL baseline (examples/maze_plr.py as-is)
-# NOTE: ACCEL baseline uses its own config. Its WandB run_name
-# must be set via the script's own config or renamed manually in WandB.
+# Step 5: ACCEL baseline (vanilla maze_plr.py, matched hyperparameters)
 echo "=== Step 5: ACCEL Baseline (20k updates) ==="
-echo "Running examples/maze_plr.py (black-box, no modifications)."
-echo "NOTE: ACCEL baseline WandB run name and group are controlled by maze_plr.py's own config."
-echo "You may need to rename/tag the run in WandB UI afterward for group filtering."
-$PYTHON examples/maze_plr.py
+$PYTHON examples/maze_plr.py \
+  --run_name accel-baseline \
+  --project es-accel \
+  --seed $SEED \
+  --num_updates $UPDATES
 echo "ACCEL baseline complete."
 echo ""
 

@@ -54,11 +54,10 @@ def compute_stein_repulsion(
 
     # Median heuristic bandwidth.
     # Use log(N+1) so the denominator is always >= log(2) > 0 for any N >= 1.
-    # jnp.maximum floor prevents h=0 when all bsigs identical (median_sq = 0).
-    h = jnp.maximum(
-        jnp.median(sq_dists_b) / jnp.log(N_f + 1.0),
-        1e-8,
-    )
+    # NaN-safe: if bsigs contain NaN, median is NaN → fall back to h=1.0.
+    median_sq = jnp.median(sq_dists_b)
+    h_raw = median_sq / jnp.log(N_f + 1.0)
+    h = jnp.where(jnp.isfinite(h_raw), jnp.maximum(h_raw, 1e-8), 1.0)
 
     # RBF kernel matrix: K[i,j] = exp(-||bsig_i - bsig_j||^2 / h)
     K = jnp.exp(-sq_dists_b / h)                           # (N, N)
@@ -74,7 +73,9 @@ def compute_stein_repulsion(
         K_rowsum[:, None] * means - K @ means
     )  # (N, param_dim)
 
-    return epsilon * repulsion
+    delta = epsilon * repulsion
+    # NaN guard: if any repulsion component is non-finite, zero it out
+    return jnp.where(jnp.isfinite(delta), delta, 0.0)
 
 
 def mean_pairwise_behavior_dist(bsigs: jnp.ndarray) -> float:
