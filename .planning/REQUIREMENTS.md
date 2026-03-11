@@ -15,14 +15,14 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Grid-to-Level Adapter
 
-- [ ] **GRID-01**: Wall map derived from wall logits: `wall_map = sigmoid(wall_logits) > 0.5` (threshold at logit=0)
-- [ ] **GRID-02**: Goal/agent logits masked at wall positions (set to -1e9) before argmax to prevent placement on walls
-- [ ] **GRID-03**: Goal position computed from masked argmax: `flat_idx → (x=col=flat%13, y=row=flat//13)`
-- [ ] **GRID-04**: Agent position computed from masked argmax with same coordinate transform
-- [ ] **GRID-05**: Goal/agent collision resolved when argmax produces same flat index
-- [ ] **GRID-06**: Wall cells cleared at goal/agent positions (ensure `wall_map[row, col] = False`)
-- [ ] **GRID-07**: Agent direction randomized (0-3) per sample using provided RNG key
-- [ ] **GRID-08**: `decode_latent_to_levels_grid()` is JIT-compatible via `jax.vmap` over single-sample function
+- [x] **GRID-01**: Wall map derived from wall logits: `wall_map = sigmoid(wall_logits) > 0.5` (threshold at logit=0)
+- [x] **GRID-02**: Goal/agent logits masked at wall positions (set to -1e9) before argmax to prevent placement on walls
+- [x] **GRID-03**: Goal position computed from masked argmax: `flat_idx → (x=col=flat%13, y=row=flat//13)`
+- [x] **GRID-04**: Agent position computed from masked argmax with same coordinate transform
+- [x] **GRID-05**: Goal/agent collision resolved when argmax produces same flat index
+- [x] **GRID-06**: Wall cells cleared at goal/agent positions (ensure `wall_map[row, col] = False`)
+- [x] **GRID-07**: Agent direction randomized (0-3) per sample using provided RNG key
+- [x] **GRID-08**: `decode_latent_to_levels_grid()` is JIT-compatible via `jax.vmap` over single-sample function
 - [ ] **GRID-09**: Generated levels pass `Level.is_well_formatted()` validation
 
 ### Training Integration
@@ -75,14 +75,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CKPT-01 | Phase 1 | Pending |
 | CKPT-02 | Phase 1 | Pending |
 | CKPT-03 | Phase 1 | Pending |
-| GRID-01 | Phase 2 | Pending |
-| GRID-02 | Phase 2 | Pending |
-| GRID-03 | Phase 2 | Pending |
-| GRID-04 | Phase 2 | Pending |
-| GRID-05 | Phase 2 | Pending |
-| GRID-06 | Phase 2 | Pending |
-| GRID-07 | Phase 2 | Pending |
-| GRID-08 | Phase 2 | Pending |
+| GRID-01 | Phase 2 | Complete |
+| GRID-02 | Phase 2 | Complete |
+| GRID-03 | Phase 2 | Complete |
+| GRID-04 | Phase 2 | Complete |
+| GRID-05 | Phase 2 | Complete |
+| GRID-06 | Phase 2 | Complete |
+| GRID-07 | Phase 2 | Complete |
+| GRID-08 | Phase 2 | Complete |
 | GRID-09 | Phase 2 | Pending |
 | INTG-01 | Phase 3 | Pending |
 | INTG-02 | Phase 3 | Pending |
