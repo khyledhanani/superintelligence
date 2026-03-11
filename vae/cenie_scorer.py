@@ -13,6 +13,9 @@ inside the JIT'd training loop (avoids host callbacks that segfault on TPU).
 The final score combines novelty and regret via rank-based weighting:
   P_replay = alpha * P_novelty + (1 - alpha) * P_regret
 """
+import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+
 import numpy as np
 import jax.numpy as jnp
 
