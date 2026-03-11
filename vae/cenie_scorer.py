@@ -75,17 +75,21 @@ class CENIEScorer:
             print(f"[CENIE] Skipping GMM refit: {self._buf_count} < {min_samples} samples")
             return
         from sklearn.mixture import GaussianMixture
-        data = self._buffer[:self._buf_count]
+        data = self._buffer[:self._buf_count].astype(np.float64)
         n_components = min(self.n_components, self._buf_count // 20)
-        self.gmm = GaussianMixture(
-            n_components=n_components,
-            covariance_type='diag',
-            max_iter=100,
-            random_state=42,
-        )
-        self.gmm.fit(data)
-        print(f"[CENIE] GMM refit: {n_components} components, {len(data)} samples, "
-              f"buffer={self._buf_count}/{self.buffer_size}")
+        try:
+            self.gmm = GaussianMixture(
+                n_components=n_components,
+                covariance_type='diag',
+                max_iter=100,
+                reg_covar=1e-4,
+                random_state=42,
+            )
+            self.gmm.fit(data)
+            print(f"[CENIE] GMM refit: {n_components} components, {len(data)} samples, "
+                  f"buffer={self._buf_count}/{self.buffer_size}")
+        except ValueError as e:
+            print(f"[CENIE] GMM refit failed ({e}), keeping previous model")
 
     def get_jax_params(self, max_components):
         """Extract fitted GMM parameters as JAX arrays for pure-JAX NLL computation.
