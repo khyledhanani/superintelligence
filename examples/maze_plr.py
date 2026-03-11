@@ -604,7 +604,7 @@ def main(config=None, project="JAXUED_TEST"):
         train_success = (max_returns > 0).astype(jnp.float32)
 
         # Additional eval rollouts using the unwrapped env
-        def sfl_eval_step(_, rng_eval):
+        def sfl_eval_step(carry, rng_eval):
             rng_r, rng_e = jax.random.split(rng_eval)
             init_obs_e, init_env_state_e = jax.vmap(eval_env.reset_to_level, (0, 0, None))(
                 jax.random.split(rng_r, config["num_train_envs"]), levels, env_params)
@@ -614,10 +614,10 @@ def main(config=None, project="JAXUED_TEST"):
                 init_obs_e, init_env_state_e,
                 env_params.max_steps_in_episode)
             success = (rewards_e.sum(axis=0) > 0).astype(jnp.float32)
-            return _, success
+            return carry, success
 
         eval_rngs = jax.random.split(rng, config["num_sfl_rollouts"] - 1)
-        _, eval_successes = jax.lax.scan(sfl_eval_step, None, eval_rngs)
+        _, eval_successes = jax.lax.scan(sfl_eval_step, jnp.int32(0), eval_rngs)
 
         # Combine training rollout + eval rollouts
         all_successes = jnp.concatenate([train_success[None], eval_successes], axis=0)
