@@ -458,6 +458,8 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("PLR")
     if config.get("use_cmaes"):
         tags.append("CMA-ES")
+    if config.get("use_dred"):
+        tags.append("DRED")
     if config.get("score_function") == "sfl":
         tags.append("SFL")
     elif config.get("score_function") == "cenie":
@@ -475,13 +477,17 @@ def main(config=None, project="JAXUED_TEST"):
     wandb.define_metric("gen/*", step_metric="num_updates")
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
+    if config.get("use_dred"):
+        wandb.define_metric("dred/*", step_metric="num_updates")
 
-    # --- CMA-ES + VAE setup ---
+    # --- VAE setup (shared by CMA-ES and DRED) ---
     vae_decode_fn = None
+    vae_encode_fn = None
     cmaes_mgr = None
-    if config["use_cmaes"]:
-        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes"
-        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes"
+    _needs_vae = config["use_cmaes"] or config.get("use_dred")
+    if _needs_vae:
+        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes or --use_dred"
+        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes or --use_dred"
 
         # Load VAE config
         with open(config["vae_config_path"]) as f:
@@ -504,6 +510,12 @@ def main(config=None, project="JAXUED_TEST"):
         def vae_decode_fn(z):
             return vae.apply({"params": vae_params}, z, method=vae.decode)
 
+        # Build pure encode function: tokens (batch, seq_len) -> (mean, logvar)
+        def vae_encode_fn(tokens):
+            return vae.apply({"params": vae_params}, tokens, train=False, method=vae.encode)
+
+    # --- CMA-ES setup ---
+    if config["use_cmaes"]:
         # Initialize CMA-ES manager
         cmaes_mgr = CMAESManager(
             popsize=config["num_train_envs"],
@@ -512,6 +524,10 @@ def main(config=None, project="JAXUED_TEST"):
         )
         print(f"[CMA-ES] VAE loaded from {config['vae_checkpoint_path']}")
         print(f"[CMA-ES] latent_dim={vae_cfg['latent_dim']}, popsize={config['num_train_envs']}")
+
+    if config.get("use_dred"):
+        print(f"[DRED] VAE loaded from {config['vae_checkpoint_path']}")
+        print(f"[DRED] latent_dim={vae_cfg['latent_dim']}, interpolation-based level generation")
 
     def log_eval(stats, train_state_info):
         print(f"Logging update: {stats['update_count']}")
@@ -557,6 +573,15 @@ def main(config=None, project="JAXUED_TEST"):
             if gen_mask.any():
                 log_dict["gen/valid_structure_pct"] = float(valid_pct[gen_mask].mean())
 
+
+        # DRED metrics (averaged over the eval_freq training steps)
+        if config.get("use_dred") and "dred/valid_structure_pct" in stats:
+            valid_pct = np.array(stats["dred/valid_structure_pct"])
+            dr_mask = valid_pct > 0
+            if dr_mask.any():
+                log_dict["dred/valid_structure_pct"] = float(valid_pct[dr_mask].mean())
+                log_dict["dred/solvable_pct"] = float(np.array(stats["dred/solvable_pct"])[dr_mask].mean())
+                log_dict["dred/mean_score"] = float(np.array(stats["dred/mean_score"])[dr_mask].mean())
 
         # CMA-ES metrics (averaged over the eval_freq training steps)
         if config.get("use_cmaes") and "cmaes/valid_structure_pct" in stats:
@@ -635,18 +660,19 @@ def main(config=None, project="JAXUED_TEST"):
         )
 
     def compute_cenie_scores(obs, actions, regret_scores):
-        """Compute CENIE combined novelty+regret scores via host callback."""
+        """Compute CENIE combined novelty+regret scores via io_callback."""
         # Flatten obs to (T, N, D) and concatenate with actions
         obs_flat = obs.image.reshape(config["num_steps"], config["num_train_envs"], -1)
         actions_float = actions[..., None].astype(jnp.float32)
         obs_actions = jnp.concatenate([obs_flat, actions_float], axis=-1)
 
-        # Update coverage buffer (side effect)
-        jax.debug.callback(cenie_scorer.add_to_buffer, obs_actions)
+        # Use io_callback for host-side computation that returns values
+        def _cenie_host_fn(obs_actions, regret_scores):
+            cenie_scorer.add_to_buffer(obs_actions)
+            return cenie_scorer.compute_combined_score(obs_actions, regret_scores)
 
-        # Compute combined scores via pure callback
-        return jax.pure_callback(
-            cenie_scorer.compute_combined_score,
+        return jax.experimental.io_callback(
+            _cenie_host_fn,
             jax.ShapeDtypeStruct((config["num_train_envs"],), jnp.float32),
             obs_actions, regret_scores,
         )
@@ -758,6 +784,52 @@ def main(config=None, project="JAXUED_TEST"):
                 rng, rng_ask, rng_decode = jax.random.split(rng, 3)
                 z_population, es_state = cmaes_mgr.ask(rng_ask, es_state)
                 new_levels = decode_latent_to_levels(vae_decode_fn, z_population, rng_decode)
+            elif config.get("use_dred"):
+                # DRED: interpolate pairs from buffer in VAE latent space
+                # Fall back to random generation if buffer has < 2 levels
+                def dred_interpolate(rng):
+                    rng, rng_idx_a, rng_idx_b, rng_alpha, rng_z, rng_decode = jax.random.split(rng, 6)
+                    N = config["num_train_envs"]
+                    buf_size = jnp.maximum(sampler["size"], 1)
+
+                    # Sample two sets of indices for pairs
+                    idx_a = jax.random.randint(rng_idx_a, (N,), 0, buf_size)
+                    idx_b = jax.random.randint(rng_idx_b, (N,), 0, buf_size)
+
+                    # Extract levels and convert to tokens
+                    levels_a = jax.tree_util.tree_map(lambda x: x[idx_a], sampler["levels"])
+                    levels_b = jax.tree_util.tree_map(lambda x: x[idx_b], sampler["levels"])
+                    tokens_a = jax.vmap(level_to_tokens)(levels_a)  # (N, 52)
+                    tokens_b = jax.vmap(level_to_tokens)(levels_b)  # (N, 52)
+
+                    # Encode to latent space
+                    mean_a, logvar_a = vae_encode_fn(tokens_a)  # each (N, 64)
+                    mean_b, logvar_b = vae_encode_fn(tokens_b)  # each (N, 64)
+
+                    # Random interpolation coefficient per pair
+                    alpha = jax.random.uniform(rng_alpha, (N, 1))
+
+                    # Interpolate latent distributions
+                    mean_interp = alpha * mean_a + (1 - alpha) * mean_b
+                    logvar_interp = alpha * logvar_a + (1 - alpha) * logvar_b
+
+                    # Sample from interpolated distribution
+                    std_interp = jnp.exp(0.5 * logvar_interp)
+                    eps = jax.random.normal(rng_z, mean_interp.shape)
+                    z = mean_interp + eps * std_interp
+
+                    return decode_latent_to_levels(vae_decode_fn, z, rng_decode)
+
+                def random_generate(rng):
+                    return jax.vmap(sample_random_level)(jax.random.split(rng, config["num_train_envs"]))
+
+                rng, rng_gen = jax.random.split(rng)
+                new_levels = jax.lax.cond(
+                    sampler["size"] >= 2,
+                    dred_interpolate,
+                    random_generate,
+                    rng_gen,
+                )
             else:
                 new_levels = jax.vmap(sample_random_level)(jax.random.split(rng_levels, config["num_train_envs"]))
 
@@ -807,6 +879,11 @@ def main(config=None, project="JAXUED_TEST"):
                     fresh_es_state, es_state
                 )
 
+            # DRED: only insert solvable levels (agent got positive reward at least once)
+            if config.get("use_dred"):
+                is_solvable = max_returns > 0
+                scores = jnp.where(is_solvable, scores, -jnp.inf)
+
             sampler, _ = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
 
             # Update: train_state only modified if exploratory_grad_updates is on
@@ -833,6 +910,13 @@ def main(config=None, project="JAXUED_TEST"):
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid.mean() * 100,
             }
+
+            # DRED monitoring metrics
+            if config.get("use_dred"):
+                is_solvable = max_returns > 0
+                metrics["dred/valid_structure_pct"] = is_valid.mean() * 100
+                metrics["dred/solvable_pct"] = is_solvable.mean() * 100
+                metrics["dred/mean_score"] = scores.mean()
 
             # CMA-ES monitoring metrics
             if config["use_cmaes"]:
@@ -907,6 +991,10 @@ def main(config=None, project="JAXUED_TEST"):
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": jnp.float32(0.0),  # no new levels generated
             }
+            if config.get("use_dred"):
+                metrics["dred/valid_structure_pct"] = jnp.float32(0.0)
+                metrics["dred/solvable_pct"] = jnp.float32(0.0)
+                metrics["dred/mean_score"] = jnp.float32(0.0)
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
                 metrics["cmaes/mean_fitness"] = jnp.float32(0.0)
@@ -923,7 +1011,7 @@ def main(config=None, project="JAXUED_TEST"):
                 replay_last_level_batch=levels,
             )
             return (rng, train_state), metrics
-        
+
         def on_mutate_levels(rng: chex.PRNGKey, train_state: TrainState):
             """
                 This mutates the previous batch of replay levels and potentially adds them to the level buffer.
@@ -983,6 +1071,10 @@ def main(config=None, project="JAXUED_TEST"):
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid_mut.mean() * 100,
             }
+            if config.get("use_dred"):
+                metrics["dred/valid_structure_pct"] = jnp.float32(0.0)
+                metrics["dred/solvable_pct"] = jnp.float32(0.0)
+                metrics["dred/mean_score"] = jnp.float32(0.0)
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
                 metrics["cmaes/mean_fitness"] = jnp.float32(0.0)
@@ -1454,6 +1546,9 @@ if __name__=="__main__":
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)
+    # === DRED CONFIG ===
+    group.add_argument("--use_dred", action=argparse.BooleanOptionalAction, default=False,
+                       help="Use DRED: generate new levels by interpolating buffer levels in VAE latent space")
     # === CMA-ES + VAE CONFIG ===
     group.add_argument("--use_cmaes", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--vae_checkpoint_path", type=str, default=None,
