@@ -23,7 +23,7 @@ Requirements for initial release. Each maps to roadmap phases.
 - [x] **GRID-06**: Wall cells cleared at goal/agent positions (ensure `wall_map[row, col] = False`)
 - [x] **GRID-07**: Agent direction randomized (0-3) per sample using provided RNG key
 - [x] **GRID-08**: `decode_latent_to_levels_grid()` is JIT-compatible via `jax.vmap` over single-sample function
-- [ ] **GRID-09**: Generated levels pass `Level.is_well_formatted()` validation
+- [x] **GRID-09**: Generated levels pass `Level.is_well_formatted()` validation
 
 ### Training Integration
 
@@ -83,7 +83,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | GRID-06 | Phase 2 | Complete |
 | GRID-07 | Phase 2 | Complete |
 | GRID-08 | Phase 2 | Complete |
-| GRID-09 | Phase 2 | Pending |
+| GRID-09 | Phase 2 | Complete |
 | INTG-01 | Phase 3 | Pending |
 | INTG-02 | Phase 3 | Pending |
 | INTG-03 | Phase 3 | Pending |
@@ -103,4 +103,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-03-11*
-*Last updated: 2026-03-11 — traceability filled after roadmap creation*
+*Last updated: 2026-03-11 — GRID-09 marked complete after scripts/test_grid_adapter.py verified all GRID-01..09 pass*

@@ -13,7 +13,7 @@ Four sequential phases that take the project from zero code to a running 20k-upd
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Checkpoint** - Download CNN-VAE checkpoint from GCS and verify decoder param tree
-- [ ] **Phase 2: Grid Adapter** - Implement and unit-test `decode_latent_to_levels_grid()` in isolation
+- [x] **Phase 2: Grid Adapter** - Implement and unit-test `decode_latent_to_levels_grid()` in isolation
 - [ ] **Phase 3: Integration** - Wire CNN-VAE as default decoder in `maze_plr.py` and pass smoke tests
 - [ ] **Phase 4: Experiment** - Launch 20k-update CNN-VAE CMA-ES vs ACCEL comparison run
 
@@ -40,8 +40,8 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A batch of 1000 random-z decodes produces zero goal-agent collisions (same flat index) and zero wall-cell placements
   4. `jax.jit(decode_latent_to_levels_grid)` compiles and runs without error (JIT compatibility confirmed)
 **Plans**: 2 plans
-- [ ] 02-01-PLAN.md — Implement vae/cnn_vae_level_utils.py with decode_latent_to_levels_grid (GRID-01..08)
-- [ ] 02-02-PLAN.md — Write and run scripts/test_grid_adapter.py verifying all GRID-01..09 against real checkpoint
+- [x] 02-01-PLAN.md — Implement vae/cnn_vae_level_utils.py with decode_latent_to_levels_grid (GRID-01..08)
+- [x] 02-02-PLAN.md — Write and run scripts/test_grid_adapter.py verifying all GRID-01..09 against real checkpoint
 
 ### Phase 3: Integration
 **Goal**: CNN-VAE is the default decode path in `maze_plr.py`, CluttrVAE fallback is preserved, and a 1000-step CMA-ES run passes with no errors and acceptable valid-structure rate
@@ -72,6 +72,6 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Checkpoint | 1/1 | Complete | 2026-03-11 |
-| 2. Grid Adapter | 1/2 | In Progress|  |
+| 2. Grid Adapter | 2/2 | Complete | 2026-03-11 |
 | 3. Integration | 0/? | Not started | - |
 | 4. Experiment | 0/? | Not started | - |
