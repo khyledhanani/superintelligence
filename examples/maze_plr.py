@@ -690,9 +690,11 @@ def main(config=None, project="JAXUED_TEST"):
             scalar log p(x)
         """
         diff = x[None, :] - means  # (K, D)
-        inv_vars = jnp.exp(-log_vars)  # (K, D)
+        # Clip log_vars for numerical stability: var in [exp(-20), exp(20)]
+        log_vars_safe = jnp.clip(log_vars, -20.0, 20.0)
+        inv_vars = jnp.exp(-log_vars_safe)  # (K, D)
         D = means.shape[1]
-        log_norm = -0.5 * (D * jnp.log(2 * jnp.pi) + log_vars.sum(axis=-1))  # (K,)
+        log_norm = -0.5 * (D * jnp.log(2 * jnp.pi) + log_vars_safe.sum(axis=-1))  # (K,)
         log_exp = -0.5 * (diff ** 2 * inv_vars).sum(axis=-1)  # (K,)
         return jax.scipy.special.logsumexp(log_weights + log_norm + log_exp)
 
