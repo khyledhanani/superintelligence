@@ -35,6 +35,8 @@ from vae_model import CluttrVAE
 from vae_level_utils import decode_latent_to_levels, level_to_tokens
 from cmaes_manager import CMAESManager
 from cenie_scorer import CENIEScorer
+from cnn_vae_model import CnnLstmDecoder
+from cnn_vae_level_utils import decode_latent_to_levels_grid
 
 class UpdateState(IntEnum):
     DR = 0
@@ -504,16 +506,36 @@ def main(config=None, project="JAXUED_TEST"):
     vae_decode_fn = None
     vae_encode_fn = None
     cmaes_mgr = None
+    _cnn_vae_latent_dim = 64  # CnnLstmDecoder has no YAML config; latent_dim is fixed
     _needs_vae = config["use_cmaes"] or config.get("use_dred")
-    if _needs_vae:
-        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes or --use_dred"
-        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes or --use_dred"
 
-        # Load VAE config
+    if _needs_vae and not config.get("use_clutr_vae"):
+        # CNN-VAE path (default when --use_cmaes without --use_clutr_vae)
+        _ckpt_abs = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vae', 'checkpoints', 'cnn_vae', 'default')
+        )
+        _checkpointer = ocp.PyTreeCheckpointer()
+        _restored = _checkpointer.restore(_ckpt_abs)
+        _decoder_params = _restored["params"]["decoder"]
+        _decoder = CnnLstmDecoder(latent_dim=_cnn_vae_latent_dim)
+
+        def vae_decode_fn(z):
+            # z: (latent_dim,) unbatched — CnnLstmDecoder expects (B, latent_dim)
+            z_batched = z[None]                                    # (1, latent_dim)
+            wl, gl, al = _decoder.apply({"params": _decoder_params}, z_batched)
+            return wl[0], gl[0], al[0]                            # each (13, 13)
+
+        print(f"[CMA-ES] CNN-VAE loaded from {_ckpt_abs}")
+        print(f"[CMA-ES] latent_dim={_cnn_vae_latent_dim}, popsize={config['num_train_envs']}")
+
+    elif _needs_vae and config.get("use_clutr_vae"):
+        # CluttrVAE path (fallback — requires --vae_checkpoint_path and --vae_config_path)
+        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required with --use_clutr_vae"
+        assert config["vae_config_path"] is not None, "--vae_config_path required with --use_clutr_vae"
+
         with open(config["vae_config_path"]) as f:
             vae_cfg = yaml.safe_load(f)
 
-        # Instantiate model with config dimensions
         vae = CluttrVAE(
             vocab_size=vae_cfg["vocab_size"],
             embed_dim=vae_cfg["embed_dim"],
@@ -521,33 +543,31 @@ def main(config=None, project="JAXUED_TEST"):
             seq_len=vae_cfg["seq_len"],
         )
 
-        # Load checkpoint
         with open(config["vae_checkpoint_path"], "rb") as f:
             vae_ckpt = pickle.load(f)
         vae_params = vae_ckpt["params"] if isinstance(vae_ckpt, dict) and "params" in vae_ckpt else vae_ckpt
 
-        # Build pure decode function: z (latent_dim,) -> logits (seq_len, vocab_size)
         def vae_decode_fn(z):
             return vae.apply({"params": vae_params}, z, method=vae.decode)
 
-        # Build pure encode function: tokens (batch, seq_len) -> (mean, logvar)
         def vae_encode_fn(tokens):
             return vae.apply({"params": vae_params}, tokens, train=False, method=vae.encode)
 
-    # --- CMA-ES setup ---
-    if config["use_cmaes"]:
-        # Initialize CMA-ES manager
-        cmaes_mgr = CMAESManager(
-            popsize=config["num_train_envs"],
-            latent_dim=vae_cfg["latent_dim"],
-            sigma_init=config["cmaes_sigma_init"],
-        )
-        print(f"[CMA-ES] VAE loaded from {config['vae_checkpoint_path']}")
+        print(f"[CMA-ES] CluttrVAE loaded from {config['vae_checkpoint_path']}")
         print(f"[CMA-ES] latent_dim={vae_cfg['latent_dim']}, popsize={config['num_train_envs']}")
 
+    # --- CMA-ES setup ---
+    if config["use_cmaes"]:
+        _latent_dim_for_cmaes = _cnn_vae_latent_dim if not config.get("use_clutr_vae") else vae_cfg["latent_dim"]
+        cmaes_mgr = CMAESManager(
+            popsize=config["num_train_envs"],
+            latent_dim=_latent_dim_for_cmaes,
+            sigma_init=config["cmaes_sigma_init"],
+        )
+
     if config.get("use_dred"):
-        print(f"[DRED] VAE loaded from {config['vae_checkpoint_path']}")
-        print(f"[DRED] latent_dim={vae_cfg['latent_dim']}, interpolation-based level generation")
+        _latent_str = str(_cnn_vae_latent_dim) if not config.get("use_clutr_vae") else str(vae_cfg["latent_dim"])
+        print(f"[DRED] latent_dim={_latent_str}, interpolation-based level generation")
 
     def log_eval(stats, train_state_info):
         print(f"Logging update: {stats['update_count']}")
@@ -866,7 +886,11 @@ def main(config=None, project="JAXUED_TEST"):
                 # CMA-ES: ask for candidate latent vectors, decode to levels
                 rng, rng_ask, rng_decode = jax.random.split(rng, 3)
                 z_population, es_state = cmaes_mgr.ask(rng_ask, es_state)
-                new_levels = decode_latent_to_levels(vae_decode_fn, z_population, rng_decode)
+                if config.get("use_clutr_vae"):
+                    new_levels = decode_latent_to_levels(vae_decode_fn, z_population, rng_decode)
+                else:
+                    # CNN-VAE default: grid-based decoder
+                    new_levels = decode_latent_to_levels_grid(vae_decode_fn, z_population, rng_decode)
             elif config.get("use_dred"):
                 # DRED: interpolate pairs from buffer in VAE latent space
                 # Fall back to random generation if buffer has < 2 levels
@@ -1492,7 +1516,7 @@ def main(config=None, project="JAXUED_TEST"):
         print(f"[Plot] Skipped rendering: {e}")
 
     # === Post-training: PCA of buffer snapshots in VAE latent space ===
-    if vae_decode_fn is not None:
+    if vae_decode_fn is not None and config.get("use_clutr_vae"):
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -1662,6 +1686,9 @@ if __name__=="__main__":
                        help="Use DRED: generate new levels by interpolating buffer levels in VAE latent space")
     # === CMA-ES + VAE CONFIG ===
     group.add_argument("--use_cmaes", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument("--use_clutr_vae", action=argparse.BooleanOptionalAction, default=False,
+                       help="Use original CluttrVAE token decoder instead of CNN-VAE "
+                            "(requires --vae_checkpoint_path and --vae_config_path)")
     group.add_argument("--vae_checkpoint_path", type=str, default=None,
                        help="Path to VAE .pkl checkpoint file")
     group.add_argument("--vae_config_path", type=str, default=None,
