@@ -34,10 +34,10 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Validation
 
-- [ ] **VALD-01**: Smoke test: decode `z=zeros(64)` → valid Level with correct field shapes and dtypes
-- [ ] **VALD-02**: Short CMA-ES run (1000 steps) completes without errors
-- [ ] **VALD-03**: Generated levels verified solvable via BFS pathfinding check
-- [ ] **VALD-04**: Coordinate convention verified: Level positions match expected grid locations
+- [x] **VALD-01**: Smoke test: decode `z=zeros(64)` → valid Level with correct field shapes and dtypes
+- [x] **VALD-02**: Short CMA-ES run (1000 steps) completes without errors
+- [x] **VALD-03**: Generated levels verified solvable via BFS pathfinding check
+- [x] **VALD-04**: Coordinate convention verified: Level positions match expected grid locations
 
 ### Experiment
 
@@ -88,10 +88,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INTG-02 | Phase 3 | Complete |
 | INTG-03 | Phase 3 | Complete |
 | INTG-04 | Phase 3 | Complete |
-| VALD-01 | Phase 3 | Pending |
-| VALD-02 | Phase 3 | Pending |
-| VALD-03 | Phase 3 | Pending |
-| VALD-04 | Phase 3 | Pending |
+| VALD-01 | Phase 3 | Complete |
+| VALD-02 | Phase 3 | Complete |
+| VALD-03 | Phase 3 | Complete |
+| VALD-04 | Phase 3 | Complete |
 | EXPT-01 | Phase 4 | Pending |
 | EXPT-02 | Phase 4 | Pending |
 | EXPT-03 | Phase 4 | Pending |

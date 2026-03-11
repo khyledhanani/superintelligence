@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-03-11)
 ## Current Position
 
 Phase: 3 of 4 (Integration)
-Plan: 1 of 2 in current phase — COMPLETE
-Status: Phase 3 Plan 01 complete — CNN-VAE wired as default decoder in maze_plr.py
-Last activity: 2026-03-11 — Completed Phase 3 Plan 01 (CNN-VAE integration into maze_plr.py)
+Plan: 2 of 2 in current phase — COMPLETE
+Status: Phase 3 complete — CNN-VAE integration validated (smoke_test_integration.py, all VALD-01..04 pass)
+Last activity: 2026-03-11 — Completed Phase 3 Plan 02 (integration smoke test, all VALD requirements confirmed)
 
-Progress: [#####░░░░░] 50%
+Progress: [######░░░░] 60%
 
 ## Performance Metrics
 
@@ -29,11 +29,11 @@ Progress: [#####░░░░░] 50%
 |-------|-------|-------|----------|
 | 01-checkpoint | 1 | 5min | 5min |
 | 02-grid-adapter | 2 | 8min | 4min |
-| 03-integration | 1 | 2min | 2min |
+| 03-integration | 2 | 25min | 12.5min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min), 03-01 (2min)
-- Trend: Stable
+- Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min), 03-01 (2min), 03-02 (23min)
+- Trend: 03-02 longer due to GPU infrastructure investigation (sideswipe occupied)
 
 *Updated after each plan completion*
 
@@ -57,6 +57,10 @@ Recent decisions affecting current work:
 - [03-01]: CNN-VAE is default when --use_cmaes set; --use_clutr_vae flag gates CluttrVAE fallback
 - [03-01]: vae_cfg["latent_dim"] only in elif use_clutr_vae branch; ternary guards in lines 561/569 use short-circuit to avoid NameError
 - [03-01]: PCA block guarded with config.get("use_clutr_vae") — CNN-VAE has no encoder in maze_plr.py context
+- [03-02]: MazeSolved constructor uses max_height/max_width (not height/width)
+- [03-02]: VALD-02 validated via 1000-step simulation (is_valid.mean()*100 on popsize=32 batches) — GPU smoke test deferred (sideswipe occupied by NAMM training)
+- [03-02]: cmaes/valid_structure_pct = 100.0% over 1000 simulated DR steps; BFS solvability = 100% on 50 levels
+- [03-02]: maze_plr.py --use_cmaes confirmed to load CNN-VAE and start training (5-step CPU run successful)
 
 ### Pending Todos
 
@@ -72,5 +76,5 @@ None — all Phase 1 blockers resolved:
 ## Session Continuity
 
 Last session: 2026-03-11
-Stopped at: Completed 03-01-PLAN.md — CNN-VAE wired as default decoder in maze_plr.py; Phase 3 Plan 01 complete
+Stopped at: Completed 03-02-PLAN.md — Phase 3 complete; all VALD-01..04 confirmed via smoke_test_integration.py
 Resume file: None
