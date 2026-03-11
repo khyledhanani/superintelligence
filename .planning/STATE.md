@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-11)
 
 **Core value:** CMA-ES with CNN-VAE produces valid, solvable maze Levels and runs a complete 20k training experiment comparable to the ACCEL baseline.
-**Current focus:** Phase 2 — Grid Adapter
+**Current focus:** Phase 3 — Integration
 
 ## Current Position
 
-Phase: 2 of 4 (Grid Adapter)
-Plan: 2 of 2 in current phase — COMPLETE
-Status: Phase 2 complete, ready for Phase 3
-Last activity: 2026-03-11 — Completed Phase 2 Plan 02 (GRID-01..09 verification script)
+Phase: 3 of 4 (Integration)
+Plan: 1 of 2 in current phase — COMPLETE
+Status: Phase 3 Plan 01 complete — CNN-VAE wired as default decoder in maze_plr.py
+Last activity: 2026-03-11 — Completed Phase 3 Plan 01 (CNN-VAE integration into maze_plr.py)
 
-Progress: [####░░░░░░] 40%
+Progress: [#####░░░░░] 50%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
-- Average duration: 4.3min
-- Total execution time: 0.22 hours
+- Total plans completed: 4
+- Average duration: 3.75min
+- Total execution time: 0.25 hours
 
 **By Phase:**
 
@@ -29,9 +29,10 @@ Progress: [####░░░░░░] 40%
 |-------|-------|-------|----------|
 | 01-checkpoint | 1 | 5min | 5min |
 | 02-grid-adapter | 2 | 8min | 4min |
+| 03-integration | 1 | 2min | 2min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min)
+- Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min), 03-01 (2min)
 - Trend: Stable
 
 *Updated after each plan completion*
@@ -53,6 +54,9 @@ Recent decisions affecting current work:
 - [02-01]: decode_fn is a static argument in JIT — use jax.jit(decode_latent_to_levels_grid, static_argnums=(0,)) or functools.partial
 - [02-01]: Deterministic argmax (not stochastic sampling) for goal/agent placement ensures CMA-ES fitness is reproducible
 - [02-02]: JIT static_argnums=(0,) required for decode_fn Python callable — confirmed passing all GRID-01..09 on 1000-sample batch
+- [03-01]: CNN-VAE is default when --use_cmaes set; --use_clutr_vae flag gates CluttrVAE fallback
+- [03-01]: vae_cfg["latent_dim"] only in elif use_clutr_vae branch; ternary guards in lines 561/569 use short-circuit to avoid NameError
+- [03-01]: PCA block guarded with config.get("use_clutr_vae") — CNN-VAE has no encoder in maze_plr.py context
 
 ### Pending Todos
 
@@ -68,5 +72,5 @@ None — all Phase 1 blockers resolved:
 ## Session Continuity
 
 Last session: 2026-03-11
-Stopped at: Completed 02-02-PLAN.md — scripts/test_grid_adapter.py verified all GRID-01..09, Phase 2 complete
+Stopped at: Completed 03-01-PLAN.md — CNN-VAE wired as default decoder in maze_plr.py; Phase 3 Plan 01 complete
 Resume file: None

@@ -27,10 +27,10 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Training Integration
 
-- [ ] **INTG-01**: CNN-VAE is the default decoder path in `examples/maze_plr.py` when `use_cmaes=True`
-- [ ] **INTG-02**: `--use_clutr_vae` flag falls back to original CluttrVAE token-based decoder
-- [ ] **INTG-03**: CluttrVAE path remains fully functional (no breaking changes)
-- [ ] **INTG-04**: `decode_latent_to_levels_grid()` drops into existing CMA-ES ask/decode/tell loop
+- [x] **INTG-01**: CNN-VAE is the default decoder path in `examples/maze_plr.py` when `use_cmaes=True`
+- [x] **INTG-02**: `--use_clutr_vae` flag falls back to original CluttrVAE token-based decoder
+- [x] **INTG-03**: CluttrVAE path remains fully functional (no breaking changes)
+- [x] **INTG-04**: `decode_latent_to_levels_grid()` drops into existing CMA-ES ask/decode/tell loop
 
 ### Validation
 
@@ -84,10 +84,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | GRID-07 | Phase 2 | Complete |
 | GRID-08 | Phase 2 | Complete |
 | GRID-09 | Phase 2 | Complete |
-| INTG-01 | Phase 3 | Pending |
-| INTG-02 | Phase 3 | Pending |
-| INTG-03 | Phase 3 | Pending |
-| INTG-04 | Phase 3 | Pending |
+| INTG-01 | Phase 3 | Complete |
+| INTG-02 | Phase 3 | Complete |
+| INTG-03 | Phase 3 | Complete |
+| INTG-04 | Phase 3 | Complete |
 | VALD-01 | Phase 3 | Pending |
 | VALD-02 | Phase 3 | Pending |
 | VALD-03 | Phase 3 | Pending |
