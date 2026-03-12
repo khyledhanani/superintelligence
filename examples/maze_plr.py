@@ -32,7 +32,7 @@ from enum import IntEnum
 # VAE + CMA-ES imports (conditional on --use_cmaes flag)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vae'))
 from vae_model import CluttrVAE
-from vae_level_utils import decode_latent_to_levels, level_to_tokens
+from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_level
 from cmaes_manager import CMAESManager
 from cenie_scorer import CENIEScorer
 
@@ -1481,8 +1481,73 @@ def main(config=None, project="JAXUED_TEST"):
     rng_init, rng_train = jax.random.split(rng)
     
     train_state = create_train_state(rng_init)
+
+    # --- Warm-start: load agent params and/or buffer from a previous run ---
+    if config.get("warmstart_checkpoint"):
+        print(f"[Warmstart] Loading agent params from {config['warmstart_checkpoint']}...")
+        ws_manager = ocp.CheckpointManager(
+            config["warmstart_checkpoint"],
+            item_handlers=ocp.StandardCheckpointHandler(),
+        )
+        ws_step = ws_manager.latest_step()
+        ws_ckpt = ws_manager.restore(ws_step)
+        ws_params = ws_ckpt["params"] if isinstance(ws_ckpt, dict) and "params" in ws_ckpt else ws_ckpt.params
+        train_state = train_state.replace(params=ws_params)
+        print(f"[Warmstart] Loaded agent params from step {ws_step}")
+
+    if config.get("warmstart_buffer"):
+        print(f"[Warmstart] Loading buffer from {config['warmstart_buffer']}...")
+        ws_buf = np.load(config["warmstart_buffer"], allow_pickle=True)
+        ws_tokens = ws_buf["tokens"]  # (N, 52)
+        ws_scores = ws_buf["scores"]  # (N,)
+        ws_size = int(ws_buf["size"])
+        print(f"[Warmstart] Buffer has {ws_size} levels")
+
+        # Convert tokens back to levels and insert into sampler in batches
+        ws_levels = jax.vmap(tokens_to_level)(jnp.array(ws_tokens))
+        sampler = train_state.sampler
+        batch_sz = config["num_train_envs"]
+        for start in range(0, ws_size, batch_sz):
+            end = min(start + batch_sz, ws_size)
+            batch_levels = jax.tree_util.tree_map(lambda x: x[start:end], ws_levels)
+            batch_scores = jnp.array(ws_scores[start:end])
+            # Pad to batch_sz if last batch is smaller
+            if end - start < batch_sz:
+                pad = batch_sz - (end - start)
+                batch_levels = jax.tree_util.tree_map(
+                    lambda x: jnp.concatenate([x, jnp.repeat(x[:1], pad, axis=0)]), batch_levels)
+                batch_scores = jnp.concatenate([batch_scores, jnp.full(pad, -jnp.inf)])
+            batch_max_returns = jnp.zeros(batch_sz)
+            sampler, _ = level_sampler.insert_batch(sampler, batch_levels, batch_scores, {"max_return": batch_max_returns})
+        train_state = train_state.replace(sampler=sampler)
+        print(f"[Warmstart] Inserted {ws_size} levels into buffer")
+
+        # If PCA is enabled, refit PCA on the warm-start buffer
+        if use_pca and vae_encode_fn is not None:
+            print(f"[Warmstart] Refitting PCA on {ws_size} buffer levels...")
+            ws_means = encode_levels_to_means(vae_encode_fn, jnp.array(ws_tokens))
+            ws_pca_mean, ws_pca_components = fit_pca(ws_means, config["cmaes_pca_dims"])
+            train_state = train_state.replace(
+                pca_mean=ws_pca_mean,
+                pca_components=ws_pca_components,
+            )
+            # Reset CMA-ES for the new PCA basis
+            new_es = cmaes_mgr.initialize(jax.random.PRNGKey(999))
+            train_state = train_state.replace(es_state=new_es)
+            print(f"[Warmstart] PCA refit on buffer, CMA-ES reset")
+
+    # Apply update counter offset for wandb continuity
+    if config.get("warmstart_updates", 0) > 0:
+        offset = config["warmstart_updates"]
+        train_state = train_state.replace(
+            num_dr_updates=train_state.num_dr_updates + offset,
+            num_replay_updates=train_state.num_replay_updates,
+            num_mutation_updates=train_state.num_mutation_updates,
+        )
+        print(f"[Warmstart] Update counter offset by {offset} (wandb starts at {offset})")
+
     runner_state = (rng_train, train_state)
-    
+
     def dump_buffer(train_state, update_num):
         """Save PLR buffer as .npy (VAE token format) + .npz (full metadata). Uploads to GCS."""
         sampler = train_state.sampler
@@ -1888,6 +1953,13 @@ if __name__=="__main__":
                        help="Path to .npy token file for PCA fitting. Falls back to --cmaes_kl_data or random levels.")
     group.add_argument("--cmaes_pca_refit_interval", type=int, default=0,
                        help="Refit PCA every N eval steps using buffer + random levels (0 = never, static PCA)")
+    group.add_argument("--warmstart_checkpoint", type=str, default=None,
+                       help="Path to Orbax checkpoint dir to warm-start agent params from (e.g. checkpoints/run/0/models)")
+    group.add_argument("--warmstart_buffer", type=str, default=None,
+                       help="Path to buffer dump .npz to warm-start PLR buffer from. "
+                            "If PCA is enabled, PCA is fit on these buffer levels.")
+    group.add_argument("--warmstart_updates", type=int, default=0,
+                       help="Offset for update counter so wandb logs continue from this step")
     group.add_argument("--save_cmaes_populations", action=argparse.BooleanOptionalAction, default=True,
                        help="Save CMA-ES population archive before each reset for latent visualization")
     # === GCS CONFIG ===
