@@ -40,11 +40,47 @@ class UpdateState(IntEnum):
     DR = 0
     REPLAY = 1
 
+
+def fit_pca(latent_means, n_components):
+    """Fit PCA on latent means and return (pca_mean, pca_components).
+
+    Args:
+        latent_means: (N, D) array of encoded latent means.
+        n_components: number of principal components to keep.
+
+    Returns:
+        pca_mean: (D,) mean of the latent vectors.
+        pca_components: (n_components, D) top principal component directions.
+    """
+    pca_mean = jnp.mean(latent_means, axis=0)
+    centered = latent_means - pca_mean
+    # SVD: centered = U @ diag(S) @ Vt, components are rows of Vt
+    _, S, Vt = jnp.linalg.svd(centered, full_matrices=False)
+    components = Vt[:n_components]  # (n_components, D)
+    # Log explained variance
+    explained = S[:n_components] ** 2
+    total = jnp.sum(S ** 2)
+    explained_ratio = jnp.sum(explained) / total
+    print(f"[PCA] Top {n_components}/{latent_means.shape[1]} components explain "
+          f"{float(explained_ratio)*100:.1f}% of variance")
+    return pca_mean, components
+
+
+def encode_levels_to_means(vae_encode_fn, tokens, batch_size=256):
+    """Encode token sequences through VAE and return latent means."""
+    all_means = []
+    for i in range(0, len(tokens), batch_size):
+        m, _ = vae_encode_fn(tokens[i:i + batch_size])
+        all_means.append(m)
+    return jnp.concatenate(all_means, axis=0)
+
 class TrainState(BaseTrainState):
     sampler: core.FrozenDict[str, chex.ArrayTree] = struct.field(pytree_node=True)
     update_state: UpdateState = struct.field(pytree_node=True)
     es_state: chex.ArrayTree = struct.field(pytree_node=True)
     cenie_gmm_params: chex.ArrayTree = struct.field(pytree_node=True)
+    pca_mean: chex.Array = struct.field(pytree_node=True)
+    pca_components: chex.Array = struct.field(pytree_node=True)
     # === Below is used for logging ===
     num_dr_updates: int
     num_replay_updates: int
@@ -351,9 +387,10 @@ def _upload_to_gcs(local_path, gcs_bucket, gcs_path):
         blob.upload_from_filename(local_path)
     except (ImportError, Exception) as e:
         print(f"[GCS] Python client failed ({e}), falling back to gcloud CLI")
-        import subprocess
+        import subprocess, shutil
+        gcloud_bin = shutil.which("gcloud") or "/cs/student/project_msc/2025/csml/rhautier/google-cloud-sdk/bin/gcloud"
         dest = f"gs://{gcs_bucket}/{gcs_path}"
-        subprocess.run(["gcloud", "storage", "cp", local_path, dest], check=True)
+        subprocess.run([gcloud_bin, "storage", "cp", local_path, dest], check=True)
     print(f"[GCS] Uploaded {local_path} -> gs://{gcs_bucket}/{gcs_path}")
 
 
@@ -381,11 +418,12 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
             blob = bucket.blob(f"{config['gcs_prefix']}/checkpoints/{config['run_name']}/{config['seed']}/config.json")
             blob.upload_from_string(config_json)
         except (ImportError, Exception):
-            import subprocess, tempfile
+            import subprocess, tempfile, shutil
+            gcloud_bin = shutil.which("gcloud") or "/cs/student/project_msc/2025/csml/rhautier/google-cloud-sdk/bin/gcloud"
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                 f.write(config_json)
                 tmp_path = f.name
-            subprocess.run(["gcloud", "storage", "cp", tmp_path, f"{overall_save_dir}/config.json"], check=True)
+            subprocess.run([gcloud_bin, "storage", "cp", tmp_path, f"{overall_save_dir}/config.json"], check=True)
             os.remove(tmp_path)
         print(f"[GCS] Config saved to {overall_save_dir}/config.json")
     else:
@@ -534,17 +572,6 @@ def main(config=None, project="JAXUED_TEST"):
         def vae_encode_fn(tokens):
             return vae.apply({"params": vae_params}, tokens, train=False, method=vae.encode)
 
-    # --- CMA-ES setup ---
-    if config["use_cmaes"]:
-        # Initialize CMA-ES manager
-        cmaes_mgr = CMAESManager(
-            popsize=config["num_train_envs"],
-            latent_dim=vae_cfg["latent_dim"],
-            sigma_init=config["cmaes_sigma_init"],
-        )
-        print(f"[CMA-ES] VAE loaded from {config['vae_checkpoint_path']}")
-        print(f"[CMA-ES] latent_dim={vae_cfg['latent_dim']}, popsize={config['num_train_envs']}")
-
     if config.get("use_dred"):
         print(f"[DRED] VAE loaded from {config['vae_checkpoint_path']}")
         print(f"[DRED] latent_dim={vae_cfg['latent_dim']}, interpolation-based level generation")
@@ -615,6 +642,8 @@ def main(config=None, project="JAXUED_TEST"):
                 log_dict["cmaes/sigma"] = float(np.array(stats["cmaes/sigma"])[dr_mask].mean())
                 log_dict["cmaes/pop_spread"] = float(np.array(stats["cmaes/pop_spread"])[dr_mask].mean())
                 log_dict["cmaes/mean_z_norm"] = float(np.array(stats["cmaes/mean_z_norm"])[dr_mask].mean())
+                log_dict["cmaes/sigma_resets"] = float(np.array(stats["cmaes/sigma_reset"])[dr_mask].sum())
+                log_dict["cmaes/periodic_resets"] = float(np.array(stats["cmaes/periodic_reset"])[dr_mask].sum())
 
         wandb.log(log_dict)
     
@@ -626,6 +655,124 @@ def main(config=None, project="JAXUED_TEST"):
     env = AutoReplayWrapper(env)
     env_params = env.default_params
     mutate_level = make_level_mutator_minimax(100)
+
+    # --- Active latent dimension detection ---
+    active_dims = None  # None = use all dims
+    full_latent_dim = vae_cfg["latent_dim"] if _needs_vae else None
+    if _needs_vae and config["use_cmaes"] and config["cmaes_kl_threshold"] > 0:
+        kl_data_path = config.get("cmaes_kl_data")
+        if kl_data_path and os.path.exists(kl_data_path):
+            print(f"[KL-filter] Loading token data from {kl_data_path}...")
+            sample_tokens = jnp.array(np.load(kl_data_path)[:config["cmaes_kl_samples"]])
+        else:
+            if kl_data_path:
+                print(f"[KL-filter] WARNING: {kl_data_path} not found, falling back to random levels")
+            print(f"[KL-filter] Generating {config['cmaes_kl_samples']} random levels...")
+            sample_rng = jax.random.PRNGKey(0)
+            sample_levels = jax.vmap(sample_random_level)(jax.random.split(sample_rng, config["cmaes_kl_samples"]))
+            sample_tokens = jax.vmap(level_to_tokens)(sample_levels)  # (n_samples, 52)
+        print(f"[KL-filter] Estimating per-dim KL with {sample_tokens.shape[0]} levels...")
+        # Encode in batches to avoid OOM
+        batch_size = 256
+        all_means, all_logvars = [], []
+        for i in range(0, len(sample_tokens), batch_size):
+            m, lv = vae_encode_fn(sample_tokens[i:i+batch_size])
+            all_means.append(m)
+            all_logvars.append(lv)
+        mean_enc = jnp.concatenate(all_means, axis=0)
+        logvar_enc = jnp.concatenate(all_logvars, axis=0)
+        # Per-dim KL: -0.5 * (1 + logvar - mean² - exp(logvar)), averaged over samples
+        kl_per_dim = -0.5 * (1 + logvar_enc - mean_enc**2 - jnp.exp(logvar_enc))
+        kl_per_dim = jnp.mean(kl_per_dim, axis=0)  # (latent_dim,)
+
+        active_mask = kl_per_dim > config["cmaes_kl_threshold"]
+        active_dims = jnp.where(active_mask)[0]
+        n_active = int(active_dims.shape[0])
+        n_total = int(full_latent_dim)
+
+        print(f"[KL-filter] Per-dim KL stats: min={float(kl_per_dim.min()):.4f}, "
+              f"max={float(kl_per_dim.max()):.4f}, mean={float(kl_per_dim.mean()):.4f}")
+        print(f"[KL-filter] Active dims: {n_active}/{n_total} (threshold={config['cmaes_kl_threshold']})")
+        print(f"[KL-filter] Active indices: {np.array(active_dims).tolist()}")
+        print(f"[KL-filter] Dead dims KL: {np.array(kl_per_dim[~active_mask]).tolist()}")
+
+        if n_active == 0:
+            print("[KL-filter] WARNING: No active dims found! Falling back to all dims.")
+            active_dims = None
+        elif n_active == n_total:
+            print("[KL-filter] All dims active, no filtering needed.")
+            active_dims = None
+
+        # Log to wandb
+        wandb.run.summary["kl_per_dim"] = np.array(kl_per_dim).tolist()
+        wandb.run.summary["active_dims"] = np.array(active_dims).tolist() if active_dims is not None else list(range(n_total))
+        wandb.run.summary["n_active_dims"] = n_active if active_dims is not None else n_total
+
+    # Wrap vae_decode_fn to expand from active subspace to full latent space
+    if active_dims is not None:
+        _original_decode_fn = vae_decode_fn
+        _active_dims = active_dims
+        _full_dim = full_latent_dim
+
+        def vae_decode_fn(z):
+            """Expand reduced latent vector to full space, then decode."""
+            if z.ndim == 1:
+                z_full = jnp.zeros(_full_dim)
+                z_full = z_full.at[_active_dims].set(z)
+            else:
+                z_full = jnp.zeros((z.shape[0], _full_dim))
+                z_full = z_full.at[:, _active_dims].set(z)
+            return _original_decode_fn(z_full)
+
+        cmaes_latent_dim = int(active_dims.shape[0])
+    else:
+        cmaes_latent_dim = vae_cfg["latent_dim"] if _needs_vae else None
+
+    # --- PCA dimensionality reduction (overrides KL filtering if both set) ---
+    pca_mean_init = None
+    pca_components_init = None
+    use_pca = _needs_vae and config["use_cmaes"] and config.get("cmaes_pca_dims", 0) > 0
+    if use_pca:
+        pca_dims = config["cmaes_pca_dims"]
+        pca_data_path = config.get("cmaes_pca_data") or config.get("cmaes_kl_data")
+        n_pca_samples = config.get("cmaes_kl_samples", 5000)
+        if pca_data_path and os.path.exists(pca_data_path):
+            print(f"[PCA] Loading token data from {pca_data_path}...")
+            pca_tokens = jnp.array(np.load(pca_data_path)[:n_pca_samples])
+        else:
+            if pca_data_path:
+                print(f"[PCA] WARNING: {pca_data_path} not found, falling back to random levels")
+            print(f"[PCA] Generating {n_pca_samples} random levels...")
+            sample_rng = jax.random.PRNGKey(0)
+            sample_levels = jax.vmap(sample_random_level)(jax.random.split(sample_rng, n_pca_samples))
+            pca_tokens = jax.vmap(level_to_tokens)(sample_levels)
+
+        print(f"[PCA] Encoding {pca_tokens.shape[0]} levels through VAE...")
+        pca_latent_means = encode_levels_to_means(vae_encode_fn, pca_tokens)
+        pca_mean_init, pca_components_init = fit_pca(pca_latent_means, pca_dims)
+
+        # PCA overrides KL filtering for CMA-ES search dim
+        cmaes_latent_dim = pca_dims
+        active_dims = None  # PCA handles dimensionality reduction instead
+
+        wandb.run.summary["pca_dims"] = pca_dims
+        wandb.run.summary["pca_explained_var"] = float(
+            jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1][:pca_dims]**2)
+            / jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1]**2)
+        )
+
+    # --- CMA-ES setup ---
+    cmaes_mgr = None
+    if config["use_cmaes"]:
+        cmaes_mgr = CMAESManager(
+            popsize=config["num_train_envs"],
+            latent_dim=cmaes_latent_dim,
+            sigma_init=config["cmaes_sigma_init"],
+        )
+        print(f"[CMA-ES] VAE loaded from {config['vae_checkpoint_path']}")
+        print(f"[CMA-ES] search_dim={cmaes_latent_dim}, full_latent_dim={full_latent_dim}, popsize={config['num_train_envs']}")
+        if use_pca:
+            print(f"[CMA-ES] Using PCA projection ({pca_dims} PCs)")
 
     # And the level sampler    
     level_sampler = LevelSampler(
@@ -788,6 +935,15 @@ def main(config=None, project="JAXUED_TEST"):
             gcs_base = f"{config['gcs_prefix']}/cmaes_populations/{config['run_name']}/{config['seed']}"
             _upload_to_gcs(path, config["gcs_bucket"], f"{gcs_base}/pre_reset_{dr_num}.npz")
 
+    # Initialize PCA state OUTSIDE jit
+    if pca_mean_init is None:
+        # Dummy PCA arrays when PCA is not used (shape doesn't matter, never read)
+        _pca_mean_init = jnp.zeros(1)
+        _pca_components_init = jnp.zeros((1, 1))
+    else:
+        _pca_mean_init = pca_mean_init
+        _pca_components_init = pca_components_init
+
     # Initialize CMA-ES state OUTSIDE jit to avoid tracing issues with evosax
     if cmaes_mgr is not None:
         es_state_init = cmaes_mgr.initialize(jax.random.PRNGKey(42))
@@ -837,6 +993,8 @@ def main(config=None, project="JAXUED_TEST"):
             update_state=0,
             es_state=es_state_init,
             cenie_gmm_params=cenie_gmm_init,
+            pca_mean=_pca_mean_init,
+            pca_components=_pca_components_init,
             num_dr_updates=0,
             num_replay_updates=0,
             num_mutation_updates=0,
@@ -866,7 +1024,12 @@ def main(config=None, project="JAXUED_TEST"):
                 # CMA-ES: ask for candidate latent vectors, decode to levels
                 rng, rng_ask, rng_decode = jax.random.split(rng, 3)
                 z_population, es_state = cmaes_mgr.ask(rng_ask, es_state)
-                new_levels = decode_latent_to_levels(vae_decode_fn, z_population, rng_decode)
+                if use_pca:
+                    # Project from PCA space to full latent space
+                    z_full = train_state.pca_mean + z_population @ train_state.pca_components
+                    new_levels = decode_latent_to_levels(vae_decode_fn, z_full, rng_decode)
+                else:
+                    new_levels = decode_latent_to_levels(vae_decode_fn, z_population, rng_decode)
             elif config.get("use_dred"):
                 # DRED: interpolate pairs from buffer in VAE latent space
                 # Fall back to random generation if buffer has < 2 levels
@@ -944,8 +1107,10 @@ def main(config=None, project="JAXUED_TEST"):
                 rng, rng_tell = jax.random.split(rng)
                 es_state = cmaes_mgr.tell(rng_tell, z_population, -scores, es_state)
 
-                # Periodic reset to prevent stagnation
-                should_reset = (train_state.num_dr_updates % config["cmaes_reset_interval"]) == 0
+                # Reset on sigma collapse (adaptive) or fixed interval (fallback)
+                sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es_state.std < config["cmaes_sigma_min"])
+                periodic_reset = (train_state.num_dr_updates % config["cmaes_reset_interval"]) == 0
+                should_reset = sigma_collapsed | periodic_reset
 
                 # Archive population before reset for latent visualization
                 if config.get("save_cmaes_populations", True):
@@ -1012,6 +1177,9 @@ def main(config=None, project="JAXUED_TEST"):
                 metrics["cmaes/pop_spread"] = z_population.std()
                 # Mean norm of latent vectors (how far from origin)
                 metrics["cmaes/mean_z_norm"] = jnp.linalg.norm(z_population, axis=-1).mean()
+                # Track sigma-triggered resets (1.0 if reset happened this step, 0.0 otherwise)
+                metrics["cmaes/sigma_reset"] = jnp.where(sigma_collapsed, 1.0, 0.0)
+                metrics["cmaes/periodic_reset"] = jnp.where(periodic_reset & ~sigma_collapsed, 1.0, 0.0)
 
             # CENIE: pass subsampled obs_actions through metrics (no callbacks)
             if config["score_function"] == "cenie":
@@ -1091,6 +1259,8 @@ def main(config=None, project="JAXUED_TEST"):
                 metrics["cmaes/sigma"] = jnp.float32(0.0)
                 metrics["cmaes/pop_spread"] = jnp.float32(0.0)
                 metrics["cmaes/mean_z_norm"] = jnp.float32(0.0)
+                metrics["cmaes/sigma_reset"] = jnp.float32(0.0)
+                metrics["cmaes/periodic_reset"] = jnp.float32(0.0)
 
             # CENIE: pass subsampled obs_actions through metrics (no callbacks)
             if config["score_function"] == "cenie":
@@ -1177,6 +1347,8 @@ def main(config=None, project="JAXUED_TEST"):
                 metrics["cmaes/sigma"] = jnp.float32(0.0)
                 metrics["cmaes/pop_spread"] = jnp.float32(0.0)
                 metrics["cmaes/mean_z_norm"] = jnp.float32(0.0)
+                metrics["cmaes/sigma_reset"] = jnp.float32(0.0)
+                metrics["cmaes/periodic_reset"] = jnp.float32(0.0)
 
             # CENIE: pass subsampled obs_actions through metrics (no callbacks)
             if config["score_function"] == "cenie":
@@ -1370,6 +1542,37 @@ def main(config=None, project="JAXUED_TEST"):
                 rng_cur, ts_cur = runner_state
                 ts_cur = ts_cur.replace(cenie_gmm_params=new_gmm_params)
                 runner_state = (rng_cur, ts_cur)
+
+        # PCA refit: combine buffer levels + random levels
+        if use_pca and config.get("cmaes_pca_refit_interval", 0) > 0:
+            if (eval_step + 1) % config["cmaes_pca_refit_interval"] == 0:
+                rng_cur, ts_cur = runner_state
+                buf_size = int(ts_cur.sampler["size"])
+                if buf_size >= config["cmaes_pca_dims"]:
+                    print(f"[PCA refit @ eval_step={eval_step+1}] Using {buf_size} buffer + random levels")
+                    # Encode buffer levels
+                    buf_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], ts_cur.sampler["levels"])
+                    buf_tokens = jax.vmap(level_to_tokens)(buf_levels)
+                    buf_means = encode_levels_to_means(vae_encode_fn, buf_tokens)
+                    # Also encode random levels (same count as buffer for balance)
+                    n_random = min(buf_size, config.get("cmaes_kl_samples", 5000))
+                    rng_pca = jax.random.PRNGKey(eval_step)
+                    rand_levels = jax.vmap(sample_random_level)(jax.random.split(rng_pca, n_random))
+                    rand_tokens = jax.vmap(level_to_tokens)(rand_levels)
+                    rand_means = encode_levels_to_means(vae_encode_fn, rand_tokens)
+                    # Combine and refit
+                    combined_means = jnp.concatenate([buf_means, rand_means], axis=0)
+                    new_pca_mean, new_pca_components = fit_pca(combined_means, config["cmaes_pca_dims"])
+                    # Reset CMA-ES (coordinate system changed)
+                    new_es = cmaes_mgr.initialize(jax.random.PRNGKey(eval_step + 1000))
+                    ts_cur = ts_cur.replace(
+                        pca_mean=new_pca_mean,
+                        pca_components=new_pca_components,
+                        es_state=new_es,
+                    )
+                    runner_state = (rng_cur, ts_cur)
+                else:
+                    print(f"[PCA refit] Skipped — buffer too small ({buf_size} < {config['cmaes_pca_dims']})")
 
         # Periodic buffer dump at configured intervals
         updates_so_far = (eval_step + 1) * config["eval_freq"]
@@ -1671,6 +1874,20 @@ if __name__=="__main__":
                        help="CMA-ES population size. Overrides num_train_envs when set (they must be equal).")
     group.add_argument("--cmaes_reset_interval", type=int, default=500,
                        help="Reset CMA-ES every N DR updates to prevent stagnation")
+    group.add_argument("--cmaes_sigma_min", type=float, default=0.0,
+                       help="Reset CMA-ES when sigma drops below this threshold (0 = disabled)")
+    group.add_argument("--cmaes_kl_threshold", type=float, default=0.0,
+                       help="Only search latent dims with per-dim KL > threshold (0 = use all dims)")
+    group.add_argument("--cmaes_kl_samples", type=int, default=5000,
+                       help="Number of levels to encode for estimating per-dim KL divergence")
+    group.add_argument("--cmaes_kl_data", type=str, default=None,
+                       help="Path to .npy token file for KL estimation (e.g. val set). Falls back to random levels.")
+    group.add_argument("--cmaes_pca_dims", type=int, default=0,
+                       help="Number of PCA dimensions for CMA-ES search (0 = disabled, overrides KL filtering)")
+    group.add_argument("--cmaes_pca_data", type=str, default=None,
+                       help="Path to .npy token file for PCA fitting. Falls back to --cmaes_kl_data or random levels.")
+    group.add_argument("--cmaes_pca_refit_interval", type=int, default=0,
+                       help="Refit PCA every N eval steps using buffer + random levels (0 = never, static PCA)")
     group.add_argument("--save_cmaes_populations", action=argparse.BooleanOptionalAction, default=True,
                        help="Save CMA-ES population archive before each reset for latent visualization")
     # === GCS CONFIG ===
