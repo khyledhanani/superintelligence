@@ -28,8 +28,6 @@ from enum import IntEnum
 
 # Metrics imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from metrics.trajectory_metrics import compute_pairwise_metrics
-from metrics.trajectory_cache import TrajectoryCache
 
 # VAE + CMA-ES imports (conditional on --use_cmaes flag)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vae'))
@@ -1046,90 +1044,6 @@ def main(config=None, project="JAXUED_TEST"):
             _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens{tag}.npy")
             _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump{tag}.npz")
 
-    # === Trajectory cache + diversity metrics ===
-    traj_cache = TrajectoryCache()
-    diversity_log_interval = config.get("diversity_log_interval", 100)  # every N eval_steps
-    diversity_sample_size = config.get("diversity_sample_size", 20)  # num levels to subsample
-
-    @jax.jit
-    def collect_buffer_trajectories(rng, train_state, level_indices):
-        """Run agent on buffer levels and return trajectory data for caching."""
-        sampler = train_state.sampler
-        levels = level_sampler.get_levels(sampler, level_indices)
-        num_levels = level_indices.shape[0]
-        rng, rng_reset = jax.random.split(rng)
-        init_obs, init_env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
-            jax.random.split(rng_reset, num_levels), levels, env_params
-        )
-        (
-            (rng, _, _, _, _, _),
-            (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
-        ) = sample_trajectories_rnn(
-            rng, env, env_params, train_state,
-            ActorCritic.initialize_carry((num_levels,)),
-            init_obs, init_env_state, num_levels,
-            env_params.max_steps_in_episode,
-        )
-        return obs.image, actions, rewards, dones, values, agent_positions
-
-    def update_cache_and_compute_metrics(rng, train_state):
-        """Collect trajectories on buffer subsample, update cache, compute pairwise metrics."""
-        sampler = train_state.sampler
-        size = int(sampler["size"])
-        if size < diversity_sample_size:
-            return {}
-
-        # Sample fixed number of indices from buffer (fixed shape for JIT stability)
-        n_sample = diversity_sample_size
-        rng_np = np.random.default_rng(int(jax.random.randint(rng, (), 0, 2**31)))
-        sample_indices = jnp.array(rng_np.choice(size, size=n_sample, replace=False))
-
-        # Collect trajectories (JIT'd)
-        rng, rng_collect = jax.random.split(rng)
-        obs, actions, rewards, dones, values, agent_positions = collect_buffer_trajectories(
-            rng_collect, train_state, sample_indices
-        )
-
-        # Move to numpy for cache + metrics
-        obs_np = np.asarray(obs)  # (T, N, *obs_shape)
-        actions_np = np.asarray(actions)  # (T, N)
-        dones_np = np.asarray(dones)  # (T, N)
-        values_np = np.asarray(values)  # (T, N)
-        positions_np = np.asarray(agent_positions)  # (T, N, 2)
-        indices_np = np.asarray(sample_indices)
-
-        # Update cache
-        traj_cache.update_batch(indices_np, obs_np, positions_np, values_np, dones_np, actions_np)
-
-        # Sync cache with buffer (evict stale entries)
-        active_indices = set(range(size))
-        traj_cache.sync_with_buffer(active_indices)
-
-        # Build trajectory list for pairwise metrics
-        trajectories = []
-        for i in range(n_sample):
-            trajectories.append({
-                "observations": obs_np[:, i],
-                "positions": positions_np[:, i],
-                "values": values_np[:, i],
-                "dones": dones_np[:, i],
-            })
-
-        # Compute pairwise metrics
-        pairwise = compute_pairwise_metrics(trajectories)
-
-        # Build wandb log dict
-        diversity_log = {}
-        for metric_name, values_arr in pairwise.items():
-            if len(values_arr) > 0:
-                diversity_log[f"diversity/{metric_name}/mean"] = float(values_arr.mean())
-                diversity_log[f"diversity/{metric_name}/std"] = float(values_arr.std())
-                diversity_log[f"diversity/{metric_name}/min"] = float(values_arr.min())
-                diversity_log[f"diversity/{metric_name}/max"] = float(values_arr.max())
-        diversity_log["diversity/cache_size"] = traj_cache.size
-
-        return diversity_log
-
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
@@ -1147,20 +1061,6 @@ def main(config=None, project="JAXUED_TEST"):
         updates_so_far = (eval_step + 1) * config["eval_freq"]
         if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
             dump_buffer(runner_state[1], updates_so_far // 1000)
-
-        # Periodic diversity metrics computation
-        if diversity_log_interval > 0 and (eval_step + 1) % diversity_log_interval == 0:
-            rng_diversity = jax.random.PRNGKey(eval_step + 9999)
-            diversity_metrics = update_cache_and_compute_metrics(rng_diversity, runner_state[1])
-            if diversity_metrics:
-                diversity_metrics["num_updates"] = int(updates_so_far)
-                wandb.log(diversity_metrics)
-                obs_dtw = diversity_metrics.get('diversity/obs_dtw_distances/mean', float('nan'))
-                pos_dtw = diversity_metrics.get('diversity/pos_dtw_distances/mean', float('nan'))
-                val_dtw = diversity_metrics.get('diversity/value_dtw_distances/mean', float('nan'))
-                jaccard = diversity_metrics.get('diversity/jaccard_indices/mean', float('nan'))
-                print(f"  [Diversity] obs_dtw={obs_dtw:.4f}, pos_dtw={pos_dtw:.4f}, "
-                      f"val_dtw={val_dtw:.4f}, jaccard={jaccard:.4f}")
 
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]

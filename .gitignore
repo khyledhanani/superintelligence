@@ -174,3 +174,6 @@ vae/model/*.pkl
 
 # GCS artifacts
 gcs_artifacts/
+
+# LLM-generated maze levels
+llm/generated_levels/
