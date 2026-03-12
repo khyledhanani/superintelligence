@@ -41,12 +41,18 @@ class UpdateState(IntEnum):
     REPLAY = 1
 
 
-def fit_pca(latent_means, n_components):
+def fit_pca(latent_means, n_components, fitness_scores=None):
     """Fit PCA on latent means and return (pca_mean, pca_components).
+
+    If fitness_scores is provided, uses fitness-aware PCA:
+      - PC1 = direction of maximum fitness change (linear regression)
+      - PC2...k = max-variance directions orthogonal to fitness direction
+    Otherwise, standard PCA (max-variance directions).
 
     Args:
         latent_means: (N, D) array of encoded latent means.
         n_components: number of principal components to keep.
+        fitness_scores: optional (N,) array of fitness/score values.
 
     Returns:
         pca_mean: (D,) mean of the latent vectors.
@@ -54,15 +60,45 @@ def fit_pca(latent_means, n_components):
     """
     pca_mean = jnp.mean(latent_means, axis=0)
     centered = latent_means - pca_mean
-    # SVD: centered = U @ diag(S) @ Vt, components are rows of Vt
-    _, S, Vt = jnp.linalg.svd(centered, full_matrices=False)
-    components = Vt[:n_components]  # (n_components, D)
-    # Log explained variance
-    explained = S[:n_components] ** 2
-    total = jnp.sum(S ** 2)
-    explained_ratio = jnp.sum(explained) / total
-    print(f"[PCA] Top {n_components}/{latent_means.shape[1]} components explain "
-          f"{float(explained_ratio)*100:.1f}% of variance")
+
+    if fitness_scores is not None and n_components >= 1:
+        # Fitness-aware: PC1 = fitness gradient direction
+        fitness_centered = fitness_scores - jnp.mean(fitness_scores)
+        # Direction of max fitness change: w = Z^T @ f (unnormalized gradient)
+        w = centered.T @ fitness_centered  # (D,)
+        w_norm = jnp.linalg.norm(w)
+        w = w / (w_norm + 1e-8)
+
+        # Correlation between fitness and projection onto this direction
+        proj = centered @ w  # (N,)
+        corr = float(jnp.corrcoef(proj, fitness_centered)[0, 1])
+        print(f"[PCA] PC0 = fitness gradient direction (corr with fitness: {corr:.3f})")
+
+        components = [w]
+
+        if n_components > 1:
+            # Project out the fitness direction from the data
+            residual = centered - (centered @ w[:, None]) @ w[None, :]
+            # Standard PCA on residuals for remaining components
+            _, S, Vt = jnp.linalg.svd(residual, full_matrices=False)
+            for i in range(n_components - 1):
+                components.append(Vt[i])
+            explained = S[: n_components - 1] ** 2
+            total = jnp.sum(S ** 2)
+            print(f"[PCA] PC1-{n_components-1}: {float(jnp.sum(explained) / total) * 100:.1f}% "
+                  f"of residual variance")
+
+        components = jnp.stack(components)
+    else:
+        # Standard PCA
+        _, S, Vt = jnp.linalg.svd(centered, full_matrices=False)
+        components = Vt[:n_components]
+        explained = S[:n_components] ** 2
+        total = jnp.sum(S ** 2)
+        explained_ratio = jnp.sum(explained) / total
+        print(f"[PCA] Top {n_components}/{latent_means.shape[1]} components explain "
+              f"{float(explained_ratio) * 100:.1f}% of variance")
+
     return pca_mean, components
 
 
@@ -1536,7 +1572,24 @@ def main(config=None, project="JAXUED_TEST"):
         if use_pca and vae_encode_fn is not None:
             print(f"[Warmstart] Refitting PCA on {ws_size} buffer levels...")
             ws_means = encode_levels_to_means(vae_encode_fn, jnp.array(ws_tokens))
-            ws_pca_mean, ws_pca_components = fit_pca(ws_means, config["cmaes_pca_dims"])
+            ws_fitness = jnp.array(ws_scores) if config.get("cmaes_pca_fitness_aware") else None
+            ws_pca_mean, ws_pca_components = fit_pca(ws_means, config["cmaes_pca_dims"], fitness_scores=ws_fitness)
+
+            # Diagnostic: verify PCA projection
+            print(f"[PCA debug] pca_mean shape: {ws_pca_mean.shape}, norm: {float(jnp.linalg.norm(ws_pca_mean)):.4f}")
+            print(f"[PCA debug] pca_components shape: {ws_pca_components.shape}")
+            for i in range(ws_pca_components.shape[0]):
+                pc = ws_pca_components[i]
+                print(f"[PCA debug]   PC{i}: norm={float(jnp.linalg.norm(pc)):.4f}, "
+                      f"top-3 dims={np.argsort(np.abs(np.array(pc)))[-3:][::-1].tolist()}")
+            # Test projection: project buffer means into PC space and back
+            ws_projected = (ws_means - ws_pca_mean) @ ws_pca_components.T  # (N, n_pcs)
+            ws_reconstructed = ws_pca_mean + ws_projected @ ws_pca_components  # (N, 64)
+            recon_error = float(jnp.mean(jnp.linalg.norm(ws_means - ws_reconstructed, axis=1)))
+            print(f"[PCA debug] Mean reconstruction error (buffer->PCA->back): {recon_error:.4f}")
+            print(f"[PCA debug] PC-space range: min={float(ws_projected.min()):.2f}, max={float(ws_projected.max()):.2f}, "
+                  f"std={float(ws_projected.std()):.2f}")
+
             train_state = train_state.replace(
                 pca_mean=ws_pca_mean,
                 pca_components=ws_pca_components,
@@ -1544,6 +1597,14 @@ def main(config=None, project="JAXUED_TEST"):
             # Reset CMA-ES for the new PCA basis
             new_es = cmaes_mgr.initialize(jax.random.PRNGKey(999))
             train_state = train_state.replace(es_state=new_es)
+
+            # Check if sigma_init is appropriate for PC-space scale
+            pc_std_per_dim = float(ws_projected.std())
+            print(f"[Warmstart] CMA-ES sigma_init={config['cmaes_sigma_init']}, "
+                  f"PC-space std={pc_std_per_dim:.2f}")
+            if config["cmaes_sigma_init"] < pc_std_per_dim * 0.1:
+                print(f"[Warmstart] WARNING: sigma_init is much smaller than PC-space spread! "
+                      f"Consider --cmaes_sigma_init {pc_std_per_dim:.1f}")
             print(f"[Warmstart] PCA refit on buffer, CMA-ES reset")
 
     # Apply update counter offset for wandb continuity
@@ -1643,7 +1704,19 @@ def main(config=None, project="JAXUED_TEST"):
                         rand_means = encode_levels_to_means(vae_encode_fn, rand_tokens)
                         refit_means = jnp.concatenate([buf_means, rand_means], axis=0)
 
-                    new_pca_mean, new_pca_components = fit_pca(refit_means, config["cmaes_pca_dims"])
+                    # Use buffer fitness scores for fitness-aware PCA
+                    refit_fitness = None
+                    if config.get("cmaes_pca_fitness_aware"):
+                        buf_scores = np.asarray(ts_cur.sampler["scores"][:buf_size])
+                        if config.get("cmaes_pca_buffer_only", False):
+                            refit_fitness = jnp.array(buf_scores)
+                        else:
+                            # Random levels get score 0 (neutral)
+                            refit_fitness = jnp.concatenate([
+                                jnp.array(buf_scores),
+                                jnp.zeros(len(refit_means) - buf_size)
+                            ])
+                    new_pca_mean, new_pca_components = fit_pca(refit_means, config["cmaes_pca_dims"], fitness_scores=refit_fitness)
                     # Reset CMA-ES (coordinate system changed)
                     new_es = cmaes_mgr.initialize(jax.random.PRNGKey(eval_step + 1000))
                     ts_cur = ts_cur.replace(
@@ -1971,6 +2044,8 @@ if __name__=="__main__":
                        help="Refit PCA every N eval steps using buffer + random levels (0 = never, static PCA)")
     group.add_argument("--cmaes_pca_buffer_only", action=argparse.BooleanOptionalAction, default=False,
                        help="Refit PCA on buffer levels only (no random levels mixed in)")
+    group.add_argument("--cmaes_pca_fitness_aware", action=argparse.BooleanOptionalAction, default=False,
+                       help="Fitness-aware PCA: PC1 = direction of max fitness change, rest = max variance orthogonal to it")
     group.add_argument("--warmstart_checkpoint", type=str, default=None,
                        help="Path to Orbax checkpoint dir to warm-start agent params from (e.g. checkpoints/run/0/models)")
     group.add_argument("--warmstart_buffer", type=str, default=None,
