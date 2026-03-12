@@ -147,6 +147,60 @@ class AgentEvaluator:
         # Remove batch dimension
         return {k: v[:, 0] if v.ndim > 1 else v for k, v in results.items()}
 
+    def evaluate_level_multi_rollout(self, level, n_rollouts: int = 100) -> dict:
+        """Evaluate the agent on a single level with multiple rollouts.
+
+        Runs n_rollouts independent rollouts (different RNG seeds) in a single
+        batched call. Returns the trajectory with the highest episode return,
+        giving a better estimate of the agent's best-case performance for
+        regret computation.
+
+        Args:
+            level: A Level object
+            n_rollouts: Number of independent rollouts (default: 100)
+
+        Returns:
+            Dict with keys matching evaluate_level(), plus:
+                best_return: float — highest episode return across all rollouts
+                solve_rate: float — fraction of rollouts that solved the level
+                all_returns: (n_rollouts,) array of per-rollout returns
+        """
+        # Duplicate the level n_rollouts times
+        batched_levels = Level.stack([level] * n_rollouts)
+        results = self._evaluate_batch(batched_levels, n_rollouts)
+
+        # Compute per-rollout episode returns
+        rewards = results["rewards"]      # (T, N)
+        dones = results["dones"]          # (T, N)
+
+        # For each rollout, sum rewards up to first done
+        returns = np.zeros(n_rollouts)
+        solved = np.zeros(n_rollouts, dtype=bool)
+        for i in range(n_rollouts):
+            done_idx = np.where(dones[:, i])[0]
+            if len(done_idx) > 0:
+                end = done_idx[0] + 1
+                solved[i] = True
+            else:
+                end = len(rewards)
+            returns[i] = float(np.sum(rewards[:end, i]))
+
+        # Pick the rollout with highest return
+        best_idx = int(np.argmax(returns))
+        traj = {
+            "observations": results["observations"][:, best_idx],
+            "positions": results["positions"][:, best_idx],
+            "values": results["values"][:, best_idx],
+            "dones": results["dones"][:, best_idx],
+            "actions": results["actions"][:, best_idx],
+            "rewards": results["rewards"][:, best_idx],
+            "entropy": results["entropy"][:, best_idx],
+            "best_return": float(returns[best_idx]),
+            "solve_rate": float(np.mean(solved)),
+            "all_returns": returns,
+        }
+        return traj
+
     def evaluate_levels(self, levels: list) -> List[dict]:
         """Evaluate the agent on multiple Level objects.
 

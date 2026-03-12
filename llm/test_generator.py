@@ -23,6 +23,7 @@ import logging
 import sys
 import os
 import json
+import yaml
 from datetime import datetime
 
 import numpy as np
@@ -130,6 +131,7 @@ def build_references_with_metrics(
     trajectories: list = None,
     inject_regret: bool = True,
     inject_dtw: bool = False,
+    downsample_points: int = 20,
 ) -> tuple:
     """Build ReferenceMaze objects with top-5 metric injection from trajectories.
 
@@ -165,7 +167,7 @@ def build_references_with_metrics(
 
             # 1. Per-step entropy (top metric)
             ent_info = compute_per_step_entropy(traj["entropy"], traj["dones"])
-            ds_entropy = downsample(ent_info["entropy"], 20)
+            ds_entropy = downsample(ent_info["entropy"], downsample_points)
             metrics.append(MetricEntry(
                 name="Per-Step Entropy",
                 value=format_vector(ds_entropy),
@@ -181,7 +183,7 @@ def build_references_with_metrics(
             reg_info = compute_per_step_regret(
                 traj["values"], traj["rewards"], traj["dones"]
             )
-            ds_regret = downsample(reg_info["regret_curve"], 20)
+            ds_regret = downsample(reg_info["regret_curve"], downsample_points)
             metrics.append(MetricEntry(
                 name="Per-Step Regret",
                 value=format_vector(ds_regret),
@@ -207,7 +209,7 @@ def build_references_with_metrics(
 
             # 5. Per-step action
             act_info = compute_per_step_action(traj["actions"], traj["dones"])
-            ds_actions = downsample(act_info["actions"].astype(np.float64), 20)
+            ds_actions = downsample(act_info["actions"].astype(np.float64), downsample_points)
             metrics.append(MetricEntry(
                 name="Action Sequence",
                 value=format_vector(ds_actions, decimals=0),
@@ -312,32 +314,77 @@ def print_result(result: GenerationResult, idx: int):
 def grid_to_image(grid_str: str) -> np.ndarray:
     """Convert ASCII maze grid to an RGB image array.
 
-    Colors:
-        Wall (#)  -> dark gray
-        Floor (.) -> white
-        Agent (>v<^) -> blue
-        Goal (G)  -> green
+    Colors: Wall (#) dark gray, Floor (.) white, Agent (>v<^) blue, Goal (G) green.
     """
     rows = grid_str.strip().split('\n')
     h, w = len(rows), len(rows[0])
-    img = np.ones((h, w, 3), dtype=np.float32)  # white background
+    img = np.ones((h, w, 3), dtype=np.float32)
 
     char_colors = {
-        '#': [0.2, 0.2, 0.2],   # dark gray walls
-        '.': [1.0, 1.0, 1.0],   # white floor
-        '>': [0.2, 0.4, 0.9],   # blue agent
+        '#': [0.2, 0.2, 0.2],
+        '.': [1.0, 1.0, 1.0],
+        '>': [0.2, 0.4, 0.9],
         'v': [0.2, 0.4, 0.9],
         '<': [0.2, 0.4, 0.9],
         '^': [0.2, 0.4, 0.9],
-        'G': [0.2, 0.8, 0.3],   # green goal
+        'G': [0.2, 0.8, 0.3],
     }
 
     for y, row in enumerate(rows):
         for x, c in enumerate(row):
             if c in char_colors:
                 img[y, x] = char_colors[c]
-
     return img
+
+
+def plot_maze_with_path(ax, grid_str: str, positions=None, dones=None,
+                        color='blue', title='', title_color='dimgray',
+                        title_bold=False):
+    """Plot a maze grid with optional agent trajectory overlay (deep-dive style).
+
+    Path is drawn as line segments with time-gradient alpha (faint early, solid late),
+    with circle marker at start and square at end.
+    """
+    img = grid_to_image(grid_str)
+    ax.imshow(img, origin='upper')
+
+    if positions is not None:
+        from metrics.utils import truncate_at_done
+        if dones is not None:
+            ep_pos = truncate_at_done(positions, dones)
+        else:
+            ep_pos = positions
+
+        # If agent solved the level, extend path to the goal position
+        # (positions record pre-step state, so the goal arrival is missing)
+        solved = dones is not None and np.any(dones)
+        if solved:
+            rows = grid_str.strip().split('\n')
+            for gy, row in enumerate(rows):
+                for gx, c in enumerate(row):
+                    if c == 'G':
+                        ep_pos = np.concatenate([ep_pos, [[gx, gy]]], axis=0)
+                        break
+
+        n = len(ep_pos)
+        if n > 0:
+            for t in range(n - 1):
+                alpha = 0.3 + 0.7 * (t / max(n - 1, 1))
+                ax.plot([ep_pos[t, 0], ep_pos[t+1, 0]],
+                        [ep_pos[t, 1], ep_pos[t+1, 1]],
+                        color=color, alpha=alpha, linewidth=2)
+            ax.plot(ep_pos[0, 0], ep_pos[0, 1], 'o', color=color,
+                    markersize=8, label='start')
+            if n > 1:
+                end_label = 'goal' if solved else 'end'
+                ax.plot(ep_pos[-1, 0], ep_pos[-1, 1], 's', color=color,
+                        markersize=8, label=end_label)
+            ax.legend(fontsize=7, loc='upper right')
+    ax.set_xlim(-0.5, 12.5)
+    ax.set_ylim(12.5, -0.5)
+    ax.set_title(title, fontsize=9,
+                 color=title_color,
+                 fontweight='bold' if title_bold else 'normal')
 
 
 def save_results(
@@ -345,6 +392,8 @@ def save_results(
     references: list,
     model: str,
     run_dir: str,
+    ref_trajectories: list = None,
+    gen_trajectories: list = None,
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
 
@@ -398,6 +447,16 @@ def save_results(
             entry["diversity_attempts"] = result.diversity_attempts
         if result.diversity_issues:
             entry["diversity_issues"] = result.diversity_issues
+        # Multi-rollout stats
+        gt = gen_trajectories[seq] if gen_trajectories and seq < len(gen_trajectories) else None
+        if gt and "solve_rate" in gt:
+            entry["multi_rollout"] = {
+                "n_rollouts": 100,
+                "solve_rate": round(gt["solve_rate"], 3),
+                "best_return": round(gt["best_return"], 6),
+                "mean_return": round(float(np.mean(gt["all_returns"])), 6),
+                "std_return": round(float(np.std(gt["all_returns"])), 6),
+            }
         metadata["generated_mazes"].append(entry)
     # Also record failures
     metadata["failed_mazes"] = []
@@ -419,7 +478,7 @@ def save_results(
 
     # --- Render visualization PNG ---
     ref_grids = [(ref.label, ref.grid) for ref in references]
-    gen_grids = [(f"Generated {seq + 1}", r.grid) for seq, (_, r) in enumerate(successful)]
+    gen_grids = [(f"Generated {orig_idx + 1}", r.grid) for orig_idx, r in successful]
     has_gate_metrics = any(r.gate_pair_metrics for _, r in successful)
 
     n_refs = len(ref_grids)
@@ -433,7 +492,7 @@ def save_results(
         # Layout with DTW profiles:
         # Row 0: reference mazes
         # For each generated maze: maze + pos DTW profiles + val DTW profiles
-        cols = max(n_refs, 3)  # maze, pos_dtw plot, val_dtw plot
+        cols = max(n_refs, 2)  # maze, pos_dtw plot
         rows = 1 + n_gens
         fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 3.5 * rows))
         fig.suptitle(
@@ -460,32 +519,38 @@ def save_results(
         for i, (label, grid) in enumerate(ref_grids):
             if i < cols:
                 ax = axes[0, i]
-                img = grid_to_image(grid)
-                ax.imshow(img, interpolation='nearest')
-                ax.set_title(label, fontsize=9, color='dimgray')
+                rt = ref_trajectories[i] if ref_trajectories and i < len(ref_trajectories) else None
+                plot_maze_with_path(
+                    ax, grid,
+                    positions=rt["positions"] if rt else None,
+                    dones=rt["dones"] if rt else None,
+                    color='blue', title=label,
+                )
 
         # Rows 1+: each generated maze with DTW profiles
         colors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12']
-        for gen_idx, (_, result) in enumerate(successful):
+        for gen_idx, (orig_idx, result) in enumerate(successful):
             row = 1 + gen_idx
             label = f"Generated {gen_idx + 1}"
 
             # Col 0: maze grid
             ax_maze = axes[row, 0]
-            img = grid_to_image(result.grid)
-            ax_maze.imshow(img, interpolation='nearest')
+            gt = gen_trajectories[gen_idx] if gen_trajectories and gen_idx < len(gen_trajectories) else None
             summary_str = ""
+            if gt and "solve_rate" in gt:
+                summary_str += f"\nsolve={gt['solve_rate']:.0%} best_ret={gt['best_return']:.3f}"
             if result.gate_metrics:
-                regret_str = ""
-                if 'regret' in result.gate_metrics:
-                    regret_str = f" regret={result.gate_metrics['regret']:.3f}"
-                summary_str = (
+                summary_str += (
                     f"\npos_dtw_min={result.gate_metrics.get('min_pos_dtw', 0):.2f}"
-                    f" val_dtw_mean={result.gate_metrics.get('mean_val_dtw', 0):.3f}"
-                    f"{regret_str}"
+                    f" pos_dtw_mean={result.gate_metrics.get('mean_pos_dtw', 0):.2f}"
                 )
-            ax_maze.set_title(label + summary_str, fontsize=9, fontweight='bold',
-                              color='darkgreen')
+            plot_maze_with_path(
+                ax_maze, result.grid,
+                positions=gt["positions"] if gt else None,
+                dones=gt["dones"] if gt else None,
+                color='red', title=label + summary_str,
+                title_color='darkgreen', title_bold=True,
+            )
 
             if not result.gate_pair_metrics:
                 continue
@@ -508,30 +573,12 @@ def save_results(
             ax_pos.grid(alpha=0.3)
             ax_pos.tick_params(labelsize=7)
 
-            # Col 2: Value DTW local_costs profiles
-            ax_val = axes[row, 2]
-            ax_val.axis('on')
-            for pi, pair in enumerate(result.gate_pair_metrics):
-                if pair.val_dtw_local_costs is not None:
-                    c = colors[pi % len(colors)]
-                    ax_val.plot(pair.val_dtw_local_costs, color=c, linewidth=1.2,
-                                label=f"vs {pair.ref_label} (d={pair.val_dtw_distance:.3f})",
-                                alpha=0.8)
-                    ax_val.fill_between(range(len(pair.val_dtw_local_costs)),
-                                         pair.val_dtw_local_costs, alpha=0.15, color=c)
-            ax_val.set_title("Value DTW Profile", fontsize=9)
-            ax_val.set_xlabel("Warping path step", fontsize=8)
-            ax_val.set_ylabel("Local cost (L1)", fontsize=8)
-            ax_val.legend(fontsize=7, loc='upper right')
-            ax_val.grid(alpha=0.3)
-            ax_val.tick_params(labelsize=7)
-
     else:
         # Simple layout without DTW profiles
         cols = max(n_refs, n_gens, 1)
         rows = 2 if n_gens > 0 else 1
 
-        fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3.5 * rows))
+        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
         fig.suptitle(
             f"LLM Maze Generation — {model}\n"
             f"{n_gens}/{len(results)} successful, "
@@ -552,18 +599,28 @@ def save_results(
 
         for i, (label, grid) in enumerate(ref_grids):
             if i < cols:
-                ax = axes[0, i]
-                img = grid_to_image(grid)
-                ax.imshow(img, interpolation='nearest')
-                ax.set_title(label, fontsize=9, color='dimgray')
+                rt = ref_trajectories[i] if ref_trajectories and i < len(ref_trajectories) else None
+                plot_maze_with_path(
+                    axes[0, i], grid,
+                    positions=rt["positions"] if rt else None,
+                    dones=rt["dones"] if rt else None,
+                    color='blue', title=label,
+                )
 
         if n_gens > 0:
             for i, (label, grid) in enumerate(gen_grids):
                 if i < cols:
-                    ax = axes[1, i]
-                    img = grid_to_image(grid)
-                    ax.imshow(img, interpolation='nearest')
-                    ax.set_title(label, fontsize=9, fontweight='bold', color='darkgreen')
+                    gt = gen_trajectories[i] if gen_trajectories and i < len(gen_trajectories) else None
+                    subtitle = label
+                    if gt and "solve_rate" in gt:
+                        subtitle += f"\nsolve={gt['solve_rate']:.0%} best_ret={gt['best_return']:.3f}"
+                    plot_maze_with_path(
+                        axes[1, i], grid,
+                        positions=gt["positions"] if gt else None,
+                        dones=gt["dones"] if gt else None,
+                        color='red', title=subtitle,
+                        title_color='darkgreen', title_bold=True,
+                    )
 
     plt.tight_layout()
     viz_path = os.path.join(run_dir, "visualization.png")
@@ -595,7 +652,7 @@ def run_test(args):
     if args.inject_metrics:
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
-        evaluator = AgentEvaluator(args.agent_dir)
+        evaluator = AgentEvaluator(args.agent_dir, num_steps=args.num_steps)
 
         ref_levels = []
         for idx, tok, score in ref_data:
@@ -610,6 +667,7 @@ def run_test(args):
         ref_data,
         trajectories=ref_trajectories,
         inject_regret=args.inject_regret,
+        downsample_points=args.downsample_points,
     )
 
     # Print reference mazes
@@ -679,11 +737,16 @@ def run_test(args):
 
     # Configure generator
     config = GenerationConfig(
+        provider=args.provider,
         base_url=args.base_url,
         model=args.model,
         api_key=args.api_key,
         temperature=args.temperature,
         max_retries=args.max_retries,
+        timeout=args.timeout,
+        min_walls=args.min_walls,
+        min_path_distance=args.min_path_distance,
+        validate_solvable=args.validate_solvable,
     )
     generator = MazeGenerator(config)
 
@@ -698,7 +761,7 @@ def run_test(args):
         # Reuse evaluator/trajectories if already loaded for metrics
         if not args.inject_metrics:
             from llm.agent_evaluator import AgentEvaluator
-            evaluator = AgentEvaluator(args.agent_dir)
+            evaluator = AgentEvaluator(args.agent_dir, num_steps=args.num_steps)
             ref_levels = [tokens_to_level_obj(tok) for _, tok, _ in ref_data]
             ref_trajectories = evaluator.evaluate_levels(ref_levels)
 
@@ -720,6 +783,7 @@ def run_test(args):
             instruction=args.instruction,
             diversity_thresholds=thresholds,
             max_diversity_retries=args.max_diversity_retries,
+            n_rollouts=args.n_rollouts,
         )
     else:
         print("\n" + "=" * 60)
@@ -759,72 +823,180 @@ def run_test(args):
             if result.success:
                 print_maze(result.grid, f"Generated {i + 1}")
 
+    # Roll out agent on successful generated mazes for path overlay
+    gen_trajectories = None
+    if args.inject_metrics and successes > 0:
+        gen_levels = []
+        for result in results:
+            if result.success:
+                try:
+                    level = Level.from_str(result.grid)
+                    gen_levels.append(level)
+                except Exception as e:
+                    logger.warning(f"Could not parse generated maze for rollout: {e}")
+                    gen_levels.append(None)
+        # Multi-rollout evaluation for generated levels (100 rollouts each)
+        gen_trajectories = []
+        for i, lv in enumerate(gen_levels):
+            if lv is not None:
+                logger.info(f"Multi-rollout (100x) on generated maze {i+1}...")
+                traj = evaluator.evaluate_level_multi_rollout(lv, n_rollouts=args.n_rollouts)
+                logger.info(
+                    f"  solve_rate={traj['solve_rate']:.0%}, "
+                    f"best_return={traj['best_return']:.3f}"
+                )
+                gen_trajectories.append(traj)
+            else:
+                gen_trajectories.append(None)
+
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_short = args.model.replace(":", "_").replace("/", "_")
     run_dir = os.path.join(OUTPUT_DIR, f"{timestamp}_{model_short}")
-    save_results(results, references, args.model, run_dir)
+    save_results(
+        results, references, args.model, run_dir,
+        ref_trajectories=ref_trajectories,
+        gen_trajectories=gen_trajectories,
+    )
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    - maze_XXX.txt files (ASCII grids)")
     print(f"    - metadata.json (run details)")
     print(f"    - visualization.png (visual grid)")
 
 
+def load_config(config_path: str) -> dict:
+    """Load YAML config file and return as dict.
+
+    Flattens provider-specific settings into top-level keys
+    (base_url, api_key_env) based on the active provider.
+    """
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f) or {}
+
+    # Flatten provider-specific block
+    provider = cfg.get("provider", "ollama")
+    provider_cfg = cfg.get(provider, {})
+    cfg.setdefault("base_url", provider_cfg.get("base_url", ""))
+    cfg.setdefault("api_key_env", provider_cfg.get("api_key_env", ""))
+
+    # Remove provider sub-dicts (not needed downstream)
+    cfg.pop("ollama", None)
+    cfg.pop("openrouter", None)
+
+    return cfg
+
+
 def main():
+    # Pre-parse to find --config before building the full parser
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=None, help="Path to YAML config file")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    # Load config defaults
+    cfg = {}
+    config_path = pre_args.config
+    if config_path is None:
+        # Auto-detect config.yaml next to this script
+        default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        if os.path.exists(default_config):
+            config_path = default_config
+    if config_path:
+        logger.info(f"Loading config from {config_path}")
+        cfg = load_config(config_path)
+
+    # Resolve API key: config api_key_env -> env var -> empty
+    api_key_default = ""
+    api_key_env = cfg.get("api_key_env", "")
+    if api_key_env:
+        api_key_default = os.environ.get(api_key_env, "")
+
     parser = argparse.ArgumentParser(description="Test LLM maze generator with saved buffer")
-    parser.add_argument(
-        "--buffer-path",
-        default="gcs_artifacts/buffer/buffer_dump_final.npz",
-        help="Path to buffer dump .npz file",
-    )
-    parser.add_argument("--n", type=int, default=5, help="Number of mazes to generate")
-    parser.add_argument("--num-refs", type=int, default=3, help="Number of reference mazes")
-    parser.add_argument(
-        "--strategy",
-        choices=["top_regret", "random", "diverse"],
-        default="top_regret",
-        help="Reference selection strategy",
-    )
+    parser.add_argument("--config", default=None, help="Path to YAML config file")
+    # All defaults come from config.yaml. The cfg.get() calls below have no
+    # hardcoded fallbacks — if config.yaml is missing a key, argparse will
+    # require it via CLI flag instead of silently using a stale default.
+
+    parser.add_argument("--buffer-path", default=cfg.get("buffer_path"),
+                        help="Path to buffer dump .npz file")
+    parser.add_argument("--n", type=int, default=cfg.get("n"),
+                        help="Number of mazes to generate")
+    parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
+                        help="Number of reference mazes")
+    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse"],
+                        default=cfg.get("strategy"),
+                        help="Reference selection strategy")
 
     # Metric injection flags
-    parser.add_argument("--inject-metrics", action="store_true", default=True,
-                        help="Compute top-5 metrics from agent rollouts (default: on)")
+    parser.add_argument("--inject-metrics", action="store_true",
+                        default=cfg.get("inject_metrics"),
+                        help="Compute top-5 metrics from agent rollouts")
     parser.add_argument("--no-inject-metrics", action="store_false", dest="inject_metrics")
-    parser.add_argument("--inject-regret", action="store_true", default=True,
-                        help="Include regret scores in prompt (default: on)")
+    parser.add_argument("--inject-regret", action="store_true",
+                        default=cfg.get("inject_regret"),
+                        help="Include regret scores in prompt")
     parser.add_argument("--no-inject-regret", action="store_false", dest="inject_regret")
-    parser.add_argument("--inject-buffer-stats", action="store_true", default=True,
+    parser.add_argument("--inject-buffer-stats", action="store_true",
+                        default=cfg.get("inject_buffer_stats"),
                         help="Include buffer-wide statistics")
     parser.add_argument("--no-inject-buffer-stats", action="store_false", dest="inject_buffer_stats")
 
     # LLM settings
-    parser.add_argument("--base-url", default="https://ollama.com",
-                        help="Ollama cloud API base URL")
-    parser.add_argument("--model", default="kimi-k2.5:cloud", help="Model name")
-    parser.add_argument("--api-key", default="",
-                        help="API key (auto-loaded from OLLAMA_API_KEY env var or .env)")
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--provider", choices=["ollama", "openrouter"],
+                        default=cfg.get("provider"),
+                        help="API provider")
+    parser.add_argument("--base-url", default=cfg.get("base_url"),
+                        help="API base URL")
+    parser.add_argument("--model", default=cfg.get("model"),
+                        help="Model name")
+    parser.add_argument("--api-key", default=api_key_default or None,
+                        help="API key (auto-loaded from env var specified in config)")
+    parser.add_argument("--temperature", type=float,
+                        default=cfg.get("temperature"))
+    parser.add_argument("--max-retries", type=int,
+                        default=cfg.get("max_retries"))
+    parser.add_argument("--timeout", type=int, default=cfg.get("timeout"),
+                        help="API request timeout in seconds")
+    parser.add_argument("--min-walls", type=int, default=cfg.get("min_walls"),
+                        help="Minimum wall cells for valid maze")
+    parser.add_argument("--min-path-distance", type=int,
+                        default=cfg.get("min_path_distance"),
+                        help="Minimum Manhattan distance agent-to-goal")
+    parser.add_argument("--validate-solvable", action="store_true",
+                        default=cfg.get("validate_solvable", True),
+                        help="BFS solvability check on generated mazes")
+    parser.add_argument("--no-validate-solvable", action="store_false",
+                        dest="validate_solvable")
 
     # Custom instruction
-    parser.add_argument("--instruction", default="",
+    parser.add_argument("--instruction", default=cfg.get("instruction", ""),
                         help="Custom generation instruction")
 
     # Feedback loop
-    parser.add_argument("--feedback", action="store_true", default=False,
+    parser.add_argument("--feedback", action="store_true",
+                        default=cfg.get("feedback"),
                         help="Enable metric feedback loop (requires agent checkpoint)")
-    parser.add_argument("--agent-dir",
-                        default="gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198",
+    parser.add_argument("--agent-dir", default=cfg.get("agent_dir"),
                         help="Path to agent checkpoint directory")
-    parser.add_argument("--max-diversity-retries", type=int, default=2,
+    parser.add_argument("--num-steps", type=int, default=cfg.get("num_steps"),
+                        help="Max rollout steps per episode")
+    parser.add_argument("--n-rollouts", type=int, default=cfg.get("n_rollouts"),
+                        help="Agent rollouts per maze for robust regret")
+    parser.add_argument("--downsample-points", type=int,
+                        default=cfg.get("downsample_points"),
+                        help="Max points when downsampling metric vectors for LLM prompt")
+    parser.add_argument("--max-diversity-retries", type=int,
+                        default=cfg.get("max_diversity_retries"),
                         help="Max diversity gate retries per maze")
-    parser.add_argument("--min-pos-dtw", type=float, default=0.5,
+    parser.add_argument("--min-pos-dtw", type=float,
+                        default=cfg.get("min_pos_dtw"),
                         help="Min position trace DTW for diversity gate")
-    parser.add_argument("--min-regret", type=float, default=None,
-                        help="Min regret to accept (rejects trivially easy mazes, None=disabled)")
+    parser.add_argument("--min-regret", type=float,
+                        default=cfg.get("min_regret"),
+                        help="Min regret to accept (null = disabled)")
 
     # Mode
     parser.add_argument("--dry-run", action="store_true",
+                        default=cfg.get("dry_run", False),
                         help="Only build prompts, skip LLM calls")
 
     args = parser.parse_args()

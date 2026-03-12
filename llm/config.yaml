@@ -1,0 +1,52 @@
+# LLM Maze Generator Configuration
+# ----------------------------------
+# Used by: python -m llm.test_generator [--config llm/config.yaml]
+# All values here can be overridden by CLI flags.
+
+# --- Provider & Model ---
+provider: ollama            # "ollama" or "openrouter"
+model: kimi-k2.5:cloud      # Model identifier
+temperature: 0.8
+timeout: 600                # API request timeout in seconds
+
+# Provider-specific settings (auto-selected by provider field)
+ollama:
+  base_url: https://ollama.com
+  api_key_env: OLLAMA_API_KEY       # env var name for API key
+
+openrouter:
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+
+# --- Generation ---
+n: 3                        # Number of mazes to generate
+max_retries: 3              # Max LLM retries on invalid output
+min_walls: 10               # Minimum wall cells for valid maze
+min_path_distance: 4        # Minimum Manhattan distance agent-to-goal
+validate_solvable: true     # BFS solvability check on generated mazes
+
+# --- Reference Mazes ---
+buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
+num_refs: 3                 # Number of reference mazes from buffer
+strategy: top_regret        # "top_regret", "random", or "diverse"
+
+# --- Metric Injection ---
+inject_metrics: true        # Compute metrics from agent rollouts
+inject_regret: true         # Include regret scores in prompt
+inject_buffer_stats: true   # Include buffer-wide statistics
+
+# --- Agent & Feedback Loop ---
+agent_dir: gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198
+num_steps: 250              # Max rollout steps per episode
+n_rollouts: 100             # Agent rollouts per maze for robust regret
+feedback: false             # Enable diversity feedback loop
+max_diversity_retries: 2
+min_pos_dtw: 0.5            # Position trace DTW threshold
+min_regret: null            # Regret threshold (null = disabled)
+
+# --- Metric Display ---
+downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt
+
+# --- Output ---
+# instruction: ""           # Optional custom generation instruction
+# dry_run: false             # Build prompts only, skip LLM calls

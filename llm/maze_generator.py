@@ -36,9 +36,9 @@ from llm.prompt_builder import (
 logger = logging.getLogger(__name__)
 
 
-def _load_api_key() -> str:
-    """Load OLLAMA_API_KEY from environment or .env file."""
-    key = os.environ.get("OLLAMA_API_KEY", "")
+def _load_api_key(env_var: str = "OLLAMA_API_KEY") -> str:
+    """Load API key from environment variable or .env file."""
+    key = os.environ.get(env_var, "")
     if key:
         return key
     # Try .env file in project root
@@ -47,7 +47,7 @@ def _load_api_key() -> str:
         with open(env_path) as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("OLLAMA_API_KEY="):
+                if line.startswith(f"{env_var}="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
     return ""
 
@@ -56,34 +56,47 @@ def _load_api_key() -> str:
 class GenerationConfig:
     """Configuration for the LLM maze generator.
 
-    Attributes:
-        base_url: Ollama cloud API base URL
-        model: Model name/identifier (e.g. "kimi-k2.5:cloud")
-        api_key: API key for authentication. Auto-loaded from OLLAMA_API_KEY
-            env var or .env file if empty.
-        temperature: Sampling temperature (higher = more creative)
-        max_retries: Maximum retry attempts on invalid output
-        timeout: Request timeout in seconds
-        min_walls: Minimum number of wall cells for a valid maze
-        min_path_distance: Minimum Manhattan distance between agent and goal
-        validate_solvable: Whether to check maze solvability (requires env)
+    All values are loaded from llm/config.yaml and/or CLI flags.
+    The dataclass holds no provider-specific defaults — config.yaml is
+    the single source of truth.
     """
-    base_url: str = "https://ollama.com"
-    model: str = "kimi-k2.5:cloud"
+    provider: str = ""
+    base_url: str = ""
+    model: str = ""
     api_key: str = ""
-    temperature: float = 0.8
-    max_retries: int = 3
-    timeout: int = 300
-    min_walls: int = 10
-    min_path_distance: int = 4
+    temperature: float = 0.0
+    max_retries: int = 0
+    timeout: int = 0
+    min_walls: int = 0
+    min_path_distance: int = 0
     validate_solvable: bool = True
 
+    # Provider defaults (used only as fallback when no config file is loaded)
+    _PROVIDER_DEFAULTS = {
+        "ollama": {
+            "base_url": "https://ollama.com",
+            "api_key_env": "OLLAMA_API_KEY",
+        },
+        "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key_env": "OPENROUTER_API_KEY",
+        },
+    }
+
     def __post_init__(self):
+        if not self.provider:
+            self.provider = "ollama"
+        defaults = self._PROVIDER_DEFAULTS.get(self.provider, {})
+        if not self.base_url:
+            self.base_url = defaults.get("base_url", "")
         if not self.api_key:
-            self.api_key = _load_api_key()
+            env_var = defaults.get("api_key_env", "")
+            if env_var:
+                self.api_key = _load_api_key(env_var)
         if not self.api_key:
             logger.warning(
-                "No OLLAMA_API_KEY found. Set it via environment variable or .env file."
+                f"No API key found for provider '{self.provider}'. "
+                f"Set {defaults.get('api_key_env', 'API_KEY')} via environment variable or .env file."
             )
 
 
@@ -258,6 +271,12 @@ class MazeGenerator:
         return result
 
     def _call_llm(self, messages: List[Dict]) -> Optional[str]:
+        """Call the LLM API. Dispatches to Ollama or OpenAI-compatible format."""
+        if self.config.provider == "openrouter":
+            return self._call_openai_compatible(messages)
+        return self._call_ollama(messages)
+
+    def _call_ollama(self, messages: List[Dict]) -> Optional[str]:
         """Call the Ollama cloud API (/api/chat endpoint)."""
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
@@ -276,10 +295,7 @@ class MazeGenerator:
         try:
             logger.debug(f"Calling {url} with model={self.config.model}")
             resp = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=self.config.timeout,
+                url, json=payload, headers=headers, timeout=self.config.timeout,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -292,6 +308,39 @@ class MazeGenerator:
                     logger.info("Content was empty, using thinking field as fallback")
                     content = thinking
             return content
+        except requests.exceptions.RequestException as e:
+            logger.error(f"LLM API error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response body: {e.response.text[:500]}")
+            return None
+        except (KeyError, IndexError) as e:
+            logger.error(f"Unexpected API response format: {e}")
+            logger.error(f"Response data: {data}")
+            return None
+
+    def _call_openai_compatible(self, messages: List[Dict]) -> Optional[str]:
+        """Call an OpenAI-compatible API (OpenRouter, etc.)."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}",
+        }
+
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+        }
+
+        url = f"{self.config.base_url}/chat/completions"
+        try:
+            logger.debug(f"Calling {url} with model={self.config.model}")
+            resp = requests.post(
+                url, json=payload, headers=headers, timeout=self.config.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
         except requests.exceptions.RequestException as e:
             logger.error(f"LLM API error: {e}")
             if hasattr(e, 'response') and e.response is not None:
@@ -499,6 +548,7 @@ class MazeGenerator:
         solvability_checker: Optional[Callable] = None,
         diversity_thresholds=None,
         max_diversity_retries: int = 2,
+        n_rollouts: int = 100,
     ) -> GenerationResult:
         """Generate a maze with full metric feedback loop.
 
@@ -521,6 +571,7 @@ class MazeGenerator:
             solvability_checker: Optional solvability checker
             diversity_thresholds: DiversityThresholds instance (or None for defaults)
             max_diversity_retries: Max times to retry after diversity gate failure
+            n_rollouts: Number of agent rollouts per maze
 
         Returns:
             GenerationResult with additional gate_result attribute
@@ -555,16 +606,25 @@ class MazeGenerator:
 
         # Step 2-4: Metric feedback loop
         for diversity_attempt in range(max_diversity_retries + 1):
-            # Run agent on candidate
+            # Run agent on candidate (100 rollouts for robust regret)
             logger.info(f"Running agent on candidate (diversity attempt {diversity_attempt + 1})...")
-            candidate_traj = agent_evaluator.evaluate_level(result.level)
+            candidate_traj = agent_evaluator.evaluate_level_multi_rollout(
+                result.level, n_rollouts=n_rollouts,
+            )
+            solve_rate = candidate_traj.get("solve_rate", 0.0)
+            best_return = candidate_traj.get("best_return", 0.0)
+            logger.info(
+                f"  100-rollout: solve_rate={solve_rate:.0%}, "
+                f"best_return={best_return:.3f}"
+            )
 
-            # Compute diversity metrics (including regret)
+            # Compute diversity metrics (using best_return for regret)
             gate_result = evaluate_candidate(
                 candidate_traj,
                 reference_trajectories,
                 reference_labels,
                 thresholds,
+                stored_max_return=best_return,
             )
 
             # Log metrics
@@ -762,6 +822,7 @@ class MazeGenerator:
         solvability_checker: Optional[Callable] = None,
         diversity_thresholds=None,
         max_diversity_retries: int = 2,
+        n_rollouts: int = 100,
     ) -> List[GenerationResult]:
         """Generate multiple mazes with metric feedback loop.
 
@@ -787,6 +848,7 @@ class MazeGenerator:
                 solvability_checker=solvability_checker,
                 diversity_thresholds=diversity_thresholds,
                 max_diversity_retries=max_diversity_retries,
+                n_rollouts=n_rollouts,
             )
             results.append(result)
 
