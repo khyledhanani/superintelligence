@@ -734,22 +734,30 @@ def main(config=None, project="JAXUED_TEST"):
     use_pca = _needs_vae and config["use_cmaes"] and config.get("cmaes_pca_dims", 0) > 0
     if use_pca:
         pca_dims = config["cmaes_pca_dims"]
-        pca_data_path = config.get("cmaes_pca_data") or config.get("cmaes_kl_data")
-        n_pca_samples = config.get("cmaes_kl_samples", 5000)
-        if pca_data_path and os.path.exists(pca_data_path):
-            print(f"[PCA] Loading token data from {pca_data_path}...")
-            pca_tokens = jnp.array(np.load(pca_data_path)[:n_pca_samples])
+        # Skip initial PCA fit if warm-start buffer is provided (PCA will be fit on buffer instead)
+        if config.get("warmstart_buffer"):
+            print(f"[PCA] Deferring initial PCA fit to warm-start buffer")
+            # Create placeholder PCA arrays with correct shapes (will be overwritten)
+            full_d = vae_cfg["latent_dim"]
+            pca_mean_init = jnp.zeros(full_d)
+            pca_components_init = jnp.eye(pca_dims, full_d)
         else:
-            if pca_data_path:
-                print(f"[PCA] WARNING: {pca_data_path} not found, falling back to random levels")
-            print(f"[PCA] Generating {n_pca_samples} random levels...")
-            sample_rng = jax.random.PRNGKey(0)
-            sample_levels = jax.vmap(sample_random_level)(jax.random.split(sample_rng, n_pca_samples))
-            pca_tokens = jax.vmap(level_to_tokens)(sample_levels)
+            pca_data_path = config.get("cmaes_pca_data") or config.get("cmaes_kl_data")
+            n_pca_samples = config.get("cmaes_kl_samples", 5000)
+            if pca_data_path and os.path.exists(pca_data_path):
+                print(f"[PCA] Loading token data from {pca_data_path}...")
+                pca_tokens = jnp.array(np.load(pca_data_path)[:n_pca_samples])
+            else:
+                if pca_data_path:
+                    print(f"[PCA] WARNING: {pca_data_path} not found, falling back to random levels")
+                print(f"[PCA] Generating {n_pca_samples} random levels...")
+                sample_rng = jax.random.PRNGKey(0)
+                sample_levels = jax.vmap(sample_random_level)(jax.random.split(sample_rng, n_pca_samples))
+                pca_tokens = jax.vmap(level_to_tokens)(sample_levels)
 
-        print(f"[PCA] Encoding {pca_tokens.shape[0]} levels through VAE...")
-        pca_latent_means = encode_levels_to_means(vae_encode_fn, pca_tokens)
-        pca_mean_init, pca_components_init = fit_pca(pca_latent_means, pca_dims)
+            print(f"[PCA] Encoding {pca_tokens.shape[0]} levels through VAE...")
+            pca_latent_means = encode_levels_to_means(vae_encode_fn, pca_tokens)
+            pca_mean_init, pca_components_init = fit_pca(pca_latent_means, pca_dims)
 
         # PCA overrides KL filtering for CMA-ES search dim
         cmaes_latent_dim = pca_dims
@@ -1608,26 +1616,32 @@ def main(config=None, project="JAXUED_TEST"):
                 ts_cur = ts_cur.replace(cenie_gmm_params=new_gmm_params)
                 runner_state = (rng_cur, ts_cur)
 
-        # PCA refit: combine buffer levels + random levels
+        # PCA refit
         if use_pca and config.get("cmaes_pca_refit_interval", 0) > 0:
             if (eval_step + 1) % config["cmaes_pca_refit_interval"] == 0:
                 rng_cur, ts_cur = runner_state
                 buf_size = int(ts_cur.sampler["size"])
                 if buf_size >= config["cmaes_pca_dims"]:
-                    print(f"[PCA refit @ eval_step={eval_step+1}] Using {buf_size} buffer + random levels")
                     # Encode buffer levels
                     buf_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], ts_cur.sampler["levels"])
                     buf_tokens = jax.vmap(level_to_tokens)(buf_levels)
                     buf_means = encode_levels_to_means(vae_encode_fn, buf_tokens)
-                    # Also encode random levels (same count as buffer for balance)
-                    n_random = min(buf_size, config.get("cmaes_kl_samples", 5000))
-                    rng_pca = jax.random.PRNGKey(eval_step)
-                    rand_levels = jax.vmap(sample_random_level)(jax.random.split(rng_pca, n_random))
-                    rand_tokens = jax.vmap(level_to_tokens)(rand_levels)
-                    rand_means = encode_levels_to_means(vae_encode_fn, rand_tokens)
-                    # Combine and refit
-                    combined_means = jnp.concatenate([buf_means, rand_means], axis=0)
-                    new_pca_mean, new_pca_components = fit_pca(combined_means, config["cmaes_pca_dims"])
+
+                    if config.get("cmaes_pca_buffer_only", False):
+                        # Buffer-only PCA
+                        print(f"[PCA refit @ eval_step={eval_step+1}] Using {buf_size} buffer levels only")
+                        refit_means = buf_means
+                    else:
+                        # Buffer + random levels
+                        n_random = min(buf_size, config.get("cmaes_kl_samples", 5000))
+                        print(f"[PCA refit @ eval_step={eval_step+1}] Using {buf_size} buffer + {n_random} random levels")
+                        rng_pca = jax.random.PRNGKey(eval_step)
+                        rand_levels = jax.vmap(sample_random_level)(jax.random.split(rng_pca, n_random))
+                        rand_tokens = jax.vmap(level_to_tokens)(rand_levels)
+                        rand_means = encode_levels_to_means(vae_encode_fn, rand_tokens)
+                        refit_means = jnp.concatenate([buf_means, rand_means], axis=0)
+
+                    new_pca_mean, new_pca_components = fit_pca(refit_means, config["cmaes_pca_dims"])
                     # Reset CMA-ES (coordinate system changed)
                     new_es = cmaes_mgr.initialize(jax.random.PRNGKey(eval_step + 1000))
                     ts_cur = ts_cur.replace(
@@ -1953,6 +1967,8 @@ if __name__=="__main__":
                        help="Path to .npy token file for PCA fitting. Falls back to --cmaes_kl_data or random levels.")
     group.add_argument("--cmaes_pca_refit_interval", type=int, default=0,
                        help="Refit PCA every N eval steps using buffer + random levels (0 = never, static PCA)")
+    group.add_argument("--cmaes_pca_buffer_only", action=argparse.BooleanOptionalAction, default=False,
+                       help="Refit PCA on buffer levels only (no random levels mixed in)")
     group.add_argument("--warmstart_checkpoint", type=str, default=None,
                        help="Path to Orbax checkpoint dir to warm-start agent params from (e.g. checkpoints/run/0/models)")
     group.add_argument("--warmstart_buffer", type=str, default=None,
