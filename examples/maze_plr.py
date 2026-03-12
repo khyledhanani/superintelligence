@@ -774,9 +774,10 @@ def main(config=None, project="JAXUED_TEST"):
         if config.get("warmstart_buffer"):
             print(f"[PCA] Deferring initial PCA fit to warm-start buffer")
             # Create placeholder PCA arrays with correct shapes (will be overwritten)
-            full_d = vae_cfg["latent_dim"]
-            pca_mean_init = jnp.zeros(full_d)
-            pca_components_init = jnp.eye(pca_dims, full_d)
+            # If KL filtering is active, PCA operates in active-dim subspace
+            pca_space_dim = len(active_dims) if active_dims is not None else vae_cfg["latent_dim"]
+            pca_mean_init = jnp.zeros(pca_space_dim)
+            pca_components_init = jnp.eye(pca_dims, pca_space_dim)
         else:
             pca_data_path = config.get("cmaes_pca_data") or config.get("cmaes_kl_data")
             n_pca_samples = config.get("cmaes_kl_samples", 5000)
@@ -793,11 +794,17 @@ def main(config=None, project="JAXUED_TEST"):
 
             print(f"[PCA] Encoding {pca_tokens.shape[0]} levels through VAE...")
             pca_latent_means = encode_levels_to_means(vae_encode_fn, pca_tokens)
+            # If KL filtering is active, fit PCA only on active dims
+            if active_dims is not None:
+                print(f"[PCA] Restricting PCA to {len(active_dims)} KL-active dims")
+                pca_latent_means = pca_latent_means[:, active_dims]
             pca_mean_init, pca_components_init = fit_pca(pca_latent_means, pca_dims)
 
-        # PCA overrides KL filtering for CMA-ES search dim
+        # PCA sets the CMA-ES search dim
         cmaes_latent_dim = pca_dims
-        active_dims = None  # PCA handles dimensionality reduction instead
+        # NOTE: if KL filtering is active, keep active_dims so the decode wrapper
+        # expands from active subspace to full 64 dims. PCA will operate within
+        # the active subspace (not full latent space).
 
         wandb.run.summary["pca_dims"] = pca_dims
         if not config.get("warmstart_buffer"):
@@ -817,8 +824,11 @@ def main(config=None, project="JAXUED_TEST"):
         )
         print(f"[CMA-ES] VAE loaded from {config['vae_checkpoint_path']}")
         print(f"[CMA-ES] search_dim={cmaes_latent_dim}, full_latent_dim={full_latent_dim}, popsize={config['num_train_envs']}")
+        if active_dims is not None:
+            print(f"[CMA-ES] KL filtering: {len(active_dims)}/{full_latent_dim} active dims")
         if use_pca:
-            print(f"[CMA-ES] Using PCA projection ({pca_dims} PCs)")
+            pca_input_dim = len(active_dims) if active_dims is not None else full_latent_dim
+            print(f"[CMA-ES] PCA: {pca_input_dim} dims -> {pca_dims} PCs")
 
     # And the level sampler    
     level_sampler = LevelSampler(
@@ -1572,6 +1582,10 @@ def main(config=None, project="JAXUED_TEST"):
         if use_pca and vae_encode_fn is not None:
             print(f"[Warmstart] Refitting PCA on {ws_size} buffer levels...")
             ws_means = encode_levels_to_means(vae_encode_fn, jnp.array(ws_tokens))
+            # If KL filtering is active, restrict to active dims
+            if active_dims is not None:
+                print(f"[Warmstart PCA] Restricting to {len(active_dims)} KL-active dims")
+                ws_means = ws_means[:, active_dims]
             ws_fitness = jnp.array(ws_scores) if config.get("cmaes_pca_fitness_aware") else None
             ws_pca_mean, ws_pca_components = fit_pca(ws_means, config["cmaes_pca_dims"], fitness_scores=ws_fitness)
 
@@ -1689,6 +1703,9 @@ def main(config=None, project="JAXUED_TEST"):
                     buf_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], ts_cur.sampler["levels"])
                     buf_tokens = jax.vmap(level_to_tokens)(buf_levels)
                     buf_means = encode_levels_to_means(vae_encode_fn, buf_tokens)
+                    # If KL filtering is active, restrict to active dims
+                    if active_dims is not None:
+                        buf_means = buf_means[:, active_dims]
 
                     if config.get("cmaes_pca_buffer_only", False):
                         # Buffer-only PCA
@@ -1702,6 +1719,8 @@ def main(config=None, project="JAXUED_TEST"):
                         rand_levels = jax.vmap(sample_random_level)(jax.random.split(rng_pca, n_random))
                         rand_tokens = jax.vmap(level_to_tokens)(rand_levels)
                         rand_means = encode_levels_to_means(vae_encode_fn, rand_tokens)
+                        if active_dims is not None:
+                            rand_means = rand_means[:, active_dims]
                         refit_means = jnp.concatenate([buf_means, rand_means], axis=0)
 
                     # Use buffer fitness scores for fitness-aware PCA
