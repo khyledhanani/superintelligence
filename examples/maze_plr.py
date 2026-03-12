@@ -697,9 +697,15 @@ def main(config=None, project="JAXUED_TEST"):
     full_latent_dim = vae_cfg["latent_dim"] if _needs_vae else None
     if _needs_vae and config["use_cmaes"] and config["cmaes_kl_threshold"] > 0:
         kl_data_path = config.get("cmaes_kl_data")
+        ws_buffer_path = config.get("warmstart_buffer")
         if kl_data_path and os.path.exists(kl_data_path):
             print(f"[KL-filter] Loading token data from {kl_data_path}...")
             sample_tokens = jnp.array(np.load(kl_data_path)[:config["cmaes_kl_samples"]])
+        elif ws_buffer_path and os.path.exists(ws_buffer_path):
+            print(f"[KL-filter] Using warm-start buffer for KL estimation...")
+            ws_buf_kl = np.load(ws_buffer_path, allow_pickle=True)
+            sample_tokens = jnp.array(ws_buf_kl["tokens"][:config["cmaes_kl_samples"]])
+            print(f"[KL-filter] Loaded {sample_tokens.shape[0]} tokens from buffer")
         else:
             if kl_data_path:
                 print(f"[KL-filter] WARNING: {kl_data_path} not found, falling back to random levels")
