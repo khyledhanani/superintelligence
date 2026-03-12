@@ -764,10 +764,12 @@ def main(config=None, project="JAXUED_TEST"):
         active_dims = None  # PCA handles dimensionality reduction instead
 
         wandb.run.summary["pca_dims"] = pca_dims
-        wandb.run.summary["pca_explained_var"] = float(
-            jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1][:pca_dims]**2)
-            / jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1]**2)
-        )
+        if not config.get("warmstart_buffer"):
+            # Log explained variance (only when we have pca_latent_means from initial fit)
+            wandb.run.summary["pca_explained_var"] = float(
+                jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1][:pca_dims]**2)
+                / jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1]**2)
+            )
 
     # --- CMA-ES setup ---
     cmaes_mgr = None
