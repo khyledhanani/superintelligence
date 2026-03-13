@@ -70,7 +70,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 ## Progress
 
 **Execution Order:**
-Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5
+Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -79,6 +79,7 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5
 | 3. Integration | 2/2 | Complete | 2026-03-11 |
 | 4. Experiment | 0/? | Not started | - |
 | 5. PCA-Space CMA-ES | 3/3 | Complete | 2026-03-13 |
+| 6. TPU Run + Comparison | 0/3 | Not started | - |
 
 ### Phase 5: PCA-Space CMA-ES Search
 **Goal**: Two-stage dimensionality reduction for CMA-ES: Stage 1 (weight-norm pruned latent search, ~30 dims from step 0 using checkpoint weights) and Stage 2 (buffer PCA search, K components after 10k steps). CMA-ES searches in a reduced subspace that reflects the valid maze manifold, giving it free covariance structure and O(K^2) sample complexity instead of O(64^2).
@@ -94,3 +95,15 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5
 - [x] 05-01-PLAN.md — Create vae/cnn_vae_pca_utils.py (5 functions) + scripts/download_pca_dataset.py
 - [x] 05-02-PLAN.md — Integrate Stage 1 + Stage 2 into maze_plr.py (flags, setup, transition hook, JIT factory)
 - [x] 05-03-PLAN.md — Write and run smoke_test_pca_search.py (PCA-08: offline + 500-step training)
+
+### Phase 6: Run PCA-space CMA-ES on TPU (30k steps, 5 seeds) and compare solve_rate against Phase 4 results
+
+**Goal:** Run PCA-space CMA-ES (Stage 1: 55 dims, Stage 2: 20 PCA dims at 10k steps) on TPU cma-es-v4 for 5 seeds x 30k updates, then produce a 3-way solve_rate comparison: PCA-CMA-ES vs CMA-ES-CNN-VAE (Phase 4) vs ACCEL baseline (Phase 4)
+**Requirements**: RUN-01, RUN-02, RUN-03
+**Depends on:** Phase 5
+**Plans:** 3 plans
+
+Plans:
+- [ ] 06-01-PLAN.md — Create examples/launch_pca_comparison.sh + scripts/compare_phase4_results.py
+- [ ] 06-02-PLAN.md — Sync files to TPU and launch 5-seed experiment (human checkpoint)
+- [ ] 06-03-PLAN.md — Retrieve WandB results and write 06-RESULTS.md comparison table (human checkpoint)
