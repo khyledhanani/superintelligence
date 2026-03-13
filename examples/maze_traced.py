@@ -42,7 +42,7 @@ from jaxued.environments.maze import Level, make_level_generator, make_level_mut
 from jaxued.environments.underspecified_env import EnvParams, EnvState, Observation, UnderspecifiedEnv
 from jaxued.level_sampler import LevelSampler
 from jaxued.linen import ResetRNN
-from jaxued.utils import compute_max_returns
+from jaxued.utils import compute_max_mean_returns_epcount, compute_max_returns
 from jaxued.wrappers import AutoReplayWrapper
 
 
@@ -66,7 +66,17 @@ class TrainState(BaseTrainState):
     replay_last_task_difficulty: chex.Array = struct.field(pytree_node=True)
     mutation_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     traced_prev_replay_inds: chex.Array = struct.field(pytree_node=True)
+    traced_prev_replay_count: int
     traced_prev_replay_valid: chex.Array = struct.field(pytree_node=True)
+    traced_seed_scores: chex.Array = struct.field(pytree_node=True)
+    traced_regret_scores: chex.Array = struct.field(pytree_node=True)
+    traced_current_regret_score: chex.Array = struct.field(pytree_node=True)
+    traced_previous_regret_score: chex.Array = struct.field(pytree_node=True)
+    traced_regret_diff_changed: chex.Array = struct.field(pytree_node=True)
+    traced_regret_seen: chex.Array = struct.field(pytree_node=True)
+    traced_partial_seed_scores: chex.Array = struct.field(pytree_node=True)
+    traced_partial_seed_max_scores: chex.Array = struct.field(pytree_node=True)
+    traced_partial_seed_steps: chex.Array = struct.field(pytree_node=True)
     transition_params: dict = struct.field(pytree_node=True)
     transition_opt_state: optax.OptState = struct.field(pytree_node=True)
     transition_last_loss: chex.Array
@@ -302,6 +312,122 @@ def sample_trajectories_rnn_with_next_obs(
     return (rng, train_state, hstate, last_obs, last_env_state, last_value.squeeze(0)), traj
 
 
+def sample_replay_trajectories_rnn_with_next_obs(
+    rng: chex.PRNGKey,
+    env: UnderspecifiedEnv,
+    env_params: EnvParams,
+    level_sampler: LevelSampler,
+    sampler: dict,
+    train_state: TrainState,
+    init_hstate: chex.ArrayTree,
+    init_obs: Observation,
+    init_env_state: EnvState,
+    init_levels: Level,
+    init_level_inds: chex.Array,
+    num_envs: int,
+    max_episode_length: int,
+):
+    def sample_step(carry, _):
+        rng, sampler, train_state, hstate, obs, env_state, levels, level_inds, last_done = carry
+        rng, rng_action, rng_step, rng_resample, rng_reset = jax.random.split(rng, 5)
+
+        x = jax.tree_util.tree_map(lambda x_: x_[None, ...], (obs, last_done))
+        hstate, pi, value = train_state.apply_fn(train_state.params, x, hstate)
+        action = pi.sample(seed=rng_action)
+        log_prob = pi.log_prob(action)
+        value = value.squeeze(0)
+        action = action.squeeze(0)
+        log_prob = log_prob.squeeze(0)
+
+        next_obs, next_env_state, reward, done, info = jax.vmap(
+            env.step, in_axes=(0, 0, 0, None)
+        )(jax.random.split(rng_step, num_envs), env_state, action, env_params)
+
+        step_level_inds = level_inds
+        rng_resample_split = jax.random.split(rng_resample, num_envs)
+        rng_reset_split = jax.random.split(rng_reset, num_envs)
+
+        def maybe_resample_one(carry_i, env_idx):
+            sampler_i, obs_i, env_state_i, levels_i, level_inds_i = carry_i
+            done_i = done[env_idx]
+
+            def on_done(data):
+                sampler_d, obs_d, env_state_d, levels_d, level_inds_d = data
+                sampler_d, (new_level_idx, new_level) = level_sampler.sample_replay_level(
+                    sampler_d, rng_resample_split[env_idx]
+                )
+                new_obs, new_env_state = env.reset_to_level(rng_reset_split[env_idx], new_level, env_params)
+                obs_d = jax.tree_util.tree_map(lambda arr, val: arr.at[env_idx].set(val), obs_d, new_obs)
+                env_state_d = jax.tree_util.tree_map(
+                    lambda arr, val: arr.at[env_idx].set(val), env_state_d, new_env_state
+                )
+                levels_d = jax.tree_util.tree_map(lambda arr, val: arr.at[env_idx].set(val), levels_d, new_level)
+                level_inds_d = level_inds_d.at[env_idx].set(new_level_idx)
+                return sampler_d, obs_d, env_state_d, levels_d, level_inds_d
+
+            return (
+                jax.lax.cond(
+                    done_i,
+                    on_done,
+                    lambda data: data,
+                    (sampler_i, obs_i, env_state_i, levels_i, level_inds_i),
+                ),
+                None,
+            )
+
+        (sampler, next_obs, next_env_state, levels, level_inds), _ = jax.lax.scan(
+            maybe_resample_one,
+            (sampler, next_obs, next_env_state, levels, level_inds),
+            jnp.arange(num_envs),
+            length=num_envs,
+        )
+
+        carry = (rng, sampler, train_state, hstate, next_obs, next_env_state, levels, level_inds, done)
+        return carry, (obs, action, reward, done, log_prob, value, next_obs, info, step_level_inds)
+
+    (
+        rng,
+        sampler,
+        train_state,
+        hstate,
+        last_obs,
+        last_env_state,
+        last_levels,
+        last_level_inds,
+        last_done,
+    ), traj = jax.lax.scan(
+        sample_step,
+        (
+            rng,
+            sampler,
+            train_state,
+            init_hstate,
+            init_obs,
+            init_env_state,
+            init_levels,
+            init_level_inds,
+            jnp.zeros(num_envs, dtype=bool),
+        ),
+        None,
+        length=max_episode_length,
+    )
+
+    x = jax.tree_util.tree_map(lambda x_: x_[None, ...], (last_obs, last_done))
+    _, _, last_value = train_state.apply_fn(train_state.params, x, hstate)
+
+    return (
+        rng,
+        sampler,
+        train_state,
+        hstate,
+        last_obs,
+        last_env_state,
+        last_levels,
+        last_level_inds,
+        last_value.squeeze(0),
+    ), traj
+
+
 def evaluate_rnn(
     rng: chex.PRNGKey,
     env: UnderspecifiedEnv,
@@ -430,6 +556,7 @@ def main(config=None, project: str = "MAZE_TRACED"):
     if not isinstance(action_space, spaces.Discrete):
         raise ValueError("maze_traced.py currently expects a discrete action space.")
     action_dim = int(action_space.n)
+    transition_action_dim = 1
 
     rng = jax.random.PRNGKey(config["seed"])
     rng, rng_dummy, rng_tm_init = jax.random.split(rng, 3)
@@ -438,11 +565,11 @@ def main(config=None, project: str = "MAZE_TRACED"):
     image_shape = tuple(dummy_obs.image.shape)
 
     transition_model = ImageTransitionPredictionModel(
-        action_dim=action_dim,
+        action_dim=transition_action_dim,
         hidden_dim=int(config["traced_transition_hidden_dim"]),
     )
     dummy_images = jnp.zeros((1, 1, *image_shape), dtype=jnp.float32)
-    dummy_actions = jnp.zeros((1, 1, action_dim), dtype=jnp.float32)
+    dummy_actions = jnp.zeros((1, 1, transition_action_dim), dtype=jnp.float32)
     transition_params = transition_model.init(rng_tm_init, dummy_images, dummy_actions)["params"]
     transition_tx = optax.chain(
         optax.clip_by_global_norm(float(config["max_grad_norm"])),
@@ -454,20 +581,25 @@ def main(config=None, project: str = "MAZE_TRACED"):
     transition_opt_state = transition_tx.init(transition_params)
 
     @jax.jit
-    def update_transition_model(params, opt_state, obs_images, actions_one_hot, next_images):
+    def update_transition_model(
+        params,
+        opt_state,
+        obs_images,
+        actions_scalar,
+        next_images,
+        valid_mask,
+    ):
         def loss_fn(p):
-            pred_next = transition_model.apply({"params": p}, obs_images, actions_one_hot)
+            pred_next = transition_model.apply({"params": p}, obs_images, actions_scalar)
             loss_raw = jnp.abs(pred_next - next_images)
-            loss_per_step = loss_raw.mean(axis=(-1, -2, -3))
-            loss = loss_per_step.mean()
-            return loss, loss_per_step
+            loss_per_pair = loss_raw.mean(axis=(-1, -2, -3))
+            loss = (loss_per_pair * valid_mask).sum() / jnp.maximum(valid_mask.sum(), 1.0)
+            return loss, loss_per_pair
 
-        (loss, loss_per_step), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (loss, loss_per_pair), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, new_opt_state = transition_tx.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        atpl_mean = loss_per_step.mean(axis=1)
-        atpl_max = loss_per_step.max(axis=1)
-        return new_params, new_opt_state, loss, atpl_mean, atpl_max
+        return new_params, new_opt_state, loss, loss_per_pair
 
     encoder_params = None
     decoder_params = None
@@ -530,6 +662,21 @@ def main(config=None, project: str = "MAZE_TRACED"):
             pholder_level,
         )
         pholder_inds = jnp.zeros((config["num_train_envs"],), dtype=jnp.int32)
+        pholder_prev_inds = jnp.zeros((config["level_buffer_capacity"],), dtype=jnp.int32)
+        pholder_seed_scores = jnp.zeros((config["level_buffer_capacity"],), dtype=jnp.float32)
+        pholder_regret_flags = jnp.zeros((config["level_buffer_capacity"],), dtype=jnp.int32)
+        pholder_regret_seen = jnp.zeros((config["level_buffer_capacity"],), dtype=bool)
+        pholder_partial_scores = jnp.zeros(
+            (config["num_train_envs"], config["level_buffer_capacity"]), dtype=jnp.float32
+        )
+        pholder_partial_max = jnp.full(
+            (config["num_train_envs"], config["level_buffer_capacity"]),
+            -jnp.inf,
+            dtype=jnp.float32,
+        )
+        pholder_partial_steps = jnp.zeros(
+            (config["num_train_envs"], config["level_buffer_capacity"]), dtype=jnp.int32
+        )
 
         return TrainState.create(
             apply_fn=network.apply,
@@ -548,8 +695,18 @@ def main(config=None, project: str = "MAZE_TRACED"):
             replay_last_level_inds=pholder_inds,
             replay_last_task_difficulty=jnp.zeros((config["num_train_envs"],), dtype=jnp.float32),
             mutation_last_level_batch=pholder_level_batch,
-            traced_prev_replay_inds=pholder_inds,
+            traced_prev_replay_inds=pholder_prev_inds,
+            traced_prev_replay_count=0,
             traced_prev_replay_valid=jnp.array(False),
+            traced_seed_scores=pholder_seed_scores,
+            traced_regret_scores=pholder_seed_scores,
+            traced_current_regret_score=pholder_seed_scores,
+            traced_previous_regret_score=pholder_seed_scores,
+            traced_regret_diff_changed=pholder_regret_flags,
+            traced_regret_seen=pholder_regret_seen,
+            traced_partial_seed_scores=pholder_partial_scores,
+            traced_partial_seed_max_scores=pholder_partial_max,
+            traced_partial_seed_steps=pholder_partial_steps,
             transition_params=transition_params,
             transition_opt_state=transition_opt_state,
             transition_last_loss=jnp.array(0.0, dtype=jnp.float32),
@@ -562,6 +719,8 @@ def main(config=None, project: str = "MAZE_TRACED"):
     traced_num_mutation_parents = max(1, int(config["traced_num_mutation_parents"]))
     traced_transition_prob_weight = float(config["traced_transition_prob_weight"])
     traced_colearnability_weight = float(config["traced_colearnability_weight"])
+    traced_score_alpha = float(config["traced_score_alpha"])
+    traced_max_score_coef = float(config["traced_max_score_coef"])
 
     def build_traced_extras(max_returns, success, pvl, atpl, task_difficulty, success_obs_count):
         return {
@@ -576,12 +735,511 @@ def main(config=None, project: str = "MAZE_TRACED"):
             "traced_priority": task_difficulty,
         }
 
-    def prepare_transition_inputs(obs: Observation, actions: chex.Array, next_obs: Observation):
-        obs_images = jnp.swapaxes(obs.image, 0, 1).astype(jnp.float32)
-        next_images = jnp.swapaxes(next_obs.image, 0, 1).astype(jnp.float32)
-        actions_bt = jnp.swapaxes(actions, 0, 1)
-        actions_oh = jax.nn.one_hot(actions_bt, action_dim, dtype=jnp.float32)
-        return obs_images, actions_oh, next_images
+    def prepare_transition_pairs(obs: Observation, actions: chex.Array, dones: chex.Array):
+        obs_bt = jnp.swapaxes(obs.image, 0, 1).astype(jnp.float32)  # (B, T, H, W, C)
+        actions_bt = jnp.swapaxes(actions, 0, 1).astype(jnp.float32)  # (B, T)
+        dones_bt = jnp.swapaxes(dones, 0, 1)  # (B, T)
+        pair_obs = obs_bt[:, :-1]
+        pair_next_obs = obs_bt[:, 1:]
+        pair_actions = actions_bt[:, :-1, None]
+        pair_valid = (~dones_bt[:, :-1]).astype(jnp.float32)
+        return pair_obs, pair_actions, pair_next_obs, pair_valid
+
+    def mask_to_compact_indices(mask: chex.Array) -> tuple[chex.Array, chex.Array]:
+        idx = jnp.arange(mask.shape[0], dtype=jnp.int32)
+        sentinel = jnp.array(mask.shape[0], dtype=jnp.int32)
+        sortable = jnp.where(mask, idx, sentinel)
+        sorted_idx = jnp.sort(sortable)
+        count = mask.astype(jnp.int32).sum()
+        compact = jnp.where(
+            jnp.arange(mask.shape[0], dtype=jnp.int32) < count,
+            sorted_idx,
+            jnp.zeros_like(sorted_idx),
+        )
+        return compact, count
+
+    def sync_sampler_scores_with_traced(sampler: dict, seed_scores: chex.Array) -> dict:
+        valid = jnp.arange(level_sampler.capacity, dtype=jnp.int32) < sampler["size"]
+        synced_scores = jnp.where(valid, seed_scores, -jnp.inf)
+        level_extras = sampler["levels_extra"]
+        level_extras = {
+            **level_extras,
+            "traced_task_difficulty": jnp.where(valid, seed_scores, level_extras["traced_task_difficulty"]),
+            "traced_priority": jnp.where(valid, synced_scores, level_extras["traced_priority"]),
+        }
+        return {**sampler, "scores": synced_scores, "levels_extra": level_extras}
+
+    def initialize_inserted_seed_state(
+        train_state: TrainState, inserted_inds: chex.Array, inserted_scores: chex.Array
+    ) -> TrainState:
+        def body(i, state):
+            idx = inserted_inds[i]
+            score = inserted_scores[i]
+
+            def do_update(st):
+                seed_scores = st.traced_seed_scores.at[idx].set(score)
+                regret_scores = st.traced_regret_scores.at[idx].set(score)
+                current_regret = st.traced_current_regret_score.at[idx].set(score)
+                previous_regret = st.traced_previous_regret_score.at[idx].set(0.0)
+                regret_diff_changed = st.traced_regret_diff_changed.at[idx].set(1)
+                regret_seen = st.traced_regret_seen.at[idx].set(False)
+                partial_scores = st.traced_partial_seed_scores.at[:, idx].set(0.0)
+                partial_max = st.traced_partial_seed_max_scores.at[:, idx].set(-jnp.inf)
+                partial_steps = st.traced_partial_seed_steps.at[:, idx].set(0)
+                return st.replace(
+                    traced_seed_scores=seed_scores,
+                    traced_regret_scores=regret_scores,
+                    traced_current_regret_score=current_regret,
+                    traced_previous_regret_score=previous_regret,
+                    traced_regret_diff_changed=regret_diff_changed,
+                    traced_regret_seen=regret_seen,
+                    traced_partial_seed_scores=partial_scores,
+                    traced_partial_seed_max_scores=partial_max,
+                    traced_partial_seed_steps=partial_steps,
+                )
+
+            return jax.lax.cond(idx >= 0, do_update, lambda st: st, state)
+
+        return jax.lax.fori_loop(0, inserted_inds.shape[0], body, train_state)
+
+    def partial_update_seed_score(
+        state: tuple,
+        actor_index: int,
+        seed_idx: chex.Array,
+        score: chex.Array,
+        max_score: chex.Array,
+        num_steps: chex.Array,
+        done: chex.Array,
+        running_mean: bool,
+    ):
+        (
+            seed_scores,
+            regret_scores,
+            current_regret,
+            previous_regret,
+            regret_diff_changed,
+            regret_seen,
+            partial_scores,
+            partial_max_scores,
+            partial_steps,
+        ) = state
+
+        partial_score = partial_scores[actor_index, seed_idx]
+        partial_max_score = partial_max_scores[actor_index, seed_idx]
+        partial_num_steps = partial_steps[actor_index, seed_idx]
+        running_num_steps = partial_num_steps + num_steps
+        merged_score = partial_score + (score - partial_score) * num_steps.astype(jnp.float32)
+        if running_mean:
+            merged_score = jnp.where(
+                running_num_steps > 0,
+                merged_score / jnp.maximum(running_num_steps.astype(jnp.float32), 1.0),
+                merged_score,
+            )
+        merged_max_score = jnp.maximum(partial_max_score, max_score)
+
+        def done_update(args):
+            (
+                seed_scores_u,
+                regret_scores_u,
+                current_regret_u,
+                previous_regret_u,
+                regret_diff_changed_u,
+                regret_seen_u,
+                partial_scores_u,
+                partial_max_scores_u,
+                partial_steps_u,
+            ) = args
+            partial_scores_u = partial_scores_u.at[actor_index, seed_idx].set(0.0)
+            partial_max_scores_u = partial_max_scores_u.at[actor_index, seed_idx].set(-jnp.inf)
+            partial_steps_u = partial_steps_u.at[actor_index, seed_idx].set(0)
+
+            old_score = regret_scores_u[seed_idx]
+            total_score = traced_max_score_coef * merged_max_score + (1.0 - traced_max_score_coef) * merged_score
+            smoothed_score = (1.0 - traced_score_alpha) * old_score + traced_score_alpha * total_score
+
+            regret_diff_changed_u = regret_diff_changed_u.at[seed_idx].set(1)
+            current_regret_u = current_regret_u.at[seed_idx].set(smoothed_score)
+            regret_scores_u = regret_scores_u.at[seed_idx].set(smoothed_score)
+            seed_scores_u = seed_scores_u.at[seed_idx].set(smoothed_score)
+
+            return (
+                seed_scores_u,
+                regret_scores_u,
+                current_regret_u,
+                previous_regret_u,
+                regret_diff_changed_u,
+                regret_seen_u,
+                partial_scores_u,
+                partial_max_scores_u,
+                partial_steps_u,
+            )
+
+        def running_update(args):
+            (
+                seed_scores_u,
+                regret_scores_u,
+                current_regret_u,
+                previous_regret_u,
+                regret_diff_changed_u,
+                regret_seen_u,
+                partial_scores_u,
+                partial_max_scores_u,
+                partial_steps_u,
+            ) = args
+            partial_scores_u = partial_scores_u.at[actor_index, seed_idx].set(merged_score)
+            partial_max_scores_u = partial_max_scores_u.at[actor_index, seed_idx].set(merged_max_score)
+            partial_steps_u = partial_steps_u.at[actor_index, seed_idx].set(running_num_steps)
+            return (
+                seed_scores_u,
+                regret_scores_u,
+                current_regret_u,
+                previous_regret_u,
+                regret_diff_changed_u,
+                regret_seen_u,
+                partial_scores_u,
+                partial_max_scores_u,
+                partial_steps_u,
+            )
+
+        return jax.lax.cond(done, done_update, running_update, state)
+
+    def update_seed_scores_from_rollout(
+        train_state: TrainState,
+        level_inds_steps: chex.Array,
+        dones: chex.Array,
+        pvl_steps: chex.Array,
+        pair_losses: chex.Array,
+        pair_valid: chex.Array,
+    ) -> TrainState:
+        level_inds_bt = jnp.swapaxes(level_inds_steps, 0, 1)
+        dones_bt = jnp.swapaxes(dones, 0, 1)
+        pvl_bt = jnp.swapaxes(pvl_steps, 0, 1)
+        rollout_len = level_inds_steps.shape[0]
+
+        state = (
+            train_state.traced_seed_scores,
+            train_state.traced_regret_scores,
+            train_state.traced_current_regret_score,
+            train_state.traced_previous_regret_score,
+            train_state.traced_regret_diff_changed,
+            train_state.traced_regret_seen,
+            train_state.traced_partial_seed_scores,
+            train_state.traced_partial_seed_max_scores,
+            train_state.traced_partial_seed_steps,
+        )
+
+        def actor_loop(actor_idx, state_in):
+            actor_levels = level_inds_bt[actor_idx]
+            actor_dones = dones_bt[actor_idx]
+            actor_pvl = pvl_bt[actor_idx]
+            actor_pair_losses = pair_losses[actor_idx]
+            actor_pair_valid = pair_valid[actor_idx].astype(bool)
+
+            init = (
+                actor_levels[0],
+                jnp.array(0, dtype=jnp.int32),
+                jnp.array(0.0, dtype=jnp.float32),
+                jnp.array(-jnp.inf, dtype=jnp.float32),
+                jnp.array(0.0, dtype=jnp.float32),
+                jnp.array(-jnp.inf, dtype=jnp.float32),
+                jnp.array(0, dtype=jnp.int32),
+                state_in,
+            )
+
+            def step_loop(t, carry):
+                (
+                    seg_seed_idx,
+                    seg_len,
+                    seg_pvl_sum,
+                    seg_pvl_max,
+                    seg_pair_sum,
+                    seg_pair_max,
+                    seg_pair_count,
+                    state_mid,
+                ) = carry
+
+                def add_pair(c):
+                    (
+                        seg_seed_idx_i,
+                        seg_len_i,
+                        seg_pvl_sum_i,
+                        seg_pvl_max_i,
+                        seg_pair_sum_i,
+                        seg_pair_max_i,
+                        seg_pair_count_i,
+                        state_i,
+                    ) = c
+                    pair_ok = actor_pair_valid[t - 1]
+                    pair_val = actor_pair_losses[t - 1]
+                    seg_pair_sum_i = seg_pair_sum_i + jnp.where(pair_ok, pair_val, 0.0)
+                    seg_pair_max_i = jnp.where(pair_ok, jnp.maximum(seg_pair_max_i, pair_val), seg_pair_max_i)
+                    seg_pair_count_i = seg_pair_count_i + pair_ok.astype(jnp.int32)
+                    return (
+                        seg_seed_idx_i,
+                        seg_len_i,
+                        seg_pvl_sum_i,
+                        seg_pvl_max_i,
+                        seg_pair_sum_i,
+                        seg_pair_max_i,
+                        seg_pair_count_i,
+                        state_i,
+                    )
+
+                (
+                    seg_seed_idx,
+                    seg_len,
+                    seg_pvl_sum,
+                    seg_pvl_max,
+                    seg_pair_sum,
+                    seg_pair_max,
+                    seg_pair_count,
+                    state_mid,
+                ) = jax.lax.cond(t > 0, add_pair, lambda c: c, carry)
+
+                pvl_t = actor_pvl[t]
+                seg_pvl_sum = seg_pvl_sum + pvl_t
+                seg_pvl_max = jnp.maximum(seg_pvl_max, pvl_t)
+                seg_len = seg_len + 1
+
+                done_t = actor_dones[t]
+
+                def on_done(c):
+                    (
+                        seg_seed_idx_i,
+                        seg_len_i,
+                        seg_pvl_sum_i,
+                        seg_pvl_max_i,
+                        seg_pair_sum_i,
+                        seg_pair_max_i,
+                        seg_pair_count_i,
+                        state_i,
+                    ) = c
+
+                    score_mean = seg_pvl_sum_i / jnp.maximum(seg_len_i.astype(jnp.float32), 1.0)
+                    score_max = seg_pvl_max_i
+                    prob_mean = jnp.where(
+                        seg_pair_count_i > 0,
+                        seg_pair_sum_i / jnp.maximum(seg_pair_count_i.astype(jnp.float32), 1.0),
+                        0.0,
+                    )
+                    prob_max = jnp.where(seg_pair_count_i > 0, seg_pair_max_i, 0.0)
+                    total_score = score_mean + traced_transition_prob_weight * prob_mean
+                    total_max = score_max + traced_transition_prob_weight * prob_max
+
+                    state_i = partial_update_seed_score(
+                        state_i,
+                        actor_idx,
+                        seg_seed_idx_i,
+                        total_score,
+                        total_max,
+                        seg_len_i,
+                        jnp.array(True),
+                        running_mean=False,
+                    )
+                    next_seed = jax.lax.select(t + 1 < rollout_len, actor_levels[t + 1], seg_seed_idx_i)
+                    return (
+                        next_seed,
+                        jnp.array(0, dtype=jnp.int32),
+                        jnp.array(0.0, dtype=jnp.float32),
+                        jnp.array(-jnp.inf, dtype=jnp.float32),
+                        jnp.array(0.0, dtype=jnp.float32),
+                        jnp.array(-jnp.inf, dtype=jnp.float32),
+                        jnp.array(0, dtype=jnp.int32),
+                        state_i,
+                    )
+
+                return jax.lax.cond(
+                    done_t,
+                    on_done,
+                    lambda c: c,
+                    (
+                        seg_seed_idx,
+                        seg_len,
+                        seg_pvl_sum,
+                        seg_pvl_max,
+                        seg_pair_sum,
+                        seg_pair_max,
+                        seg_pair_count,
+                        state_mid,
+                    ),
+                )
+
+            (
+                seg_seed_idx,
+                seg_len,
+                seg_pvl_sum,
+                seg_pvl_max,
+                seg_pair_sum,
+                seg_pair_max,
+                seg_pair_count,
+                state_out,
+            ) = jax.lax.fori_loop(0, rollout_len, step_loop, init)
+
+            def flush_partial(st):
+                score_mean = seg_pvl_sum / jnp.maximum(seg_len.astype(jnp.float32), 1.0)
+                score_max = seg_pvl_max
+                prob_mean = jnp.where(
+                    seg_pair_count > 0,
+                    seg_pair_sum / jnp.maximum(seg_pair_count.astype(jnp.float32), 1.0),
+                    0.0,
+                )
+                prob_max = jnp.where(seg_pair_count > 0, seg_pair_max, 0.0)
+                total_score = score_mean + traced_transition_prob_weight * prob_mean
+                total_max = score_max + traced_transition_prob_weight * prob_max
+                return partial_update_seed_score(
+                    st,
+                    actor_idx,
+                    seg_seed_idx,
+                    total_score,
+                    total_max,
+                    seg_len,
+                    jnp.array(False),
+                    running_mean=False,
+                )
+
+            return jax.lax.cond(seg_len > 0, flush_partial, lambda st: st, state_out)
+
+        state = jax.lax.fori_loop(0, num_train_envs, actor_loop, state)
+        (
+            seed_scores,
+            regret_scores,
+            current_regret,
+            previous_regret,
+            regret_diff_changed,
+            regret_seen,
+            partial_scores,
+            partial_max_scores,
+            partial_steps,
+        ) = state
+        return train_state.replace(
+            traced_seed_scores=seed_scores,
+            traced_regret_scores=regret_scores,
+            traced_current_regret_score=current_regret,
+            traced_previous_regret_score=previous_regret,
+            traced_regret_diff_changed=regret_diff_changed,
+            traced_regret_seen=regret_seen,
+            traced_partial_seed_scores=partial_scores,
+            traced_partial_seed_max_scores=partial_max_scores,
+            traced_partial_seed_steps=partial_steps,
+        )
+
+    def update_regret_diff(train_state: TrainState):
+        changed_mask = train_state.traced_regret_diff_changed == 1
+        changed_count = changed_mask.astype(jnp.int32).sum()
+        first_seen = (~train_state.traced_regret_seen) & (train_state.traced_previous_regret_score == 0.0)
+        diffs = jnp.where(
+            changed_mask,
+            jnp.where(
+                first_seen,
+                0.0,
+                train_state.traced_previous_regret_score - train_state.traced_current_regret_score,
+            ),
+            0.0,
+        )
+        mean_diff = jnp.where(
+            changed_count > 0,
+            diffs.sum() / jnp.maximum(changed_count.astype(jnp.float32), 1.0),
+            0.0,
+        )
+        max_diff = jnp.where(changed_count > 0, jnp.max(jnp.where(changed_mask, diffs, -jnp.inf)), 0.0)
+        min_diff = jnp.where(changed_count > 0, jnp.min(jnp.where(changed_mask, diffs, jnp.inf)), 0.0)
+        std_diff = jnp.where(
+            changed_count > 0,
+            jnp.sqrt(
+                (
+                    jnp.where(changed_mask, diffs - mean_diff, 0.0) ** 2
+                ).sum()
+                / jnp.maximum(changed_count.astype(jnp.float32), 1.0)
+            ),
+            0.0,
+        )
+
+        prev_inds = train_state.traced_prev_replay_inds
+        prev_count = train_state.traced_prev_replay_count
+        prev_mask = jnp.arange(prev_inds.shape[0], dtype=jnp.int32) < prev_count
+        bonus = traced_colearnability_weight * mean_diff
+        bonus_vals = jnp.where(prev_mask, bonus, 0.0)
+        seed_scores = train_state.traced_seed_scores.at[prev_inds].add(bonus_vals)
+
+        previous_regret = jnp.where(
+            changed_mask,
+            train_state.traced_current_regret_score,
+            train_state.traced_previous_regret_score,
+        )
+        regret_diff_changed = jnp.where(changed_mask, 0, train_state.traced_regret_diff_changed)
+        regret_seen = jnp.where(changed_mask, True, train_state.traced_regret_seen)
+        new_prev_inds, new_prev_count = mask_to_compact_indices(changed_mask)
+
+        train_state = train_state.replace(
+            traced_seed_scores=seed_scores,
+            traced_previous_regret_score=previous_regret,
+            traced_regret_diff_changed=regret_diff_changed,
+            traced_regret_seen=regret_seen,
+            traced_prev_replay_inds=new_prev_inds,
+            traced_prev_replay_count=new_prev_count,
+            traced_prev_replay_valid=new_prev_count > 0,
+        )
+        return train_state, mean_diff, max_diff, min_diff, std_diff, bonus
+
+    def traced_after_update(train_state: TrainState) -> TrainState:
+        state = (
+            train_state.traced_seed_scores,
+            train_state.traced_regret_scores,
+            train_state.traced_current_regret_score,
+            train_state.traced_previous_regret_score,
+            train_state.traced_regret_diff_changed,
+            train_state.traced_regret_seen,
+            train_state.traced_partial_seed_scores,
+            train_state.traced_partial_seed_max_scores,
+            train_state.traced_partial_seed_steps,
+        )
+
+        num_capacity = train_state.traced_seed_scores.shape[0]
+
+        def actor_loop(actor_idx, state_in):
+            def seed_loop(seed_idx, state_mid):
+                partial_score = state_mid[6][actor_idx, seed_idx]
+                return jax.lax.cond(
+                    partial_score != 0.0,
+                    lambda st: partial_update_seed_score(
+                        st,
+                        actor_idx,
+                        jnp.array(seed_idx, dtype=jnp.int32),
+                        jnp.array(0.0, dtype=jnp.float32),
+                        jnp.array(-jnp.inf, dtype=jnp.float32),
+                        jnp.array(0, dtype=jnp.int32),
+                        jnp.array(True),
+                        running_mean=True,
+                    ),
+                    lambda st: st,
+                    state_mid,
+                )
+
+            return jax.lax.fori_loop(0, num_capacity, seed_loop, state_in)
+
+        state = jax.lax.fori_loop(0, num_train_envs, actor_loop, state)
+        (
+            seed_scores,
+            regret_scores,
+            current_regret,
+            previous_regret,
+            regret_diff_changed,
+            regret_seen,
+            partial_scores,
+            partial_max_scores,
+            partial_steps,
+        ) = state
+        return train_state.replace(
+            traced_seed_scores=seed_scores,
+            traced_regret_scores=regret_scores,
+            traced_current_regret_score=current_regret,
+            traced_previous_regret_score=previous_regret,
+            traced_regret_diff_changed=regret_diff_changed,
+            traced_regret_seen=regret_seen,
+            traced_partial_seed_scores=jnp.zeros_like(partial_scores),
+            traced_partial_seed_max_scores=partial_max_scores,
+            traced_partial_seed_steps=jnp.zeros_like(partial_steps),
+        )
 
     def select_mutation_parent_indices(task_difficulty: chex.Array) -> chex.Array:
         num_parents = min(traced_num_mutation_parents, num_train_envs)
@@ -612,19 +1270,23 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 config["num_steps"],
             )
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
+            pvl_steps = jnp.maximum(targets - values, 0.0)
+            pvl = jnp.mean(pvl_steps, axis=0)
             max_returns = compute_max_returns(dones, rewards)
-            pvl = compute_score(config, dones, values, max_returns, advantages)
-            obs_images, actions_oh, next_images = prepare_transition_inputs(obs, actions, next_obs)
-            transition_params_new, transition_opt_state_new, transition_loss, atpl_mean, _ = update_transition_model(
+            pair_obs, pair_actions, pair_next_obs, pair_valid = prepare_transition_pairs(obs, actions, dones)
+            transition_params_new, transition_opt_state_new, transition_loss, pair_losses = update_transition_model(
                 train_state.transition_params,
                 train_state.transition_opt_state,
-                obs_images,
-                actions_oh,
-                next_images,
+                pair_obs,
+                pair_actions,
+                pair_next_obs,
+                pair_valid,
             )
+            pair_den = jnp.maximum(pair_valid.sum(axis=1), 1.0)
+            atpl_mean = (pair_losses * pair_valid).sum(axis=1) / pair_den
             task_difficulty = pvl + traced_transition_prob_weight * atpl_mean
             success = rollout_success_from_rewards(rewards)
-            sampler, _ = level_sampler.insert_batch(
+            sampler, inserted_inds = level_sampler.insert_batch(
                 sampler,
                 new_levels,
                 task_difficulty,
@@ -653,15 +1315,53 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 update_grad=config["exploratory_grad_updates"],
             )
 
+            train_state = train_state.replace(
+                transition_params=transition_params_new,
+                transition_opt_state=transition_opt_state_new,
+                transition_last_loss=transition_loss,
+                transition_last_atpl_mean=atpl_mean.mean(),
+            )
+            train_state = initialize_inserted_seed_state(train_state, inserted_inds, task_difficulty)
+
+            def run_regret_pass(state):
+                return update_regret_diff(state)
+
+            def skip_regret_pass(state):
+                zero = jnp.array(0.0, dtype=jnp.float32)
+                return state, zero, zero, zero, zero, zero
+
+            (
+                train_state,
+                mean_regret_diff,
+                _max_regret_diff,
+                _min_regret_diff,
+                _std_regret_diff,
+                colearnability_bonus,
+            ) = jax.lax.cond(
+                config["exploratory_grad_updates"],
+                run_regret_pass,
+                skip_regret_pass,
+                train_state,
+            )
+            train_state = traced_after_update(train_state)
+            sampler = sync_sampler_scores_with_traced(sampler, train_state.traced_seed_scores)
+            inserted_mask = inserted_inds >= 0
+            inserted_score_mean = jnp.where(
+                inserted_mask.any(),
+                jnp.where(inserted_mask, train_state.traced_seed_scores[inserted_inds], 0.0).sum()
+                / jnp.maximum(inserted_mask.astype(jnp.float32).sum(), 1.0),
+                0.0,
+            )
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / num_train_envs,
                 "traced_transition_loss": transition_loss,
                 "traced_pvl_mean": pvl.mean(),
                 "traced_atpl_mean": atpl_mean.mean(),
-                "traced_task_difficulty_mean": task_difficulty.mean(),
-                "traced_mean_regret_diff": jnp.array(0.0, dtype=jnp.float32),
-                "traced_colearnability_bonus": jnp.array(0.0, dtype=jnp.float32),
+                "traced_task_difficulty_mean": inserted_score_mean,
+                "traced_mean_regret_diff": mean_regret_diff,
+                "traced_colearnability_bonus": colearnability_bonus,
                 "traced_pca_used": jnp.array(0, dtype=jnp.int32),
                 "mutation_parent_difficulty_mean": jnp.array(0.0, dtype=jnp.float32),
                 "mutation_uphill_fraction": jnp.array(0.0, dtype=jnp.float32),
@@ -672,10 +1372,6 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 update_state=UpdateState.DR,
                 num_dr_updates=train_state.num_dr_updates + 1,
                 dr_last_level_batch=new_levels,
-                transition_params=transition_params_new,
-                transition_opt_state=transition_opt_state_new,
-                transition_last_loss=transition_loss,
-                transition_last_atpl_mean=atpl_mean.mean(),
             )
             return (rng_step, train_state), metrics
 
@@ -687,32 +1383,50 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 jax.random.split(rng_reset, num_train_envs), levels, env_params
             )
             (
-                (rng_step, train_state, _, _, _, last_value),
-                (obs, actions, rewards, dones, log_probs, values, next_obs, _),
-            ) = sample_trajectories_rnn_with_next_obs(
+                (rng_step, sampler, train_state, _, _, _, _, _, last_value),
+                (obs, actions, rewards, dones, log_probs, values, _next_obs, _, replay_level_inds_steps),
+            ) = sample_replay_trajectories_rnn_with_next_obs(
                 rng_step,
                 env,
                 env_params,
+                level_sampler,
+                sampler,
                 train_state,
                 ActorCritic.initialize_carry((num_train_envs,)),
                 init_obs,
                 init_env_state,
+                levels,
+                level_inds,
                 num_train_envs,
                 config["num_steps"],
             )
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
-            level_extras = level_sampler.get_levels_extra(sampler, level_inds)
-            max_returns = jnp.maximum(level_extras["max_return"], compute_max_returns(dones, rewards))
-            pvl = compute_score(config, dones, values, max_returns, advantages)
-            obs_images, actions_oh, next_images = prepare_transition_inputs(obs, actions, next_obs)
-            transition_params_new, transition_opt_state_new, transition_loss, atpl_mean, _ = update_transition_model(
+            pvl_steps = jnp.maximum(targets - values, 0.0)
+            pvl = jnp.mean(pvl_steps, axis=0)
+            pair_obs, pair_actions, pair_next_obs, pair_valid = prepare_transition_pairs(obs, actions, dones)
+            transition_params_new, transition_opt_state_new, transition_loss, pair_losses = update_transition_model(
                 train_state.transition_params,
                 train_state.transition_opt_state,
-                obs_images,
-                actions_oh,
-                next_images,
+                pair_obs,
+                pair_actions,
+                pair_next_obs,
+                pair_valid,
             )
-            task_difficulty = pvl + traced_transition_prob_weight * atpl_mean
+            pair_den = jnp.maximum(pair_valid.sum(axis=1), 1.0)
+            atpl_mean = (pair_losses * pair_valid).sum(axis=1) / pair_den
+
+            train_state = update_seed_scores_from_rollout(
+                train_state,
+                replay_level_inds_steps,
+                dones,
+                pvl_steps,
+                pair_losses,
+                pair_valid,
+            )
+
+            level_extras = level_sampler.get_levels_extra(sampler, level_inds)
+            max_returns = jnp.maximum(level_extras["max_return"], compute_max_returns(dones, rewards))
+            task_difficulty = train_state.traced_seed_scores[level_inds]
             success = rollout_success_from_rewards(rewards)
             new_success_ema, new_success_obs_count = update_success_ema(
                 level_extras["success_ema"],
@@ -720,9 +1434,6 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 success,
                 float(config["success_ema_alpha"]),
             )
-            regret_diff = level_extras["traced_prev_task_difficulty"] - task_difficulty
-            mean_regret_diff = regret_diff.mean()
-
             sampler = level_sampler.update_batch(
                 sampler,
                 level_inds,
@@ -736,35 +1447,9 @@ def main(config=None, project: str = "MAZE_TRACED"):
                     new_success_obs_count,
                 ),
             )
-
-            def apply_colearnability_bonus(curr_sampler):
-                prev_inds = train_state.traced_prev_replay_inds
-                prev_extras = level_sampler.get_levels_extra(curr_sampler, prev_inds)
-                prev_scores = curr_sampler["scores"][prev_inds] + traced_colearnability_weight * mean_regret_diff
-                updated_sampler = level_sampler.update_batch(
-                    curr_sampler,
-                    prev_inds,
-                    prev_scores,
-                    {
-                        "max_return": prev_extras["max_return"],
-                        "success_ema": prev_extras["success_ema"],
-                        "success_obs_count": prev_extras["success_obs_count"],
-                        "traced_pvl": prev_extras["traced_pvl"],
-                        "traced_atpl": prev_extras["traced_atpl"],
-                        "traced_task_difficulty": prev_extras["traced_task_difficulty"],
-                        "traced_prev_task_difficulty": prev_extras["traced_prev_task_difficulty"],
-                        "traced_colearnability": jnp.full_like(prev_scores, mean_regret_diff),
-                        "traced_priority": prev_scores,
-                    },
-                )
-                return updated_sampler, traced_colearnability_weight * mean_regret_diff
-
-            sampler, colearnability_bonus = jax.lax.cond(
-                train_state.traced_prev_replay_valid,
-                apply_colearnability_bonus,
-                lambda curr_sampler: (curr_sampler, jnp.array(0.0, dtype=jnp.float32)),
-                sampler,
-            )
+            mean_returns, _, _ = compute_max_mean_returns_epcount(dones, rewards)
+            batched_value_loss = jnp.clip(jnp.mean(jnp.abs(targets - values), axis=0), -1.0, 1.0)
+            mutation_parent_difficulty = mean_returns - batched_value_loss
 
             (rng_step, train_state), losses = update_actor_critic_rnn(
                 rng_step,
@@ -781,13 +1466,31 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 update_grad=True,
             )
 
+            train_state = train_state.replace(
+                transition_params=transition_params_new,
+                transition_opt_state=transition_opt_state_new,
+                transition_last_loss=transition_loss,
+                transition_last_atpl_mean=atpl_mean.mean(),
+            )
+            (
+                train_state,
+                mean_regret_diff,
+                _max_regret_diff,
+                _min_regret_diff,
+                _std_regret_diff,
+                colearnability_bonus,
+            ) = update_regret_diff(train_state)
+            train_state = traced_after_update(train_state)
+            sampler = sync_sampler_scores_with_traced(sampler, train_state.traced_seed_scores)
+            sampled_scores = train_state.traced_seed_scores[level_inds]
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / num_train_envs,
                 "traced_transition_loss": transition_loss,
                 "traced_pvl_mean": pvl.mean(),
                 "traced_atpl_mean": atpl_mean.mean(),
-                "traced_task_difficulty_mean": task_difficulty.mean(),
+                "traced_task_difficulty_mean": sampled_scores.mean(),
                 "traced_mean_regret_diff": mean_regret_diff,
                 "traced_colearnability_bonus": colearnability_bonus,
                 "traced_pca_used": jnp.array(0, dtype=jnp.int32),
@@ -801,13 +1504,7 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 num_replay_updates=train_state.num_replay_updates + 1,
                 replay_last_level_batch=levels,
                 replay_last_level_inds=level_inds,
-                replay_last_task_difficulty=task_difficulty,
-                traced_prev_replay_inds=level_inds,
-                traced_prev_replay_valid=jnp.array(True),
-                transition_params=transition_params_new,
-                transition_opt_state=transition_opt_state_new,
-                transition_last_loss=transition_loss,
-                transition_last_atpl_mean=atpl_mean.mean(),
+                replay_last_task_difficulty=mutation_parent_difficulty,
             )
             return (rng_step, train_state), metrics
 
@@ -873,19 +1570,23 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 config["num_steps"],
             )
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
+            pvl_steps = jnp.maximum(targets - values, 0.0)
+            pvl = jnp.mean(pvl_steps, axis=0)
             max_returns = compute_max_returns(dones, rewards)
-            pvl = compute_score(config, dones, values, max_returns, advantages)
-            obs_images, actions_oh, next_images = prepare_transition_inputs(obs, actions, next_obs)
-            transition_params_new, transition_opt_state_new, transition_loss, atpl_mean, _ = update_transition_model(
+            pair_obs, pair_actions, pair_next_obs, pair_valid = prepare_transition_pairs(obs, actions, dones)
+            transition_params_new, transition_opt_state_new, transition_loss, pair_losses = update_transition_model(
                 train_state.transition_params,
                 train_state.transition_opt_state,
-                obs_images,
-                actions_oh,
-                next_images,
+                pair_obs,
+                pair_actions,
+                pair_next_obs,
+                pair_valid,
             )
+            pair_den = jnp.maximum(pair_valid.sum(axis=1), 1.0)
+            atpl_mean = (pair_losses * pair_valid).sum(axis=1) / pair_den
             task_difficulty = pvl + traced_transition_prob_weight * atpl_mean
             success = rollout_success_from_rewards(rewards)
-            sampler, _ = level_sampler.insert_batch(
+            sampler, inserted_inds = level_sampler.insert_batch(
                 sampler,
                 child_levels,
                 task_difficulty,
@@ -915,7 +1616,24 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 config["clip_eps"],
                 config["entropy_coeff"],
                 config["critic_coeff"],
-                update_grad=config["exploratory_grad_updates"],
+                update_grad=False,
+            )
+
+            train_state = train_state.replace(
+                transition_params=transition_params_new,
+                transition_opt_state=transition_opt_state_new,
+                transition_last_loss=transition_loss,
+                transition_last_atpl_mean=atpl_mean.mean(),
+            )
+            train_state = initialize_inserted_seed_state(train_state, inserted_inds, task_difficulty)
+            train_state = traced_after_update(train_state)
+            sampler = sync_sampler_scores_with_traced(sampler, train_state.traced_seed_scores)
+            inserted_mask = inserted_inds >= 0
+            inserted_score_mean = jnp.where(
+                inserted_mask.any(),
+                jnp.where(inserted_mask, train_state.traced_seed_scores[inserted_inds], 0.0).sum()
+                / jnp.maximum(inserted_mask.astype(jnp.float32).sum(), 1.0),
+                0.0,
             )
 
             metrics = {
@@ -924,7 +1642,7 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 "traced_transition_loss": transition_loss,
                 "traced_pvl_mean": pvl.mean(),
                 "traced_atpl_mean": atpl_mean.mean(),
-                "traced_task_difficulty_mean": task_difficulty.mean(),
+                "traced_task_difficulty_mean": inserted_score_mean,
                 "traced_mean_regret_diff": jnp.array(0.0, dtype=jnp.float32),
                 "traced_colearnability_bonus": jnp.array(0.0, dtype=jnp.float32),
                 "traced_pca_used": pca_used,
@@ -940,22 +1658,32 @@ def main(config=None, project: str = "MAZE_TRACED"):
                 num_compared=train_state.num_compared + batch_compared,
                 uphill_last_fraction=uphill_frac,
                 mutation_last_level_batch=child_levels,
-                transition_params=transition_params_new,
-                transition_opt_state=transition_opt_state_new,
-                transition_last_loss=transition_loss,
-                transition_last_atpl_mean=atpl_mean.mean(),
             )
             return (rng_step, train_state), metrics
 
         rng_step, train_state = carry
         rng_step, rng_replay = jax.random.split(rng_step)
-        s = train_state.update_state
-        branch = (1 - s) * level_sampler.sample_replay_decision(train_state.sampler, rng_replay) + 2 * s
-        return jax.lax.switch(
-            branch,
-            [on_new_levels, on_replay_levels, on_mutate_levels],
-            rng_step,
-            train_state,
+        should_replay = level_sampler.sample_replay_decision(train_state.sampler, rng_replay)
+
+        def run_new_levels(c):
+            return on_new_levels(*c)
+
+        def run_replay_and_mutate(c):
+            (rng_i, state_i), replay_metrics = on_replay_levels(*c)
+            (rng_i, state_i), mutate_metrics = on_mutate_levels(rng_i, state_i)
+            merged_metrics = {
+                **replay_metrics,
+                "mutation_parent_difficulty_mean": mutate_metrics["mutation_parent_difficulty_mean"],
+                "mutation_uphill_fraction": mutate_metrics["mutation_uphill_fraction"],
+                "traced_pca_used": mutate_metrics["traced_pca_used"],
+            }
+            return (rng_i, state_i), merged_metrics
+
+        return jax.lax.cond(
+            should_replay,
+            run_replay_and_mutate,
+            run_new_levels,
+            (rng_step, train_state),
         )
 
     def eval_once(rng_eval: chex.PRNGKey, train_state: TrainState):
@@ -999,9 +1727,7 @@ def main(config=None, project: str = "MAZE_TRACED"):
         frames = images.transpose(0, 1, 4, 2, 3)
 
         metrics = dict(train_metrics)
-        metrics["update_count"] = (
-            train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
-        )
+        metrics["update_count"] = train_state.num_dr_updates + train_state.num_replay_updates
         metrics["eval_returns"] = eval_returns
         metrics["eval_solve_rates"] = eval_solve_rates
         metrics["eval_ep_lengths"] = episode_lengths
@@ -1183,6 +1909,8 @@ if __name__ == "__main__":
     group.add_argument("--n_walls", type=int, default=25)
     group.add_argument("--traced_colearnability_weight", type=float, default=1.0)
     group.add_argument("--traced_transition_prob_weight", type=float, default=1.0)
+    group.add_argument("--traced_score_alpha", type=float, default=1.0)
+    group.add_argument("--traced_max_score_coef", type=float, default=0.0)
     group.add_argument("--traced_transition_hidden_dim", type=int, default=128)
     group.add_argument("--traced_transition_lr", type=float, default=1e-4)
     group.add_argument("--traced_transition_weight_decay", type=float, default=1e-5)
