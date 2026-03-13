@@ -1114,11 +1114,16 @@ def main(config=None, project="JAXUED_TEST"):
                 # CMA-ES: ask for candidate latent vectors, decode to levels
                 rng, rng_ask, rng_decode = jax.random.split(rng, 3)
 
+                # When PCA components are in full 64-dim space (delayed_start or pca_start_after),
+                # use _original_decode_fn to skip the KL 58->64 expansion wrapper
+                _uses_full_space_pca = use_pca and (config.get("cmaes_delayed_start") or config.get("cmaes_pca_start_after", 0) > 0)
+                _gen_pca_decode = _original_decode_fn if (_uses_full_space_pca and active_dims is not None) else vae_decode_fn
+
                 def _cmaes_generate(rng_ask):
                     z_pop, es_new = cmaes_mgr.ask(rng_ask, es_state)
                     if use_pca:
                         z_full = train_state.pca_mean + z_pop @ train_state.pca_components
-                        levels = decode_latent_to_levels(vae_decode_fn, z_full, rng_decode)
+                        levels = decode_latent_to_levels(_gen_pca_decode, z_full, rng_decode)
                     else:
                         levels = decode_latent_to_levels(vae_decode_fn, z_pop, rng_decode)
                     return levels, es_new, z_pop
@@ -1141,10 +1146,14 @@ def main(config=None, project="JAXUED_TEST"):
                         dummy_z = jnp.zeros((config["num_train_envs"], cmaes_latent_dim))
                         return levels, es_state, dummy_z, es_full_new
 
+                    # Use _original_decode_fn for PCA path: z_full is already in full 64-dim space
+                    # (PCA components are embedded back to full space with zeros on dead dims)
+                    _pca_decode_fn = _original_decode_fn if active_dims is not None else vae_decode_fn
+
                     def _cmaes_pca_generate(rng_ask):
                         z_pop, es_new = cmaes_mgr.ask(rng_ask, es_state)
                         z_full = train_state.pca_mean + z_pop @ train_state.pca_components
-                        levels = decode_latent_to_levels(vae_decode_fn, z_full, rng_decode)
+                        levels = decode_latent_to_levels(_pca_decode_fn, z_full, rng_decode)
                         return levels, es_new, z_pop, train_state.es_state_full
 
                     new_levels, es_state, z_population, es_state_full = jax.lax.cond(
@@ -1969,8 +1978,8 @@ def main(config=None, project="JAXUED_TEST"):
                             ])
                     new_pca_mean, new_pca_components = fit_pca(refit_means, config["cmaes_pca_dims"], fitness_scores=refit_fitness)
 
-                    # For delayed-start mode, embed PCA back into full 64-dim space
-                    if config.get("cmaes_delayed_start") and _refit_active is not None:
+                    # For delayed-start or pca_start_after mode, embed PCA back into full 64-dim space
+                    if (config.get("cmaes_delayed_start") or config.get("cmaes_pca_start_after", 0) > 0) and _refit_active is not None:
                         full_d = vae_cfg["latent_dim"]
                         new_pca_mean = jnp.zeros(full_d).at[_refit_active].set(new_pca_mean)
                         new_pca_components = jnp.zeros((config["cmaes_pca_dims"], full_d)).at[:, _refit_active].set(new_pca_components)
