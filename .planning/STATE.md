@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-03-11)
 ## Current Position
 
 Phase: 6 of 6 (Run PCA-CMA-ES on TPU + Compare Phase 4)
-Plan: 1 of 1 in current phase — COMPLETE
-Status: Phase 6 Plan 01 COMPLETE — launch_pca_comparison.sh and compare_phase4_results.py created; ready for TPU execution + human verification
-Last activity: 2026-03-13 — Completed Phase 6 Plan 01 (experiment launch script + WandB comparison script)
+Plan: 2 of 3 in current phase — CHECKPOINT (human-verify)
+Status: Phase 6 Plan 02 CHECKPOINT — all 4 files synced to TPU VM cma-es-v4 (verified via wc -l); awaiting human to SSH, check comparison3 done, and launch pca_run tmux session
+Last activity: 2026-03-13 — Task 1 complete (file sync verified); stopped at Task 2 human checkpoint
 
 Progress: [##########] 100%
 
@@ -78,6 +78,8 @@ Recent decisions affecting current work:
 - [06-01]: PCA launch script runs only 5 seeds (1 condition) — Phase 4 already has cmaes-cnn-vae-accel and accel-baseline data
 - [06-01]: compare_phase4_results.py accepts --entity as optional arg (WandB infers from login if omitted)
 - [06-01]: Final value extraction via hist[metric].dropna().iloc[-1] — robust to sparse WandB logging
+- [06-02]: gcloud binary at /cs/student/project_msc/2025/csml/gmaralla/home/google-cloud-sdk/bin/gcloud (not in PATH on head node)
+- [06-02]: SCP 'Attempting to connect to worker 0...' is normal gcloud SSH tunnel init — verify with subsequent ssh command
 
 ### Roadmap Evolution
 
@@ -98,5 +100,5 @@ None — all Phase 1 blockers resolved:
 ## Session Continuity
 
 Last session: 2026-03-13
-Stopped at: Completed 06-01-PLAN.md — launch_pca_comparison.sh and compare_phase4_results.py created. Awaiting human checkpoint: sync scripts to TPU VM and run 5-seed PCA experiment.
+Stopped at: 06-02-PLAN.md Task 2 checkpoint (human-verify) — files synced to TPU VM, awaiting SSH to check comparison3 done and launch pca_run tmux session with launch_pca_comparison.sh
 Resume file: None
