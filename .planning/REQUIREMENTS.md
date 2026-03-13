@@ -45,6 +45,17 @@ Requirements for initial release. Each maps to roadmap phases.
 - [ ] **EXPT-02**: Script runs both ACCEL + CMA-ES+CNN-VAE together with WandB logging (same pattern as existing ACCEL vs CluttrVAE runs)
 - [ ] **EXPT-03**: 20k-update comparison run launched via adapted script
 
+### PCA-Space CMA-ES Search
+
+- [x] **PCA-01**: `vae/cnn_vae_pca_utils.py` created with `encode_mazes_to_mu`, `compute_active_dims`, `compute_pca_axes`, `make_variance_pruned_decode_fn`, `make_pc_decode_fn`
+- [x] **PCA-02**: `compute_active_dims` uses mean_layer weight norms from checkpoint to select active dims (no dataset encoding needed for Stage 1); `scripts/download_pca_dataset.py` for offline validation only
+- [ ] **PCA-03**: Stage 1 weight-norm pruned decode function wraps base decode_fn; CMA-ES searches in ~30 reduced dims from step 0 using `make_variance_pruned_decode_fn` — checkpoint weights only, no data dependency
+- [ ] **PCA-04**: Stage 2 PCA computed from replay buffer levels' mu vectors at configurable transition step (default 10k updates)
+- [ ] **PCA-05**: Stage 2 decode function uses whitened PCA projection via `make_pc_decode_fn`; CMAESManager reinitialized with K_stage2 dims and `pca_sigma_init`
+- [ ] **PCA-06**: JIT recompilation handled at Stage 1->2 transition via factory pattern (`jax.jit(train_and_eval_step)` called fresh after reassigning closures)
+- [ ] **PCA-07**: CLI flags added to `maze_plr.py`: `--use_pca_search`, `--pca_components`, `--pca_dataset_size`, `--pca_dataset_path`, `--pca_stage2_step`, `--pca_stage1_k`, `--pca_sigma_init`
+- [ ] **PCA-08**: Smoke test passes: z=zeros(K) decodes to valid Level through both wrappers; 500-step CMA-ES run with `--use_pca_search` completes with exit 0, valid_structure_pct > 90%, no NaN
+
 ## v2 Requirements
 
 Deferred to future release. Tracked but not in current roadmap.
@@ -95,12 +106,20 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EXPT-01 | Phase 4 | Pending |
 | EXPT-02 | Phase 4 | Pending |
 | EXPT-03 | Phase 4 | Pending |
+| PCA-01 | Phase 5 | Complete |
+| PCA-02 | Phase 5 | Complete |
+| PCA-03 | Phase 5 | Pending |
+| PCA-04 | Phase 5 | Pending |
+| PCA-05 | Phase 5 | Pending |
+| PCA-06 | Phase 5 | Pending |
+| PCA-07 | Phase 5 | Pending |
+| PCA-08 | Phase 5 | Pending |
 
 **Coverage:**
-- v1 requirements: 23 total
-- Mapped to phases: 23
+- v1 requirements: 31 total
+- Mapped to phases: 31
 - Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-11*
-*Last updated: 2026-03-11 — GRID-09 marked complete after scripts/test_grid_adapter.py verified all GRID-01..09 pass*
+*Last updated: 2026-03-12 — Phase 5 PCA-01..PCA-08 added for PCA-Space CMA-ES Search*

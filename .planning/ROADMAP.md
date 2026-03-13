@@ -16,6 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Grid Adapter** - Implement and unit-test `decode_latent_to_levels_grid()` in isolation
 - [x] **Phase 3: Integration** - Wire CNN-VAE as default decoder in `maze_plr.py` and pass smoke tests
 - [ ] **Phase 4: Experiment** - Launch 20k-update CNN-VAE CMA-ES vs ACCEL comparison run
+- [ ] **Phase 5: PCA-Space CMA-ES Search** - Two-stage dimensionality reduction for CMA-ES (variance-pruned + buffer PCA)
 
 ## Phase Details
 
@@ -69,7 +70,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 ## Progress
 
 **Execution Order:**
-Phases execute in strict sequential order: 1 → 2 → 3 → 4
+Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -77,3 +78,19 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4
 | 2. Grid Adapter | 2/2 | Complete | 2026-03-11 |
 | 3. Integration | 2/2 | Complete | 2026-03-11 |
 | 4. Experiment | 0/? | Not started | - |
+| 5. PCA-Space CMA-ES | 1/3 | In Progress|  |
+
+### Phase 5: PCA-Space CMA-ES Search
+**Goal**: Two-stage dimensionality reduction for CMA-ES: Stage 1 (weight-norm pruned latent search, ~30 dims from step 0 using checkpoint weights) and Stage 2 (buffer PCA search, K components after 10k steps). CMA-ES searches in a reduced subspace that reflects the valid maze manifold, giving it free covariance structure and O(K^2) sample complexity instead of O(64^2).
+**Depends on**: Phase 3 (CNN-VAE integrated into maze_plr.py)
+**Requirements**: PCA-01, PCA-02, PCA-03, PCA-04, PCA-05, PCA-06, PCA-07, PCA-08
+**Success Criteria** (what must be TRUE):
+  1. `vae/cnn_vae_pca_utils.py` exists with `encode_mazes_to_mu`, `compute_active_dims`, `compute_pca_axes`, `make_variance_pruned_decode_fn`, `make_pc_decode_fn`
+  2. `python examples/maze_plr.py --use_cmaes --use_pca_search` starts with Stage 1 (weight-norm pruned dims from checkpoint) from step 0 and CMAESManager uses K_stage1 < 64
+  3. At the Stage 2 transition step (default 10k), buffer levels are encoded to PCA, CMAESManager reinitialized with K_stage2 dims, and `train_and_eval_step` is recompiled
+  4. A 500-step CMA-ES run with `--use_pca_search` completes with exit code 0, valid_structure_pct > 90%, no NaN
+  5. z=zeros(K) through both Stage 1 and Stage 2 decode wrappers produces valid Levels
+**Plans**: 3 plans
+- [ ] 05-01-PLAN.md — Create vae/cnn_vae_pca_utils.py (5 functions) + scripts/download_pca_dataset.py
+- [ ] 05-02-PLAN.md — Integrate Stage 1 + Stage 2 into maze_plr.py (flags, setup, transition hook, JIT factory)
+- [ ] 05-03-PLAN.md — Write and run smoke_test_pca_search.py (PCA-08: offline + 500-step training)

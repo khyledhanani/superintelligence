@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-03-11)
 
 **Core value:** CMA-ES with CNN-VAE produces valid, solvable maze Levels and runs a complete 20k training experiment comparable to the ACCEL baseline.
-**Current focus:** Phase 3 — Integration
+**Current focus:** Phase 5 — PCA-Space CMA-ES Search
 
 ## Current Position
 
-Phase: 3 of 4 (Integration)
-Plan: 2 of 2 in current phase — COMPLETE
-Status: Phase 3 complete — CNN-VAE integration validated (smoke_test_integration.py, all VALD-01..04 pass)
-Last activity: 2026-03-11 — Completed Phase 3 Plan 02 (integration smoke test, all VALD requirements confirmed)
+Phase: 5 of 5 (PCA-Space CMA-ES Search)
+Plan: 1 of 3 in current phase — COMPLETE
+Status: Phase 5 Plan 01 complete — PCA utilities (5 functions) created in vae/cnn_vae_pca_utils.py
+Last activity: 2026-03-13 — Completed Phase 5 Plan 01 (PCA utility library, Stage 1 weight-norm + Stage 2 SVD)
 
-Progress: [######░░░░] 60%
+Progress: [########░░] 70%
 
 ## Performance Metrics
 
@@ -30,10 +30,11 @@ Progress: [######░░░░] 60%
 | 01-checkpoint | 1 | 5min | 5min |
 | 02-grid-adapter | 2 | 8min | 4min |
 | 03-integration | 2 | 25min | 12.5min |
+| 05-pca-space-cma-es-search | 1 | 3min | 3min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min), 03-01 (2min), 03-02 (23min)
-- Trend: 03-02 longer due to GPU infrastructure investigation (sideswipe occupied)
+- Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min), 03-01 (2min), 03-02 (23min), 05-01 (3min)
+- Trend: 05-01 fast (pure file creation, no GPU infrastructure work needed)
 
 *Updated after each plan completion*
 
@@ -61,6 +62,15 @@ Recent decisions affecting current work:
 - [03-02]: VALD-02 validated via 1000-step simulation (is_valid.mean()*100 on popsize=32 batches) — GPU smoke test deferred (sideswipe occupied by NAMM training)
 - [03-02]: cmaes/valid_structure_pct = 100.0% over 1000 simulated DR steps; BFS solvability = 100% on 50 levels
 - [03-02]: maze_plr.py --use_cmaes confirmed to load CNN-VAE and start training (5-step CPU run successful)
+- [05-01]: cumulative norm threshold 0.85 for Stage 1 K selection (not fixed K) — adapts to any checkpoint
+- [05-01]: full_matrices=False in np.linalg.svd essential when N >> 64 (avoids large U matrix)
+- [05-01]: Closures in make_*_decode_fn capture jnp arrays (not numpy) for JIT/vmap compatibility
+- [05-01]: Stage 1 uses zeros as mu_mean baseline by default (VAE prior mean) — dataset not needed at search time
+- [05-01]: pc_stds whitening ensures unit-variance CMA-ES dimensions (sigma_init=0.5 becomes meaningful)
+
+### Roadmap Evolution
+
+- Phase 5 added: PCA-Space CMA-ES Search
 
 ### Pending Todos
 
@@ -75,6 +85,6 @@ None — all Phase 1 blockers resolved:
 
 ## Session Continuity
 
-Last session: 2026-03-11
-Stopped at: Completed 03-02-PLAN.md — Phase 3 complete; all VALD-01..04 confirmed via smoke_test_integration.py
+Last session: 2026-03-13
+Stopped at: Completed 05-01-PLAN.md — PCA utility library created (5 functions in vae/cnn_vae_pca_utils.py + validation script)
 Resume file: None
