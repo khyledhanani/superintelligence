@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-03-11)
 ## Current Position
 
 Phase: 5 of 5 (PCA-Space CMA-ES Search)
-Plan: 1 of 3 in current phase — COMPLETE
-Status: Phase 5 Plan 01 complete — PCA utilities (5 functions) created in vae/cnn_vae_pca_utils.py
-Last activity: 2026-03-13 — Completed Phase 5 Plan 01 (PCA utility library, Stage 1 weight-norm + Stage 2 SVD)
+Plan: 2 of 3 in current phase — COMPLETE
+Status: Phase 5 Plan 02 complete — Two-stage PCA-space CMA-ES wired into maze_plr.py with --use_pca_search flag
+Last activity: 2026-03-13 — Completed Phase 5 Plan 02 (Stage 1+2 integration, JIT factory pattern, 7 CLI flags)
 
-Progress: [########░░] 70%
+Progress: [#########░] 80%
 
 ## Performance Metrics
 
@@ -30,7 +30,7 @@ Progress: [########░░] 70%
 | 01-checkpoint | 1 | 5min | 5min |
 | 02-grid-adapter | 2 | 8min | 4min |
 | 03-integration | 2 | 25min | 12.5min |
-| 05-pca-space-cma-es-search | 1 | 3min | 3min |
+| 05-pca-space-cma-es-search | 2 | 7min | 3.5min |
 
 **Recent Trend:**
 - Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min), 03-01 (2min), 03-02 (23min), 05-01 (3min)
@@ -67,6 +67,10 @@ Recent decisions affecting current work:
 - [05-01]: Closures in make_*_decode_fn capture jnp arrays (not numpy) for JIT/vmap compatibility
 - [05-01]: Stage 1 uses zeros as mu_mean baseline by default (VAE prior mean) — dataset not needed at search time
 - [05-01]: pc_stds whitening ensures unit-variance CMA-ES dimensions (sigma_init=0.5 becomes meaningful)
+- [05-02]: Removed @jax.jit from train_and_eval_step; use explicit jax.jit() variable for re-jitting after Stage 2 transition
+- [05-02]: Stage 2 guarded by _pca_stage == 1 to fire exactly once at or after pca_stage2_step
+- [05-02]: tokens_np = np.array(tokens_jax) required before encode_mazes_to_mu (clutr_to_grid needs numpy)
+- [05-02]: PCA WandB logging done outside jit in outer loop (Python-level state, not JAX arrays)
 
 ### Roadmap Evolution
 
@@ -86,5 +90,5 @@ None — all Phase 1 blockers resolved:
 ## Session Continuity
 
 Last session: 2026-03-13
-Stopped at: Completed 05-01-PLAN.md — PCA utility library created (5 functions in vae/cnn_vae_pca_utils.py + validation script)
+Stopped at: Completed 05-02-PLAN.md — Two-stage PCA-space CMA-ES integrated into maze_plr.py with --use_pca_search flag, JIT factory pattern, 7 CLI flags
 Resume file: None

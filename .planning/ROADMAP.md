@@ -78,7 +78,7 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5
 | 2. Grid Adapter | 2/2 | Complete | 2026-03-11 |
 | 3. Integration | 2/2 | Complete | 2026-03-11 |
 | 4. Experiment | 0/? | Not started | - |
-| 5. PCA-Space CMA-ES | 1/3 | In Progress|  |
+| 5. PCA-Space CMA-ES | 2/3 | In Progress|  |
 
 ### Phase 5: PCA-Space CMA-ES Search
 **Goal**: Two-stage dimensionality reduction for CMA-ES: Stage 1 (weight-norm pruned latent search, ~30 dims from step 0 using checkpoint weights) and Stage 2 (buffer PCA search, K components after 10k steps). CMA-ES searches in a reduced subspace that reflects the valid maze manifold, giving it free covariance structure and O(K^2) sample complexity instead of O(64^2).
@@ -91,6 +91,6 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5
   4. A 500-step CMA-ES run with `--use_pca_search` completes with exit code 0, valid_structure_pct > 90%, no NaN
   5. z=zeros(K) through both Stage 1 and Stage 2 decode wrappers produces valid Levels
 **Plans**: 3 plans
-- [ ] 05-01-PLAN.md — Create vae/cnn_vae_pca_utils.py (5 functions) + scripts/download_pca_dataset.py
-- [ ] 05-02-PLAN.md — Integrate Stage 1 + Stage 2 into maze_plr.py (flags, setup, transition hook, JIT factory)
+- [x] 05-01-PLAN.md — Create vae/cnn_vae_pca_utils.py (5 functions) + scripts/download_pca_dataset.py
+- [x] 05-02-PLAN.md — Integrate Stage 1 + Stage 2 into maze_plr.py (flags, setup, transition hook, JIT factory)
 - [ ] 05-03-PLAN.md — Write and run smoke_test_pca_search.py (PCA-08: offline + 500-step training)
