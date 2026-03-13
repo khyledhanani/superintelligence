@@ -695,7 +695,10 @@ def main(config=None, project="JAXUED_TEST"):
     # --- Active latent dimension detection ---
     active_dims = None  # None = use all dims
     full_latent_dim = vae_cfg["latent_dim"] if _needs_vae else None
-    if _needs_vae and config["use_cmaes"] and config["cmaes_kl_threshold"] > 0:
+    if config.get("cmaes_delayed_start") and _needs_vae and config["use_cmaes"]:
+        # Delayed start: skip KL filtering at init, will be computed when buffer is full
+        print(f"[KL-filter] Deferred to delayed start (will compute when buffer is full)")
+    elif _needs_vae and config["use_cmaes"] and config["cmaes_kl_threshold"] > 0:
         kl_data_path = config.get("cmaes_kl_data")
         ws_buffer_path = config.get("warmstart_buffer")
         if kl_data_path and os.path.exists(kl_data_path):
@@ -776,8 +779,13 @@ def main(config=None, project="JAXUED_TEST"):
     use_pca = _needs_vae and config["use_cmaes"] and config.get("cmaes_pca_dims", 0) > 0
     if use_pca:
         pca_dims = config["cmaes_pca_dims"]
-        # Skip initial PCA fit if warm-start buffer is provided (PCA will be fit on buffer instead)
-        if config.get("warmstart_buffer"):
+        # Skip initial PCA fit if delayed start or warm-start buffer (PCA will be fit later)
+        if config.get("cmaes_delayed_start"):
+            print(f"[PCA] Deferred to delayed start (will compute when buffer is full)")
+            full_d = vae_cfg["latent_dim"]
+            pca_mean_init = jnp.zeros(full_d)
+            pca_components_init = jnp.eye(pca_dims, full_d)
+        elif config.get("warmstart_buffer"):
             print(f"[PCA] Deferring initial PCA fit to warm-start buffer")
             # Create placeholder PCA arrays with correct shapes (will be overwritten)
             # If KL filtering is active, PCA operates in active-dim subspace
@@ -1085,13 +1093,27 @@ def main(config=None, project="JAXUED_TEST"):
             if config["use_cmaes"]:
                 # CMA-ES: ask for candidate latent vectors, decode to levels
                 rng, rng_ask, rng_decode = jax.random.split(rng, 3)
-                z_population, es_state = cmaes_mgr.ask(rng_ask, es_state)
-                if use_pca:
-                    # Project from PCA space to full latent space
-                    z_full = train_state.pca_mean + z_population @ train_state.pca_components
-                    new_levels = decode_latent_to_levels(vae_decode_fn, z_full, rng_decode)
+
+                def _cmaes_generate(rng_ask):
+                    z_pop, es_new = cmaes_mgr.ask(rng_ask, es_state)
+                    if use_pca:
+                        z_full = train_state.pca_mean + z_pop @ train_state.pca_components
+                        levels = decode_latent_to_levels(vae_decode_fn, z_full, rng_decode)
+                    else:
+                        levels = decode_latent_to_levels(vae_decode_fn, z_pop, rng_decode)
+                    return levels, es_new, z_pop
+
+                def _random_generate(rng_ask):
+                    levels = jax.vmap(sample_random_level)(jax.random.split(rng_ask, config["num_train_envs"]))
+                    dummy_z = jnp.zeros((config["num_train_envs"], cmaes_latent_dim))
+                    return levels, es_state, dummy_z
+
+                if config.get("cmaes_delayed_start"):
+                    buffer_full = sampler["size"] >= config["level_buffer_capacity"]
+                    new_levels, es_state, z_population = jax.lax.cond(
+                        buffer_full, _cmaes_generate, _random_generate, rng_ask)
                 else:
-                    new_levels = decode_latent_to_levels(vae_decode_fn, z_population, rng_decode)
+                    new_levels, es_state, z_population = _cmaes_generate(rng_ask)
             elif config.get("use_dred"):
                 # DRED: interpolate pairs from buffer in VAE latent space
                 # Fall back to random generation if buffer has < 2 levels
@@ -1167,27 +1189,43 @@ def main(config=None, project="JAXUED_TEST"):
             if config["use_cmaes"]:
                 # CMA-ES minimizes; negate scores so high-regret = low fitness
                 rng, rng_tell = jax.random.split(rng)
-                es_state = cmaes_mgr.tell(rng_tell, z_population, -scores, es_state)
 
-                # Reset on sigma collapse (adaptive) or fixed interval (fallback)
-                sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es_state.std < config["cmaes_sigma_min"])
-                periodic_reset = (train_state.num_dr_updates % config["cmaes_reset_interval"]) == 0
-                should_reset = sigma_collapsed | periodic_reset
+                def _cmaes_tell(args):
+                    rng_tell, z_pop, scores_neg, es, num_dr = args
+                    es = cmaes_mgr.tell(rng_tell, z_pop, scores_neg, es)
 
-                # Archive population before reset for latent visualization
-                if config.get("save_cmaes_populations", True):
-                    jax.debug.callback(
-                        _save_cmaes_population,
-                        z_population, scores, es_state.mean,
-                        train_state.num_dr_updates, should_reset,
+                    # Reset on sigma collapse (adaptive) or fixed interval (fallback)
+                    sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es.std < config["cmaes_sigma_min"])
+                    periodic_reset = (num_dr % config["cmaes_reset_interval"]) == 0
+                    should_reset = sigma_collapsed | periodic_reset
+
+                    # Archive population before reset for latent visualization
+                    if config.get("save_cmaes_populations", True):
+                        jax.debug.callback(
+                            _save_cmaes_population,
+                            z_pop, -scores_neg, es.mean,
+                            num_dr, should_reset,
+                        )
+
+                    rng_reset_es = jax.random.fold_in(rng_tell, 999)
+                    fresh_es = cmaes_mgr.initialize(rng_reset_es)
+                    es = jax.tree_util.tree_map(
+                        lambda fresh, old: jnp.where(should_reset, fresh, old),
+                        fresh_es, es
                     )
+                    return es
 
-                rng, rng_reset_es = jax.random.split(rng)
-                fresh_es_state = cmaes_mgr.initialize(rng_reset_es)
-                es_state = jax.tree_util.tree_map(
-                    lambda fresh, old: jnp.where(should_reset, fresh, old),
-                    fresh_es_state, es_state
-                )
+                def _skip_tell(args):
+                    return args[3]  # return es_state unchanged
+
+                if config.get("cmaes_delayed_start"):
+                    buffer_full = sampler["size"] >= config["level_buffer_capacity"]
+                    es_state = jax.lax.cond(
+                        buffer_full, _cmaes_tell, _skip_tell,
+                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates))
+                else:
+                    es_state = _cmaes_tell(
+                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates))
 
             # DRED: only insert solvable levels (agent got positive reward at least once)
             if config.get("use_dred"):
@@ -1671,6 +1709,10 @@ def main(config=None, project="JAXUED_TEST"):
             _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens{tag}.npy")
             _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump{tag}.npz")
 
+    # Track whether delayed-start KL+PCA has been initialized
+    _delayed_start_initialized = False
+    _delayed_active_dims = None  # set when delayed-start KL is computed
+
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
@@ -1699,6 +1741,79 @@ def main(config=None, project="JAXUED_TEST"):
                 ts_cur = ts_cur.replace(cenie_gmm_params=new_gmm_params)
                 runner_state = (rng_cur, ts_cur)
 
+        # Delayed-start: initialize KL filtering + PCA when buffer first becomes full
+        if config.get("cmaes_delayed_start") and use_pca and not _delayed_start_initialized:
+            rng_cur, ts_cur = runner_state
+            buf_size = int(ts_cur.sampler["size"])
+            if buf_size >= config["level_buffer_capacity"]:
+                print(f"[Delayed start] Buffer full ({buf_size} levels). Computing KL + PCA on buffer...")
+
+                # Encode buffer levels
+                buf_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], ts_cur.sampler["levels"])
+                buf_tokens = jax.vmap(level_to_tokens)(buf_levels)
+                buf_means = encode_levels_to_means(vae_encode_fn, buf_tokens)
+
+                # KL filtering on buffer
+                full_d = vae_cfg["latent_dim"]
+                if config["cmaes_kl_threshold"] > 0:
+                    batch_size = 256
+                    all_means_kl, all_logvars_kl = [], []
+                    for i in range(0, len(buf_tokens), batch_size):
+                        m, lv = vae_encode_fn(buf_tokens[i:i+batch_size])
+                        all_means_kl.append(m)
+                        all_logvars_kl.append(lv)
+                    mean_enc = jnp.concatenate(all_means_kl, axis=0)
+                    logvar_enc = jnp.concatenate(all_logvars_kl, axis=0)
+                    kl_per_dim = -0.5 * (1 + logvar_enc - mean_enc**2 - jnp.exp(logvar_enc))
+                    kl_per_dim = jnp.mean(kl_per_dim, axis=0)
+
+                    delayed_active_mask = kl_per_dim > config["cmaes_kl_threshold"]
+                    delayed_active_dims = jnp.where(delayed_active_mask)[0]
+                    n_active = int(delayed_active_dims.shape[0])
+                    print(f"[Delayed start KL] Active dims: {n_active}/{full_d} (threshold={config['cmaes_kl_threshold']})")
+                    print(f"[Delayed start KL] Active indices: {np.array(delayed_active_dims).tolist()}")
+
+                    if n_active == 0 or n_active == full_d:
+                        print(f"[Delayed start KL] {'No active' if n_active == 0 else 'All'} dims — skipping KL filter")
+                        delayed_active_dims = None
+                    wandb.run.summary["delayed_kl_per_dim"] = np.array(kl_per_dim).tolist()
+                    wandb.run.summary["delayed_active_dims"] = np.array(delayed_active_dims).tolist() if delayed_active_dims is not None else list(range(full_d))
+                else:
+                    delayed_active_dims = None
+
+                # Fit PCA on active dims, embed back into full space
+                pca_input = buf_means
+                if delayed_active_dims is not None:
+                    pca_input = buf_means[:, delayed_active_dims]
+
+                pca_fitness = None
+                if config.get("cmaes_pca_fitness_aware"):
+                    pca_fitness = jnp.array(np.asarray(ts_cur.sampler["scores"][:buf_size]))
+
+                new_pca_mean_sub, new_pca_components_sub = fit_pca(pca_input, config["cmaes_pca_dims"], fitness_scores=pca_fitness)
+
+                # Embed back into full 64-dim space
+                if delayed_active_dims is not None:
+                    new_pca_mean = jnp.zeros(full_d).at[delayed_active_dims].set(new_pca_mean_sub)
+                    new_pca_components = jnp.zeros((config["cmaes_pca_dims"], full_d)).at[:, delayed_active_dims].set(new_pca_components_sub)
+                    print(f"[Delayed start PCA] {len(delayed_active_dims)} active dims -> {config['cmaes_pca_dims']} PCs (embedded in {full_d}D)")
+                else:
+                    new_pca_mean = new_pca_mean_sub
+                    new_pca_components = new_pca_components_sub
+                    print(f"[Delayed start PCA] {full_d} dims -> {config['cmaes_pca_dims']} PCs")
+
+                # Reset CMA-ES and update PCA in train_state
+                new_es = cmaes_mgr.initialize(jax.random.PRNGKey(eval_step + 2000))
+                ts_cur = ts_cur.replace(
+                    pca_mean=new_pca_mean,
+                    pca_components=new_pca_components,
+                    es_state=new_es,
+                )
+                runner_state = (rng_cur, ts_cur)
+                _delayed_start_initialized = True
+                _delayed_active_dims = delayed_active_dims
+                print(f"[Delayed start] CMA-ES + PCA activated at eval_step={eval_step+1}")
+
         # PCA refit
         if use_pca and config.get("cmaes_pca_refit_interval", 0) > 0:
             if (eval_step + 1) % config["cmaes_pca_refit_interval"] == 0:
@@ -1709,9 +1824,11 @@ def main(config=None, project="JAXUED_TEST"):
                     buf_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], ts_cur.sampler["levels"])
                     buf_tokens = jax.vmap(level_to_tokens)(buf_levels)
                     buf_means = encode_levels_to_means(vae_encode_fn, buf_tokens)
-                    # If KL filtering is active, restrict to active dims
-                    if active_dims is not None:
-                        buf_means = buf_means[:, active_dims]
+                    # Determine which dims to use for PCA
+                    # delayed-start uses _delayed_active_dims, normal mode uses active_dims
+                    _refit_active = _delayed_active_dims if config.get("cmaes_delayed_start") else active_dims
+                    if _refit_active is not None:
+                        buf_means = buf_means[:, _refit_active]
 
                     if config.get("cmaes_pca_buffer_only", False):
                         # Buffer-only PCA
@@ -1725,8 +1842,8 @@ def main(config=None, project="JAXUED_TEST"):
                         rand_levels = jax.vmap(sample_random_level)(jax.random.split(rng_pca, n_random))
                         rand_tokens = jax.vmap(level_to_tokens)(rand_levels)
                         rand_means = encode_levels_to_means(vae_encode_fn, rand_tokens)
-                        if active_dims is not None:
-                            rand_means = rand_means[:, active_dims]
+                        if _refit_active is not None:
+                            rand_means = rand_means[:, _refit_active]
                         refit_means = jnp.concatenate([buf_means, rand_means], axis=0)
 
                     # Use buffer fitness scores for fitness-aware PCA
@@ -1742,6 +1859,13 @@ def main(config=None, project="JAXUED_TEST"):
                                 jnp.zeros(len(refit_means) - buf_size)
                             ])
                     new_pca_mean, new_pca_components = fit_pca(refit_means, config["cmaes_pca_dims"], fitness_scores=refit_fitness)
+
+                    # For delayed-start mode, embed PCA back into full 64-dim space
+                    if config.get("cmaes_delayed_start") and _refit_active is not None:
+                        full_d = vae_cfg["latent_dim"]
+                        new_pca_mean = jnp.zeros(full_d).at[_refit_active].set(new_pca_mean)
+                        new_pca_components = jnp.zeros((config["cmaes_pca_dims"], full_d)).at[:, _refit_active].set(new_pca_components)
+
                     # Reset CMA-ES (coordinate system changed)
                     new_es = cmaes_mgr.initialize(jax.random.PRNGKey(eval_step + 1000))
                     ts_cur = ts_cur.replace(
@@ -2071,6 +2195,9 @@ if __name__=="__main__":
                        help="Refit PCA on buffer levels only (no random levels mixed in)")
     group.add_argument("--cmaes_pca_fitness_aware", action=argparse.BooleanOptionalAction, default=False,
                        help="Fitness-aware PCA: PC1 = direction of max fitness change, rest = max variance orthogonal to it")
+    group.add_argument("--cmaes_delayed_start", action=argparse.BooleanOptionalAction, default=False,
+                       help="Start with standard ACCEL (random levels), switch to CMA-ES+PCA once buffer is full. "
+                            "KL filtering and PCA are computed from buffer levels at that point.")
     group.add_argument("--warmstart_checkpoint", type=str, default=None,
                        help="Path to Orbax checkpoint dir to warm-start agent params from (e.g. checkpoints/run/0/models)")
     group.add_argument("--warmstart_buffer", type=str, default=None,
