@@ -37,6 +37,10 @@ from cmaes_manager import CMAESManager
 from cenie_scorer import CENIEScorer
 from cnn_vae_model import CnnLstmDecoder
 from cnn_vae_level_utils import decode_latent_to_levels_grid
+from cnn_vae_pca_utils import (
+    encode_mazes_to_mu, compute_active_dims, compute_pca_axes,
+    make_variance_pruned_decode_fn, make_pc_decode_fn,
+)
 
 class UpdateState(IntEnum):
     DR = 0
@@ -517,6 +521,7 @@ def main(config=None, project="JAXUED_TEST"):
         _checkpointer = ocp.PyTreeCheckpointer()
         _restored = _checkpointer.restore(_ckpt_abs)
         _decoder_params = _restored["params"]["decoder"]
+        _cnn_vae_params = _restored["params"]  # Full params for encoder (PCA needs 'encoder' + 'mean_layer')
         _decoder = CnnLstmDecoder(latent_dim=_cnn_vae_latent_dim)
 
         def vae_decode_fn(z):
@@ -524,6 +529,8 @@ def main(config=None, project="JAXUED_TEST"):
             z_batched = z[None]                                    # (1, latent_dim)
             wl, gl, al = _decoder.apply({"params": _decoder_params}, z_batched)
             return wl[0], gl[0], al[0]                            # each (13, 13)
+
+        cnn_base_decode_fn = vae_decode_fn  # Save unwrapped reference for PCA wrapping
 
         print(f"[CMA-ES] CNN-VAE loaded from {_ckpt_abs}")
         print(f"[CMA-ES] latent_dim={_cnn_vae_latent_dim}, popsize={config['num_train_envs']}")
@@ -565,6 +572,41 @@ def main(config=None, project="JAXUED_TEST"):
             sigma_init=config["cmaes_sigma_init"],
         )
 
+    # --- PCA-space CMA-ES setup (Stage 1: variance-pruned dims) ---
+    _pca_stage = 0  # 0 = no PCA, 1 = variance-pruned, 2 = buffer PCA
+    _effective_latent_dim = _latent_dim_for_cmaes if config["use_cmaes"] else None
+
+    if config.get("use_pca_search") and config["use_cmaes"] and not config.get("use_clutr_vae"):
+        import numpy as _np_pca
+
+        # Stage 1: Select active dims via mean_layer weight norms (no dataset needed)
+        _mean_layer_kernel = _np_pca.array(_cnn_vae_params['mean_layer']['kernel'])  # (512, 64)
+        print(f"[PCA Stage 1] Analyzing mean_layer weights: {_mean_layer_kernel.shape}")
+
+        _pca_stage1_k = config.get("pca_stage1_k")  # None = auto
+        _kept_dims, _per_dim_norms, _K_stage1 = compute_active_dims(
+            _mean_layer_kernel, K=_pca_stage1_k, cum_threshold=0.85
+        )
+        _cumnorm_pct = _per_dim_norms[_kept_dims].sum() / _per_dim_norms.sum() * 100
+        print(f"[PCA Stage 1] Keeping {_K_stage1} of 64 dims (cumulative norm: {_cumnorm_pct:.1f}%)")
+        print(f"[PCA Stage 1] Kept dims: {_kept_dims}")
+
+        # Wrap decode function for Stage 1
+        _mu_mean_zeros = jnp.zeros(_cnn_vae_latent_dim)  # Use VAE prior mean (zeros) for dropped dims
+        _kept_dims_jnp = jnp.array(_kept_dims, dtype=jnp.int32)
+        vae_decode_fn = make_variance_pruned_decode_fn(cnn_base_decode_fn, _mu_mean_zeros, _kept_dims_jnp)
+        _effective_latent_dim = _K_stage1
+
+        # Reinitialize CMAESManager with reduced dims
+        cmaes_mgr = CMAESManager(
+            popsize=config["num_train_envs"],
+            latent_dim=_K_stage1,
+            sigma_init=config["cmaes_sigma_init"],  # Keep same sigma for Stage 1 (latent space, not whitened)
+        )
+        print(f"[PCA Stage 1] CMAESManager reinitialized: latent_dim={_K_stage1}, sigma={config['cmaes_sigma_init']}")
+
+        _pca_stage = 1
+
     if config.get("use_dred"):
         _latent_str = str(_cnn_vae_latent_dim) if not config.get("use_clutr_vae") else str(vae_cfg["latent_dim"])
         print(f"[DRED] latent_dim={_latent_str}, interpolation-based level generation")
@@ -601,10 +643,11 @@ def main(config=None, project="JAXUED_TEST"):
                 log_dict.update({f"images/{s}_levels": [wandb.Image(np.array(image)) for image in stats[f"{s}_levels"]]})
 
         # animations
-        for i, level_name in enumerate(config["eval_levels"]):
-            frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
-            frames = np.array(frames[:episode_length])
-            log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
+        if not config.get("skip_video"):
+            for i, level_name in enumerate(config["eval_levels"]):
+                frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
+                frames = np.array(frames[:episode_length])
+                log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
 
         # Validity rate and insertion rate logging (averaged over eval_freq steps, excluding replay steps where it's 0)
         if "gen/valid_structure_pct" in stats:
@@ -1376,6 +1419,12 @@ def main(config=None, project="JAXUED_TEST"):
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
+        # Log PCA stage info (Python-level, not inside jit)
+        if config.get("use_pca_search") and config["use_cmaes"]:
+            wandb.log({
+                "pca/stage": _pca_stage,
+                "pca/K": _effective_latent_dim or 0,
+            }, commit=False)
         if config["checkpoint_save_interval"] > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
@@ -1700,6 +1749,21 @@ if __name__=="__main__":
                        help="Reset CMA-ES every N DR updates to prevent stagnation")
     group.add_argument("--save_cmaes_populations", action=argparse.BooleanOptionalAction, default=True,
                        help="Save CMA-ES population archive before each reset for latent visualization")
+    # === PCA-SPACE CMA-ES CONFIG ===
+    group.add_argument("--use_pca_search", action=argparse.BooleanOptionalAction, default=False,
+                       help="Enable two-stage PCA-space CMA-ES search (Stage 1: variance-pruned, Stage 2: buffer PCA)")
+    group.add_argument("--pca_components", type=int, default=20,
+                       help="Number of PCA components for Stage 2 (default: 20)")
+    group.add_argument("--pca_dataset_size", type=int, default=10000,
+                       help="Number of training mazes for Stage 1 variance analysis (default: 10000)")
+    group.add_argument("--pca_dataset_path", type=str, default="/tmp/train_1M_envs.npy",
+                       help="Path to training dataset .npy file (CLUTR format)")
+    group.add_argument("--pca_stage2_step", type=int, default=10000,
+                       help="Update step at which to transition from Stage 1 to Stage 2 (default: 10000)")
+    group.add_argument("--pca_stage1_k", type=int, default=None,
+                       help="Override Stage 1 K (default: auto via 85%% cumulative variance)")
+    group.add_argument("--pca_sigma_init", type=float, default=0.5,
+                       help="CMA-ES sigma_init for Stage 2 (whitened PCA space, default: 0.5)")
     # === GCS CONFIG ===
     group.add_argument("--gcs_bucket", type=str, default=None,
                        help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
@@ -1709,6 +1773,8 @@ if __name__=="__main__":
                        help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
     group.add_argument("--skip_post_eval", action="store_true", default=False,
                        help="Skip post-training buffer evaluation, rendering, and PCA (run evaluate_buffer.py separately)")
+    group.add_argument("--skip_video", action="store_true", default=False,
+                       help="Skip wandb.Video GIF encoding at each eval checkpoint (speeds up logging significantly)")
 
     config = vars(parser.parse_args())
 
