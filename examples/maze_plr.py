@@ -1304,7 +1304,6 @@ def main(config=None, project="JAXUED_TEST"):
         cum_rewards = (rewards * mask).sum(axis=0)
         return states, cum_rewards, episode_lengths # (num_steps, num_eval_levels, ...), (num_eval_levels,), (num_eval_levels,)
     
-    @jax.jit
     def train_and_eval_step(runner_state, _):
         """
             This function runs the train_step for a certain number of iterations, and then evaluates the policy.
@@ -1316,16 +1315,16 @@ def main(config=None, project="JAXUED_TEST"):
         # Eval
         rng, rng_eval = jax.random.split(rng)
         states, cum_rewards, episode_lengths = jax.vmap(eval, (0, None))(jax.random.split(rng_eval, config["eval_num_attempts"]), train_state)
-        
+
         # Collect Metrics
         eval_solve_rates = jnp.where(cum_rewards > 0, 1., 0.).mean(axis=0) # (num_eval_levels,)
         eval_returns = cum_rewards.mean(axis=0) # (num_eval_levels,)
-        
+
         # just grab the first run
         states, episode_lengths = jax.tree_util.tree_map(lambda x: x[0], (states, episode_lengths)) # (num_steps, num_eval_levels, ...), (num_eval_levels,)
         images = jax.vmap(jax.vmap(env_renderer.render_state, (0, None)), (0, None))(states, env_params) # (num_steps, num_eval_levels, ...)
         frames = images.transpose(0, 1, 4, 2, 3) # WandB expects color channel before image dimensions when dealing with animations for some reason
-        
+
         metrics["update_count"] = train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
         metrics["eval_returns"] = eval_returns
         metrics["eval_solve_rates"] = eval_solve_rates
@@ -1334,15 +1333,17 @@ def main(config=None, project="JAXUED_TEST"):
         metrics["dr_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.dr_last_level_batch, env_params)
         metrics["replay_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.replay_last_level_batch, env_params)
         metrics["mutation_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.mutation_last_level_batch, env_params)
-        
+
         highest_scoring_level = level_sampler.get_levels(train_state.sampler, train_state.sampler["scores"].argmax())
         highest_weighted_level = level_sampler.get_levels(train_state.sampler, level_sampler.level_weights(train_state.sampler).argmax())
-        
+
         metrics["highest_scoring_level"] = env_renderer.render_level(highest_scoring_level, env_params)
         metrics["highest_weighted_level"] = env_renderer.render_level(highest_weighted_level, env_params)
-        
+
         return (rng, train_state), metrics
-    
+
+    train_and_eval_step_jitted = jax.jit(train_and_eval_step)
+
     def eval_checkpoint(og_config):
         """
             This function is what is used to evaluate a saved checkpoint *after* training. It first loads the checkpoint and then runs evaluation.
@@ -1415,7 +1416,7 @@ def main(config=None, project="JAXUED_TEST"):
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
     for eval_step in range(config["num_updates"] // config["eval_freq"]):
         start_time = time.time()
-        runner_state, metrics = train_and_eval_step(runner_state, None)
+        runner_state, metrics = train_and_eval_step_jitted(runner_state, None)
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
@@ -1448,6 +1449,85 @@ def main(config=None, project="JAXUED_TEST"):
         updates_so_far = (eval_step + 1) * config["eval_freq"]
         if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
             dump_buffer(runner_state[1], updates_so_far // 1000)
+
+        # === PCA Stage 2 transition ===
+        if (config.get("use_pca_search") and config["use_cmaes"]
+                and not config.get("use_clutr_vae")
+                and _pca_stage == 1
+                and updates_so_far >= config.get("pca_stage2_step", 10000)):
+
+            print(f"\n{'='*60}")
+            print(f"[PCA Stage 2] Transitioning at update {updates_so_far}...")
+
+            # Step 1: Extract buffer levels and encode to mu vectors
+            ts = runner_state[1]
+            sampler = ts.sampler
+            buf_size = int(sampler["size"])
+
+            K_stage2 = config.get("pca_components", 20)
+            min_buf_for_pca = K_stage2 * 10
+
+            if buf_size < min_buf_for_pca:
+                print(f"[PCA Stage 2] WARNING: Buffer too small ({buf_size} < {min_buf_for_pca}). "
+                      f"Staying in Stage 1.")
+            else:
+                print(f"[PCA Stage 2] Buffer has {buf_size} levels. Encoding to mu vectors...")
+
+                buffer_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], sampler["levels"])
+                tokens_jax = jax.vmap(level_to_tokens)(buffer_levels)  # (buf_size, 52)
+                tokens_np = np.array(tokens_jax)  # CRITICAL: convert to numpy before clutr_to_grid
+
+                mu_buf = encode_mazes_to_mu(_cnn_vae_params, tokens_np, latent_dim=_cnn_vae_latent_dim)
+                print(f"[PCA Stage 2] Encoded {buf_size} buffer levels -> mu ({mu_buf.shape})")
+
+                # Step 2: Compute PCA
+                mu_mean_s2, pc_axes_s2, pc_stds_s2, evr_s2 = compute_pca_axes(mu_buf, K_stage2)
+                print(f"[PCA Stage 2] Top {K_stage2} PCs explain {evr_s2.sum()*100:.1f}% variance")
+
+                # Step 3: Wrap decode function with PCA projection
+                vae_decode_fn = make_pc_decode_fn(
+                    cnn_base_decode_fn,
+                    jnp.array(mu_mean_s2),
+                    jnp.array(pc_axes_s2),
+                    jnp.array(pc_stds_s2),
+                )
+
+                # Step 4: Reinitialize CMAESManager with Stage 2 dims
+                _sigma_s2 = config.get("pca_sigma_init", 0.5)
+                cmaes_mgr = CMAESManager(
+                    popsize=config["num_train_envs"],
+                    latent_dim=K_stage2,
+                    sigma_init=_sigma_s2,
+                )
+                print(f"[PCA Stage 2] CMAESManager reinitialized: latent_dim={K_stage2}, sigma={_sigma_s2}")
+
+                # Step 5: Reinitialize es_state and inject into runner_state
+                rng_cur, ts_cur = runner_state
+                rng_cur, rng_es_init = jax.random.split(rng_cur)
+                new_es_state = cmaes_mgr.initialize(rng_es_init)
+                ts_cur = ts_cur.replace(es_state=new_es_state)
+                runner_state = (rng_cur, ts_cur)
+
+                # Step 6: Force JIT recompilation with new closures
+                # train_step and train_and_eval_step are Python closures that capture
+                # cmaes_mgr and vae_decode_fn. By reassigning above and re-jitting,
+                # JAX will trace fresh functions with the new objects.
+                train_and_eval_step_jitted = jax.jit(train_and_eval_step)
+                print(f"[PCA Stage 2] JIT recompilation scheduled (next call will retrace)")
+
+                _pca_stage = 2
+                _effective_latent_dim = K_stage2
+
+                # Log transition to WandB
+                wandb.log({
+                    "pca/stage": 2,
+                    "pca/K": K_stage2,
+                    "pca/explained_var": float(evr_s2.sum()),
+                    "pca/transition_step": updates_so_far,
+                }, commit=False)
+
+                print(f"[PCA Stage 2] Transition complete. CMA-ES now searching in {K_stage2}-dim PCA space.")
+                print(f"{'='*60}\n")
 
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]
