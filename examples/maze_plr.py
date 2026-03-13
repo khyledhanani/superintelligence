@@ -1278,8 +1278,10 @@ def main(config=None, project="JAXUED_TEST"):
                 # Mean norm of latent vectors (how far from origin)
                 metrics["cmaes/mean_z_norm"] = jnp.linalg.norm(z_population, axis=-1).mean()
                 # Track sigma-triggered resets (1.0 if reset happened this step, 0.0 otherwise)
-                metrics["cmaes/sigma_reset"] = jnp.where(sigma_collapsed, 1.0, 0.0)
-                metrics["cmaes/periodic_reset"] = jnp.where(periodic_reset & ~sigma_collapsed, 1.0, 0.0)
+                _sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es_state.std < config["cmaes_sigma_min"])
+                _periodic_reset = (train_state.num_dr_updates % config["cmaes_reset_interval"]) == 0
+                metrics["cmaes/sigma_reset"] = jnp.where(_sigma_collapsed, 1.0, 0.0)
+                metrics["cmaes/periodic_reset"] = jnp.where(_periodic_reset & ~_sigma_collapsed, 1.0, 0.0)
 
             # CENIE: pass subsampled obs_actions through metrics (no callbacks)
             if config["score_function"] == "cenie":
