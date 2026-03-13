@@ -25,6 +25,12 @@ class RunSpec:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="If set, pass --project <name> to every maze_traced run.",
+    )
     parser.add_argument("--start_seed", type=int, default=0, help="First seed (inclusive).")
     parser.add_argument("--num_seeds", type=int, default=3, help="Number of consecutive seeds to run.")
     parser.add_argument(
@@ -93,6 +99,8 @@ def main() -> None:
         raise ValueError("--num_seeds must be >= 1")
 
     shared_extra = shlex.split(args.shared_args)
+    if args.project is not None:
+        shared_extra = ["--project", args.project, *shared_extra]
     traced_extra = shlex.split(args.traced_args)
     pca_extra = shlex.split(args.pca_args)
 
