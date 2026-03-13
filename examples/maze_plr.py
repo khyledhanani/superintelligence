@@ -821,7 +821,7 @@ def main(config=None, project="JAXUED_TEST"):
         # the active subspace (not full latent space).
 
         wandb.run.summary["pca_dims"] = pca_dims
-        if not config.get("warmstart_buffer"):
+        if not config.get("warmstart_buffer") and not config.get("cmaes_delayed_start"):
             # Log explained variance (only when we have pca_latent_means from initial fit)
             wandb.run.summary["pca_explained_var"] = float(
                 jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1][:pca_dims]**2)
