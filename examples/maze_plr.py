@@ -1355,14 +1355,29 @@ def main(config=None, project="JAXUED_TEST"):
                 metrics["cmaes/valid_structure_pct"] = is_valid.mean() * 100
                 metrics["cmaes/mean_fitness"] = scores.mean()
                 metrics["cmaes/mean_episode_length"] = dones.sum(axis=0).mean()
+                # For pca_start_after: use full es_state during phase 1, pca es_state during phase 2
+                if config.get("cmaes_pca_start_after", 0) > 0 and cmaes_mgr_full is not None:
+                    pca_active = train_state.num_dr_updates >= config["cmaes_pca_start_after"]
+                    _report_sigma = jnp.where(pca_active, es_state.std, es_state_full.std)
+                else:
+                    _report_sigma = es_state.std
                 # Step size (sigma) — tracks exploration vs convergence
-                metrics["cmaes/sigma"] = es_state.std
+                metrics["cmaes/sigma"] = _report_sigma
                 # Spread of population in latent space (std of z-vectors across candidates)
-                metrics["cmaes/pop_spread"] = z_population.std()
+                # For pca_start_after phase 1: z_population is dummy, use es_state_full.mean norm instead
+                if config.get("cmaes_pca_start_after", 0) > 0 and cmaes_mgr_full is not None:
+                    _pop_spread = jnp.where(pca_active, z_population.std(), es_state_full.std)
+                    _z_norm = jnp.where(pca_active,
+                        jnp.linalg.norm(z_population, axis=-1).mean(),
+                        jnp.linalg.norm(es_state_full.mean))
+                else:
+                    _pop_spread = z_population.std()
+                    _z_norm = jnp.linalg.norm(z_population, axis=-1).mean()
+                metrics["cmaes/pop_spread"] = _pop_spread
                 # Mean norm of latent vectors (how far from origin)
-                metrics["cmaes/mean_z_norm"] = jnp.linalg.norm(z_population, axis=-1).mean()
+                metrics["cmaes/mean_z_norm"] = _z_norm
                 # Track sigma-triggered resets (1.0 if reset happened this step, 0.0 otherwise)
-                _sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es_state.std < config["cmaes_sigma_min"])
+                _sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (_report_sigma < config["cmaes_sigma_min"])
                 _periodic_reset = (train_state.num_dr_updates % config["cmaes_reset_interval"]) == 0
                 metrics["cmaes/sigma_reset"] = jnp.where(_sigma_collapsed, 1.0, 0.0)
                 metrics["cmaes/periodic_reset"] = jnp.where(_periodic_reset & ~_sigma_collapsed, 1.0, 0.0)

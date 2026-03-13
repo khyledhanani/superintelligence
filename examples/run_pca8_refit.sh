@@ -11,7 +11,7 @@ for SEED in 1 2 3; do
         --num_updates 30000 --eval_freq 250 \
         --use_cmaes --score_function sfl \
         --cmaes_sigma_min 0.1 \
-        --cmaes_kl_threshold 0.01 \
+        --cmaes_kl_threshold 0.1 \
         --cmaes_kl_data /tmp/train_1M_envs.npy \
         --cmaes_kl_samples 20000 \
         --cmaes_pca_dims 20 \
