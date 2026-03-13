@@ -79,7 +79,7 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. Integration | 2/2 | Complete | 2026-03-11 |
 | 4. Experiment | 0/? | Not started | - |
 | 5. PCA-Space CMA-ES | 3/3 | Complete | 2026-03-13 |
-| 6. TPU Run + Comparison | 0/3 | Not started | - |
+| 6. TPU Run + Comparison | 1/3 | In progress | - |
 
 ### Phase 5: PCA-Space CMA-ES Search
 **Goal**: Two-stage dimensionality reduction for CMA-ES: Stage 1 (weight-norm pruned latent search, ~30 dims from step 0 using checkpoint weights) and Stage 2 (buffer PCA search, K components after 10k steps). CMA-ES searches in a reduced subspace that reflects the valid maze manifold, giving it free covariance structure and O(K^2) sample complexity instead of O(64^2).
@@ -104,6 +104,6 @@ Phases execute in strict sequential order: 1 → 2 → 3 → 4 → 5 → 6
 **Plans:** 3 plans
 
 Plans:
-- [ ] 06-01-PLAN.md — Create examples/launch_pca_comparison.sh + scripts/compare_phase4_results.py
+- [x] 06-01-PLAN.md — Create examples/launch_pca_comparison.sh + scripts/compare_phase4_results.py
 - [ ] 06-02-PLAN.md — Sync files to TPU and launch 5-seed experiment (human checkpoint)
 - [ ] 06-03-PLAN.md — Retrieve WandB results and write 06-RESULTS.md comparison table (human checkpoint)

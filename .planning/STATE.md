@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-03-11)
 
 **Core value:** CMA-ES with CNN-VAE produces valid, solvable maze Levels and runs a complete 20k training experiment comparable to the ACCEL baseline.
-**Current focus:** Phase 5 — PCA-Space CMA-ES Search
+**Current focus:** Phase 6 — Run PCA-space CMA-ES on TPU (30k steps, 5 seeds) and compare solve_rate against Phase 4 results
 
 ## Current Position
 
-Phase: 5 of 5 (PCA-Space CMA-ES Search)
-Plan: 3 of 3 in current phase — COMPLETE
-Status: Phase 5 COMPLETE — PCA-space CMA-ES smoke test passed (Stage 1 K=55, sigma=0.963, valid_structure_pct=100%)
-Last activity: 2026-03-13 — Completed Phase 5 Plan 03 (smoke test: Phase A offline validation + Phase B 500-step run)
+Phase: 6 of 6 (Run PCA-CMA-ES on TPU + Compare Phase 4)
+Plan: 1 of 1 in current phase — COMPLETE
+Status: Phase 6 Plan 01 COMPLETE — launch_pca_comparison.sh and compare_phase4_results.py created; ready for TPU execution + human verification
+Last activity: 2026-03-13 — Completed Phase 6 Plan 01 (experiment launch script + WandB comparison script)
 
 Progress: [##########] 100%
 
@@ -31,10 +31,11 @@ Progress: [##########] 100%
 | 02-grid-adapter | 2 | 8min | 4min |
 | 03-integration | 2 | 25min | 12.5min |
 | 05-pca-space-cma-es-search | 3 | 43min | 14.3min |
+| 06-run-pca-tpu-compare | 1 | 2min | 2min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (5min), 02-01 (6min), 02-02 (2min), 03-01 (2min), 03-02 (23min), 05-01 (3min)
-- Trend: 05-01 fast (pure file creation, no GPU infrastructure work needed)
+- Last 5 plans: 02-02 (2min), 03-01 (2min), 03-02 (23min), 05-01 (3min), 06-01 (2min)
+- Trend: 06-01 fast (pure file creation, no GPU infrastructure work needed)
 
 *Updated after each plan completion*
 
@@ -74,10 +75,14 @@ Recent decisions affecting current work:
 - [05-03]: Stage 1 K=55 (at upper boundary of [15, 55]) — cumulative 86.5% norm threshold adapts to checkpoint quality
 - [05-03]: Phase B smoke test run on CPU (GPU nodes unreachable); 500 steps completed in ~31 min — all functional checks pass
 - [05-03]: pca_stage2_step=99999 in smoke test keeps Stage 1 active for full 500 steps (no dataset download needed)
+- [06-01]: PCA launch script runs only 5 seeds (1 condition) — Phase 4 already has cmaes-cnn-vae-accel and accel-baseline data
+- [06-01]: compare_phase4_results.py accepts --entity as optional arg (WandB infers from login if omitted)
+- [06-01]: Final value extraction via hist[metric].dropna().iloc[-1] — robust to sparse WandB logging
 
 ### Roadmap Evolution
 
 - Phase 5 added: PCA-Space CMA-ES Search
+- Phase 6 added: Run PCA-space CMA-ES on TPU (30k steps, 5 seeds) and compare solve_rate against Phase 4 results
 
 ### Pending Todos
 
@@ -93,5 +98,5 @@ None — all Phase 1 blockers resolved:
 ## Session Continuity
 
 Last session: 2026-03-13
-Stopped at: Completed 05-03-PLAN.md — Phase 5 complete. PCA-space CMA-ES smoke test passed (Stage 1 K=55, sigma=0.963, valid_structure_pct=100%, exit 0). All 5 phases done.
+Stopped at: Completed 06-01-PLAN.md — launch_pca_comparison.sh and compare_phase4_results.py created. Awaiting human checkpoint: sync scripts to TPU VM and run 5-seed PCA experiment.
 Resume file: None
