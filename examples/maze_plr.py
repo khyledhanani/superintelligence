@@ -114,6 +114,7 @@ class TrainState(BaseTrainState):
     sampler: core.FrozenDict[str, chex.ArrayTree] = struct.field(pytree_node=True)
     update_state: UpdateState = struct.field(pytree_node=True)
     es_state: chex.ArrayTree = struct.field(pytree_node=True)
+    es_state_full: chex.ArrayTree = struct.field(pytree_node=True)  # For pca_start_after: full-dim CMA-ES
     cenie_gmm_params: chex.ArrayTree = struct.field(pytree_node=True)
     pca_mean: chex.Array = struct.field(pytree_node=True)
     pca_components: chex.Array = struct.field(pytree_node=True)
@@ -697,7 +698,7 @@ def main(config=None, project="JAXUED_TEST"):
     full_latent_dim = vae_cfg["latent_dim"] if _needs_vae else None
     if config.get("cmaes_delayed_start") and _needs_vae and config["use_cmaes"]:
         # Delayed start: skip KL filtering at init, will be computed when buffer is full
-        print(f"[KL-filter] Deferred to delayed start (will compute when buffer is full)")
+        print(f"[KL-filter] Deferred (will compute when PCA activates)")
     elif _needs_vae and config["use_cmaes"] and config["cmaes_kl_threshold"] > 0:
         kl_data_path = config.get("cmaes_kl_data")
         ws_buffer_path = config.get("warmstart_buffer")
@@ -780,8 +781,9 @@ def main(config=None, project="JAXUED_TEST"):
     if use_pca:
         pca_dims = config["cmaes_pca_dims"]
         # Skip initial PCA fit if delayed start or warm-start buffer (PCA will be fit later)
-        if config.get("cmaes_delayed_start"):
-            print(f"[PCA] Deferred to delayed start (will compute when buffer is full)")
+        if config.get("cmaes_delayed_start") or config.get("cmaes_pca_start_after", 0) > 0:
+            _start_msg = f"after {config['cmaes_pca_start_after']} updates" if config.get("cmaes_pca_start_after", 0) > 0 else "when buffer is full"
+            print(f"[PCA] Deferred ({_start_msg})")
             full_d = vae_cfg["latent_dim"]
             pca_mean_init = jnp.zeros(full_d)
             pca_components_init = jnp.eye(pca_dims, full_d)
@@ -821,7 +823,7 @@ def main(config=None, project="JAXUED_TEST"):
         # the active subspace (not full latent space).
 
         wandb.run.summary["pca_dims"] = pca_dims
-        if not config.get("warmstart_buffer") and not config.get("cmaes_delayed_start"):
+        if not config.get("warmstart_buffer") and not config.get("cmaes_delayed_start") and not config.get("cmaes_pca_start_after", 0) > 0:
             # Log explained variance (only when we have pca_latent_means from initial fit)
             wandb.run.summary["pca_explained_var"] = float(
                 jnp.sum(jnp.linalg.svd(pca_latent_means - pca_mean_init, full_matrices=False)[1][:pca_dims]**2)
@@ -830,17 +832,29 @@ def main(config=None, project="JAXUED_TEST"):
 
     # --- CMA-ES setup ---
     cmaes_mgr = None
+    cmaes_mgr_full = None  # For pca_start_after: full-dim CMA-ES before PCA activates
     if config["use_cmaes"]:
         cmaes_mgr = CMAESManager(
             popsize=config["num_train_envs"],
             latent_dim=cmaes_latent_dim,
             sigma_init=config["cmaes_sigma_init"],
         )
+        # For pca_start_after: also create a full-dim CMA-ES for phase 1
+        if config.get("cmaes_pca_start_after", 0) > 0 and use_pca:
+            kl_dim = len(active_dims) if active_dims is not None else vae_cfg["latent_dim"]
+            cmaes_mgr_full = CMAESManager(
+                popsize=config["num_train_envs"],
+                latent_dim=kl_dim,
+                sigma_init=config["cmaes_sigma_init"],
+            )
+            print(f"[CMA-ES] Phase 1: full search_dim={kl_dim} (before PCA at {config['cmaes_pca_start_after']} updates)")
+            print(f"[CMA-ES] Phase 2: PCA search_dim={cmaes_latent_dim}")
+        else:
+            print(f"[CMA-ES] search_dim={cmaes_latent_dim}, full_latent_dim={full_latent_dim}, popsize={config['num_train_envs']}")
         print(f"[CMA-ES] VAE loaded from {config['vae_checkpoint_path']}")
-        print(f"[CMA-ES] search_dim={cmaes_latent_dim}, full_latent_dim={full_latent_dim}, popsize={config['num_train_envs']}")
         if active_dims is not None:
             print(f"[CMA-ES] KL filtering: {len(active_dims)}/{full_latent_dim} active dims")
-        if use_pca:
+        if use_pca and not config.get("cmaes_pca_start_after", 0) > 0:
             pca_input_dim = len(active_dims) if active_dims is not None else full_latent_dim
             print(f"[CMA-ES] PCA: {pca_input_dim} dims -> {pca_dims} PCs")
 
@@ -1015,6 +1029,7 @@ def main(config=None, project="JAXUED_TEST"):
         _pca_components_init = pca_components_init
 
     # Initialize CMA-ES state OUTSIDE jit to avoid tracing issues with evosax
+    es_state_full_init = None
     if cmaes_mgr is not None:
         es_state_init = cmaes_mgr.initialize(jax.random.PRNGKey(42))
         # Verify shapes before entering any jit context
@@ -1025,6 +1040,10 @@ def main(config=None, project="JAXUED_TEST"):
             f"expected ({cmaes_mgr.latent_dim},). "
             f"This likely means evosax inferred the wrong num_dims."
         )
+        # For pca_start_after: initialize full-dim CMA-ES state for phase 1
+        if cmaes_mgr_full is not None:
+            es_state_full_init = cmaes_mgr_full.initialize(jax.random.PRNGKey(42))
+            print(f"[CMA-ES] Initialized es_state_full: mean.shape={es_state_full_init.mean.shape}")
     else:
         es_state_init = None
 
@@ -1062,6 +1081,7 @@ def main(config=None, project="JAXUED_TEST"):
             sampler=sampler,
             update_state=0,
             es_state=es_state_init,
+            es_state_full=es_state_full_init if es_state_full_init is not None else es_state_init,
             cenie_gmm_params=cenie_gmm_init,
             pca_mean=_pca_mean_init,
             pca_components=_pca_components_init,
@@ -1108,12 +1128,35 @@ def main(config=None, project="JAXUED_TEST"):
                     dummy_z = jnp.zeros((config["num_train_envs"], cmaes_latent_dim))
                     return levels, es_state, dummy_z
 
-                if config.get("cmaes_delayed_start"):
-                    buffer_full = sampler["size"] >= config["level_buffer_capacity"]
+                if config.get("cmaes_pca_start_after", 0) > 0 and cmaes_mgr_full is not None:
+                    # Phase 1: CMA-ES searches full KL-filtered space
+                    # Phase 2: CMA-ES searches PCA space
+                    pca_active = train_state.num_dr_updates >= config["cmaes_pca_start_after"]
+
+                    def _cmaes_full_generate(rng_ask):
+                        es_full = train_state.es_state_full
+                        z_pop, es_full_new = cmaes_mgr_full.ask(rng_ask, es_full)
+                        levels = decode_latent_to_levels(vae_decode_fn, z_pop, rng_decode)
+                        # Return dummy pca-dim z and unchanged es_state for the pca manager
+                        dummy_z = jnp.zeros((config["num_train_envs"], cmaes_latent_dim))
+                        return levels, es_state, dummy_z, es_full_new
+
+                    def _cmaes_pca_generate(rng_ask):
+                        z_pop, es_new = cmaes_mgr.ask(rng_ask, es_state)
+                        z_full = train_state.pca_mean + z_pop @ train_state.pca_components
+                        levels = decode_latent_to_levels(vae_decode_fn, z_full, rng_decode)
+                        return levels, es_new, z_pop, train_state.es_state_full
+
+                    new_levels, es_state, z_population, es_state_full = jax.lax.cond(
+                        pca_active, _cmaes_pca_generate, _cmaes_full_generate, rng_ask)
+                elif config.get("cmaes_delayed_start"):
+                    cmaes_ready = sampler["size"] >= config["level_buffer_capacity"]
                     new_levels, es_state, z_population = jax.lax.cond(
-                        buffer_full, _cmaes_generate, _random_generate, rng_ask)
+                        cmaes_ready, _cmaes_generate, _random_generate, rng_ask)
+                    es_state_full = train_state.es_state_full
                 else:
                     new_levels, es_state, z_population = _cmaes_generate(rng_ask)
+                    es_state_full = train_state.es_state_full
             elif config.get("use_dred"):
                 # DRED: interpolate pairs from buffer in VAE latent space
                 # Fall back to random generation if buffer has < 2 levels
@@ -1218,10 +1261,51 @@ def main(config=None, project="JAXUED_TEST"):
                 def _skip_tell(args):
                     return args[3]  # return es_state unchanged
 
-                if config.get("cmaes_delayed_start"):
-                    buffer_full = sampler["size"] >= config["level_buffer_capacity"]
+                if config.get("cmaes_pca_start_after", 0) > 0 and cmaes_mgr_full is not None:
+                    pca_active = train_state.num_dr_updates >= config["cmaes_pca_start_after"]
+
+                    def _cmaes_full_tell(args):
+                        rng_t, z_pop_full, scores_neg, es_full, num_dr = args
+                        # z_pop_full is dummy (pca-dim) — we need the actual full-dim z
+                        # But we can't access it here. Instead, skip tell for pca es_state
+                        # and tell the full es_state separately
+                        return es_full  # unchanged — full tell handled below
+
+                    # Phase 2: tell PCA CMA-ES
                     es_state = jax.lax.cond(
-                        buffer_full, _cmaes_tell, _skip_tell,
+                        pca_active, _cmaes_tell, _skip_tell,
+                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates))
+
+                    # Phase 1: tell full CMA-ES (need full-dim z_population from _cmaes_full_generate)
+                    # We re-ask to get the z_population used (deterministic given same rng)
+                    # Actually, the full es_state is updated in the generate step already via es_state_full
+                    # We need to tell es_state_full with the scores
+                    def _full_tell(args):
+                        rng_t, scores_neg, es_full, num_dr = args
+                        # Re-ask to get z_population (same rng produces same z)
+                        z_pop, _ = cmaes_mgr_full.ask(rng_ask, train_state.es_state_full)
+                        es_full = cmaes_mgr_full.tell(rng_t, z_pop, scores_neg, es_full)
+                        sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es_full.std < config["cmaes_sigma_min"])
+                        periodic_reset = (num_dr % config["cmaes_reset_interval"]) == 0
+                        should_reset = sigma_collapsed | periodic_reset
+                        rng_reset_es = jax.random.fold_in(rng_t, 999)
+                        fresh_es = cmaes_mgr_full.initialize(rng_reset_es)
+                        es_full = jax.tree_util.tree_map(
+                            lambda fresh, old: jnp.where(should_reset, fresh, old),
+                            fresh_es, es_full)
+                        return es_full
+
+                    def _full_skip(args):
+                        return args[2]  # return es_state_full unchanged
+
+                    es_state_full = jax.lax.cond(
+                        pca_active, _full_skip, _full_tell,
+                        (rng_tell, -scores, es_state_full, train_state.num_dr_updates))
+
+                elif config.get("cmaes_delayed_start"):
+                    cmaes_ready = sampler["size"] >= config["level_buffer_capacity"]
+                    es_state = jax.lax.cond(
+                        cmaes_ready, _cmaes_tell, _skip_tell,
                         (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates))
                 else:
                     es_state = _cmaes_tell(
@@ -1293,6 +1377,7 @@ def main(config=None, project="JAXUED_TEST"):
                 sampler=sampler,
                 update_state=UpdateState.DR,
                 es_state=es_state,
+                es_state_full=es_state_full if config.get("cmaes_pca_start_after", 0) > 0 else train_state.es_state_full,
                 num_dr_updates=train_state.num_dr_updates + 1,
                 dr_last_level_batch=new_levels,
             )
@@ -1743,11 +1828,18 @@ def main(config=None, project="JAXUED_TEST"):
                 ts_cur = ts_cur.replace(cenie_gmm_params=new_gmm_params)
                 runner_state = (rng_cur, ts_cur)
 
-        # Delayed-start: initialize KL filtering + PCA when buffer first becomes full
-        if config.get("cmaes_delayed_start") and use_pca and not _delayed_start_initialized:
+        # Delayed-start / pca_start_after: initialize KL filtering + PCA
+        _pca_start_after = config.get("cmaes_pca_start_after", 0)
+        _use_delayed = config.get("cmaes_delayed_start") or _pca_start_after > 0
+        if _use_delayed and use_pca and not _delayed_start_initialized:
             rng_cur, ts_cur = runner_state
             buf_size = int(ts_cur.sampler["size"])
-            if buf_size >= config["level_buffer_capacity"]:
+            updates_so_far = (eval_step + 1) * config["eval_freq"]
+            if _pca_start_after > 0:
+                should_activate = updates_so_far >= _pca_start_after and buf_size >= config["cmaes_pca_dims"]
+            else:
+                should_activate = buf_size >= config["level_buffer_capacity"]
+            if should_activate:
                 print(f"[Delayed start] Buffer full ({buf_size} levels). Computing KL + PCA on buffer...")
 
                 # Encode buffer levels
@@ -2200,6 +2292,10 @@ if __name__=="__main__":
     group.add_argument("--cmaes_delayed_start", action=argparse.BooleanOptionalAction, default=False,
                        help="Start with standard ACCEL (random levels), switch to CMA-ES+PCA once buffer is full. "
                             "KL filtering and PCA are computed from buffer levels at that point.")
+    group.add_argument("--cmaes_pca_start_after", type=int, default=0,
+                       help="Number of updates before switching from free CMA-ES to PCA-guided CMA-ES. "
+                            "Before this point, CMA-ES searches the full KL-filtered space. "
+                            "At this point, PCA is fit on the buffer and CMA-ES switches to PCA space. (0 = disabled)")
     group.add_argument("--warmstart_checkpoint", type=str, default=None,
                        help="Path to Orbax checkpoint dir to warm-start agent params from (e.g. checkpoints/run/0/models)")
     group.add_argument("--warmstart_buffer", type=str, default=None,
