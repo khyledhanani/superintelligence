@@ -16,10 +16,9 @@ for SEED in 1 2 3; do
         --cmaes_pca_buffer_only \
         --cmaes_kl_data /tmp/train_1M_envs.npy \
         --cmaes_kl_samples 20000 \
-        --cmaes_pca_refit_interval 10 \
+        --cmaes_pca_refit_interval 40 \
         --warmstart_checkpoint /tmp/warmstart/models \
         --warmstart_buffer /tmp/warmstart/buffer_dump_10k.npz \
-        --warmstart_updates 10000 \
         --vae_checkpoint_path /tmp/vae_beta10/checkpoint_500000.pkl \
         --vae_config_path /tmp/vae_beta10/config.yaml \
         --gcs_bucket ucl-ued-project-bucket --gcs_prefix accel \
