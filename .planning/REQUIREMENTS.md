@@ -54,7 +54,7 @@ Requirements for initial release. Each maps to roadmap phases.
 - [x] **PCA-05**: Stage 2 decode function uses whitened PCA projection via `make_pc_decode_fn`; CMAESManager reinitialized with K_stage2 dims and `pca_sigma_init`
 - [x] **PCA-06**: JIT recompilation handled at Stage 1->2 transition via factory pattern (`jax.jit(train_and_eval_step)` called fresh after reassigning closures)
 - [x] **PCA-07**: CLI flags added to `maze_plr.py`: `--use_pca_search`, `--pca_components`, `--pca_dataset_size`, `--pca_dataset_path`, `--pca_stage2_step`, `--pca_stage1_k`, `--pca_sigma_init`
-- [ ] **PCA-08**: Smoke test passes: z=zeros(K) decodes to valid Level through both wrappers; 500-step CMA-ES run with `--use_pca_search` completes with exit 0, valid_structure_pct > 90%, no NaN
+- [x] **PCA-08**: Smoke test passes: z=zeros(K) decodes to valid Level through both wrappers; 500-step CMA-ES run with `--use_pca_search` completes with exit 0, valid_structure_pct > 90%, no NaN
 
 ## v2 Requirements
 
@@ -113,7 +113,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PCA-05 | Phase 5 | Complete |
 | PCA-06 | Phase 5 | Complete |
 | PCA-07 | Phase 5 | Complete |
-| PCA-08 | Phase 5 | Pending |
+| PCA-08 | Phase 5 | Complete |
 
 **Coverage:**
 - v1 requirements: 31 total
@@ -122,4 +122,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-03-11*
-*Last updated: 2026-03-12 — Phase 5 PCA-01..PCA-08 added for PCA-Space CMA-ES Search*
+*Last updated: 2026-03-13 — PCA-08 marked complete (smoke test passed: Stage 1 K=55, sigma=0.963, valid_structure_pct=100%)*
