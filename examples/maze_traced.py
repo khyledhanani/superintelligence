@@ -340,10 +340,16 @@ def evaluate_rnn(
 
 
 def setup_checkpointing(config: dict, train_state: TrainState) -> ocp.CheckpointManager:
-    overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config["seed"]))
+    plain_config = dict(config)
+    overall_save_dir = os.path.join(
+        os.getcwd(),
+        "checkpoints",
+        f"{plain_config['run_name']}",
+        str(plain_config["seed"]),
+    )
     os.makedirs(overall_save_dir, exist_ok=True)
     with open(os.path.join(overall_save_dir, "config.json"), "w") as f:
-        json.dump(config, f, indent=2)
+        json.dump(plain_config, f, indent=2)
 
     checkpoint_manager = ocp.CheckpointManager(
         os.path.join(overall_save_dir, "models"),
