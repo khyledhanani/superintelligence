@@ -46,6 +46,7 @@ from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_
 from jaxued.environments.underspecified_env import EnvParams, EnvState, Observation, UnderspecifiedEnv
 from jaxued.linen import ResetRNN
 from jaxued.environments import Maze
+from jaxued.utils import compute_max_returns, max_mc
 
 
 class ActorCritic(nn.Module):
@@ -76,30 +77,72 @@ class ActorCritic(nn.Module):
 
 
 def evaluate_rnn(rng, env, env_params, train_state, init_hstate, init_obs, init_env_state, max_episode_length):
-    """Run RNN agent on levels, return (states, rewards, episode_lengths)."""
+    """Run RNN agent on levels, return (states, rewards, episode_lengths, values, dones)."""
     num_levels = jax.tree_util.tree_flatten(init_obs)[0][0].shape[0]
 
     def step(carry, _):
         rng, hstate, obs, state, done, mask, episode_length = carry
         rng, rng_action, rng_step = jax.random.split(rng, 3)
         x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, done))
-        hstate, pi, _ = train_state.apply_fn(train_state.params, x, hstate)
+        hstate, pi, value = train_state.apply_fn(train_state.params, x, hstate)
         action = pi.sample(seed=rng_action).squeeze(0)
+        value = value.squeeze(0)
         obs, next_state, reward, done, _ = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
         )(jax.random.split(rng_step, num_levels), state, action, env_params)
         next_mask = mask & ~done
         episode_length += mask
-        return (rng, hstate, obs, next_state, done, next_mask, episode_length), (state, reward)
+        return (rng, hstate, obs, next_state, done, next_mask, episode_length), (state, reward, value, done)
 
-    (_, _, _, _, _, _, episode_lengths), (states, rewards) = jax.lax.scan(
+    (_, _, _, _, _, _, episode_lengths), (states, rewards, values, dones) = jax.lax.scan(
         step,
         (rng, init_hstate, init_obs, init_env_state,
          jnp.zeros(num_levels, dtype=bool), jnp.ones(num_levels, dtype=bool),
          jnp.zeros(num_levels, dtype=jnp.int32)),
         None, length=max_episode_length,
     )
-    return states, rewards, episode_lengths
+    return states, rewards, episode_lengths, values, dones
+
+
+def score_levels_maxmc(rng, env, env_params, train_state, levels, num_rollouts, rollout_batch_size=256):
+    """Score levels using MaxMC regret = mean(max_return - value) over episode.
+
+    Runs multiple rollouts and averages the MaxMC scores.
+    Processes levels in batches to avoid OOM.
+    """
+    n_levels = jax.tree_util.tree_flatten(levels)[0][0].shape[0]
+    max_steps = env_params.max_steps_in_episode
+
+    @jax.jit
+    def _score_batch(rng, batch_levels):
+        n_batch = jax.tree_util.tree_flatten(batch_levels)[0][0].shape[0]
+
+        def single_rollout(rng_roll):
+            rng_r, rng_e = jax.random.split(rng_roll)
+            init_obs, init_env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
+                jax.random.split(rng_r, n_batch), batch_levels, env_params)
+            _, rewards, _, values, dones = evaluate_rnn(
+                rng_e, env, env_params, train_state,
+                ActorCritic.initialize_carry((n_batch,)),
+                init_obs, init_env_state, max_steps)
+            max_returns = compute_max_returns(dones, rewards)
+            # max_mc returns per-level scores; incomplete_value=0 for levels with no complete episodes
+            return max_mc(dones, values, max_returns, incomplete_value=0.0)
+
+        rollout_rngs = jax.random.split(rng, num_rollouts)
+        scores = jax.vmap(single_rollout)(rollout_rngs)  # (num_rollouts, n_batch)
+        return scores.mean(axis=0)
+
+    all_scores = []
+    for i in range(0, n_levels, rollout_batch_size):
+        end = min(i + rollout_batch_size, n_levels)
+        batch = jax.tree_util.tree_map(lambda x: x[i:end], levels)
+        rng, rng_batch = jax.random.split(rng)
+        scores = _score_batch(rng_batch, batch)
+        all_scores.append(np.array(scores))
+        print(f"    Scored {end}/{n_levels} levels...")
+
+    return np.concatenate(all_scores, axis=0)
 
 
 def score_levels_sfl(rng, env, env_params, train_state, levels, num_rollouts, rollout_batch_size=256):
@@ -118,7 +161,7 @@ def score_levels_sfl(rng, env, env_params, train_state, levels, num_rollouts, ro
             rng_r, rng_e = jax.random.split(rng_roll)
             init_obs, init_env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
                 jax.random.split(rng_r, n_batch), batch_levels, env_params)
-            _, rewards, _ = evaluate_rnn(
+            _, rewards, _, _, _ = evaluate_rnn(
                 rng_e, env, env_params, train_state,
                 ActorCritic.initialize_carry((n_batch,)),
                 init_obs, init_env_state, max_steps)
@@ -155,8 +198,11 @@ def main():
     parser.add_argument("--agent_checkpoint_path", type=str, default=None,
                         help="Path to orbax agent checkpoint dir (e.g. /tmp/agent/40). "
                              "Required for scoring prior samples via rollouts.")
+    parser.add_argument("--score_function", type=str, default="maxmc",
+                        choices=["maxmc", "sfl"],
+                        help="Score function: maxmc (MaxMC regret) or sfl (learnability)")
     parser.add_argument("--num_rollouts", type=int, default=5,
-                        help="Number of rollouts per level for SFL scoring")
+                        help="Number of rollouts per level for scoring")
     parser.add_argument("--agent_view_size", type=int, default=5)
     parser.add_argument("--rollout_batch_size", type=int, default=256,
                         help="Batch size for agent rollouts (reduce if OOM)")
@@ -243,7 +289,9 @@ def main():
 
     # --- Score all levels with agent rollouts ---
     if args.agent_checkpoint_path is not None:
-        print(f"\n[3.5/5] Loading agent and scoring ALL levels ({args.num_rollouts} rollouts each)...")
+        score_fn_name = args.score_function.upper()
+        print(f"\n[3.5/5] Loading agent and scoring ALL levels with {score_fn_name} ({args.num_rollouts} rollouts each)...")
+        score_fn = score_levels_maxmc if args.score_function == "maxmc" else score_levels_sfl
 
         # Set up environment
         env = Maze(max_height=13, max_width=13, agent_view_size=args.agent_view_size, normalize_obs=True)
@@ -296,11 +344,11 @@ def main():
 
         rng, rng_score_buf = jax.random.split(rng)
         buf_scores_old = buf_scores.copy()
-        buf_scores = score_levels_sfl(
+        buf_scores = score_fn(
             rng_score_buf, env, env_params, agent_train_state, buf_levels,
             args.num_rollouts, args.rollout_batch_size,
         )
-        print(f"  Buffer SFL scores (re-evaluated): mean={buf_scores.mean():.4f}, std={buf_scores.std():.4f}, "
+        print(f"  Buffer {score_fn_name} scores (re-evaluated): mean={buf_scores.mean():.4f}, std={buf_scores.std():.4f}, "
               f"max={buf_scores.max():.4f}, nonzero={np.count_nonzero(buf_scores)}/{buf_size}")
         print(f"  (Original buffer scores were: mean={buf_scores_old.mean():.4f}, std={buf_scores_old.std():.4f})")
 
@@ -316,11 +364,11 @@ def main():
         prior_levels = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *prior_levels_list)
 
         rng, rng_score = jax.random.split(rng)
-        prior_scores = score_levels_sfl(
+        prior_scores = score_fn(
             rng_score, env, env_params, agent_train_state, prior_levels,
             args.num_rollouts, args.rollout_batch_size,
         )
-        print(f"  Prior SFL scores: mean={prior_scores.mean():.4f}, std={prior_scores.std():.4f}, "
+        print(f"  Prior {score_fn_name} scores: mean={prior_scores.mean():.4f}, std={prior_scores.std():.4f}, "
               f"max={prior_scores.max():.4f}, nonzero={np.count_nonzero(prior_scores)}/{n_prior}")
     else:
         prior_scores = np.zeros(n_prior, dtype=np.float32)

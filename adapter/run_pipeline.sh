@@ -11,7 +11,8 @@ KL_THRESHOLD="${KL_THRESHOLD:-0.1}"
 PRIOR_MULT="${PRIOR_MULT:-3}"        # sample 3x buffer_size from prior N(0,I)
 TEST_SPLIT="${TEST_SPLIT:-0.2}"      # 20% held out for test
 AGENT_CKPT="${AGENT_CKPT:-}"          # orbax checkpoint dir (e.g. /tmp/agent_checkpoint/40)
-NUM_ROLLOUTS="${NUM_ROLLOUTS:-5}"     # rollouts per level for SFL scoring
+SCORE_FUNCTION="${SCORE_FUNCTION:-maxmc}" # scoring: maxmc (regret) or sfl (learnability)
+NUM_ROLLOUTS="${NUM_ROLLOUTS:-5}"     # rollouts per level for scoring
 ROLLOUT_BATCH="${ROLLOUT_BATCH:-256}" # batch size for rollouts
 EPOCHS="${EPOCHS:-300}"
 PROJECT="${PROJECT:-ADAPTER_TRAINING}"
@@ -23,8 +24,8 @@ echo "Step 1: Prepare data (buffer + ${PRIOR_MULT}x prior + KL eviction + train/
 echo "=========================================="
 AGENT_ARGS=""
 if [ -n "${AGENT_CKPT}" ]; then
-    AGENT_ARGS="--agent_checkpoint_path ${AGENT_CKPT} --num_rollouts ${NUM_ROLLOUTS} --rollout_batch_size ${ROLLOUT_BATCH}"
-    echo "  Agent checkpoint: ${AGENT_CKPT} (${NUM_ROLLOUTS} rollouts/level)"
+    AGENT_ARGS="--agent_checkpoint_path ${AGENT_CKPT} --num_rollouts ${NUM_ROLLOUTS} --rollout_batch_size ${ROLLOUT_BATCH} --score_function ${SCORE_FUNCTION}"
+    echo "  Agent checkpoint: ${AGENT_CKPT} (${NUM_ROLLOUTS} rollouts/level, score=${SCORE_FUNCTION})"
 else
     echo "  WARNING: No AGENT_CKPT set — prior samples will get score=0"
 fi
