@@ -42,7 +42,6 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--val_split", type=float, default=0.2)
-    parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--project", type=str, default="ADAPTER_TRAINING")
     parser.add_argument("--run_name", type=str, default=None)
@@ -120,7 +119,6 @@ def main():
     best_val_r2 = -float("inf")
     best_params = None
     best_epoch = 0
-    epochs_without_improvement = 0
     t0 = time.time()
 
     print(f"\nTraining predictor (hidden={args.hidden_dim}, layers={args.n_layers}, "
@@ -158,13 +156,6 @@ def main():
             best_val_r2 = val_r2
             best_params = jax.tree_util.tree_map(lambda x: np.array(x), state.params)
             best_epoch = epoch
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= args.patience:
-                print(f"  Early stopping at epoch {epoch+1} "
-                      f"(no val R² improvement for {args.patience} epochs)")
-                break
 
         if (epoch + 1) % 25 == 0 or epoch == 0:
             elapsed = time.time() - t0
