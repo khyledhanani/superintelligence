@@ -46,6 +46,7 @@ from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_
 from jaxued.environments.underspecified_env import EnvParams, EnvState, Observation, UnderspecifiedEnv
 from jaxued.linen import ResetRNN
 from jaxued.environments import Maze
+from jaxued.wrappers import AutoReplayWrapper
 from jaxued.utils import compute_max_returns, max_mc
 
 
@@ -293,8 +294,8 @@ def main():
         print(f"\n[3.5/5] Loading agent and scoring ALL levels with {score_fn_name} ({args.num_rollouts} rollouts each)...")
         score_fn = score_levels_maxmc if args.score_function == "maxmc" else score_levels_sfl
 
-        # Set up environment
-        env = Maze(max_height=13, max_width=13, agent_view_size=args.agent_view_size, normalize_obs=True)
+        # Set up environment (AutoReplayWrapper resets env on done, matching training setup)
+        env = AutoReplayWrapper(Maze(max_height=13, max_width=13, agent_view_size=args.agent_view_size, normalize_obs=True))
         env_params = env.default_params
 
         # Load agent checkpoint (orbax)

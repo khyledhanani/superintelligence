@@ -16,6 +16,8 @@ NUM_ROLLOUTS="${NUM_ROLLOUTS:-5}"     # rollouts per level for scoring
 ROLLOUT_BATCH="${ROLLOUT_BATCH:-256}" # batch size for rollouts
 EPOCHS="${EPOCHS:-300}"
 PROJECT="${PROJECT:-ADAPTER_TRAINING}"
+GCS_BUCKET="${GCS_BUCKET:-gs://ucl-ued-project-bucket}"
+GCS_PREFIX="${GCS_PREFIX:-adapter_results}"    # upload to GCS_BUCKET/GCS_PREFIX/run_name/
 
 mkdir -p "${OUT_DIR}"
 
@@ -68,10 +70,21 @@ python3 adapter/diagnostics.py \
 
 echo ""
 echo "=========================================="
+echo "Step 4: Upload results to GCS"
+echo "=========================================="
+RUN_NAME="joint_beta10_kl${KL_THRESHOLD}_prior${PRIOR_MULT}x_${SCORE_FUNCTION}"
+GCS_DEST="${GCS_BUCKET}/${GCS_PREFIX}/${RUN_NAME}/"
+echo "  Uploading ${OUT_DIR} → ${GCS_DEST}"
+gcloud storage cp -r "${OUT_DIR}/" "${GCS_DEST}"
+echo "  Upload complete: ${GCS_DEST}"
+
+echo ""
+echo "=========================================="
 echo "Pipeline complete!"
 echo "  Train data:  ${OUT_DIR}/train_data.npz"
 echo "  Test data:   ${OUT_DIR}/train_data_test.npz"
 echo "  Predictor:   ${OUT_DIR}/predictor.pkl"
 echo "  Adapter:     ${OUT_DIR}/adapter.pkl"
 echo "  Diagnostics: ${OUT_DIR}/diagnostics/"
+echo "  GCS:         ${GCS_DEST}"
 echo "=========================================="
