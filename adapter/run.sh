@@ -28,8 +28,9 @@ N_LAYERS=2
 WEIGHT_DECAY=1e-3
 
 # -- Loss weights --
+LAMBDA_RECON=0.01     # reconstruction (default 1.0; lower to let adapter move z)
 LAMBDA_PRED=1.0       # predictor MSE (z -> score)
-LAMBDA_REGRET=1.0     # regret-maximising direction for adapter (now functional!)
+LAMBDA_REGRET=1.0     # regret-maximising direction for adapter
 LAMBDA_REG=0.01       # ||delta_z||^2 regularisation
 LAMBDA_KL=0.0         # KL penalty on adapted z
 
@@ -97,7 +98,7 @@ if [ "${RUN_STEP2}" = "1" ]; then
         --vae_config_path "${VAE_CFG}" \
         --output_dir "${OUT_DIR}" \
         --hidden_dim ${HIDDEN_DIM} --n_layers ${N_LAYERS} \
-        --lambda_regret ${LAMBDA_REGRET} --lambda_reg ${LAMBDA_REG} --lambda_pred ${LAMBDA_PRED} --lambda_kl ${LAMBDA_KL} \
+        --lambda_recon ${LAMBDA_RECON} --lambda_regret ${LAMBDA_REGRET} --lambda_reg ${LAMBDA_REG} --lambda_pred ${LAMBDA_PRED} --lambda_kl ${LAMBDA_KL} \
         --epochs ${EPOCHS} --lr ${LR} --batch_size ${BATCH_SIZE} --weight_decay ${WEIGHT_DECAY} \
         --project "${PROJECT}" \
         --run_name "${RUN_NAME}"

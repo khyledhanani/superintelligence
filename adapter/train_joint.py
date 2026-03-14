@@ -69,6 +69,8 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--n_layers", type=int, default=2)
+    parser.add_argument("--lambda_recon", type=float, default=1.0,
+                        help="Weight for reconstruction loss (default 1.0, lower to let adapter move)")
     parser.add_argument("--lambda_regret", type=float, default=0.1)
     parser.add_argument("--lambda_reg", type=float, default=0.01)
     parser.add_argument("--lambda_kl", type=float, default=0.0)
@@ -175,6 +177,7 @@ def main():
         return jax.vmap(lambda z: vae.apply({"params": vae_params}, z, method=vae.decode))(z_prime)
 
     # --- Joint loss ---
+    lambda_recon = args.lambda_recon
     lambda_regret = args.lambda_regret
     lambda_reg = args.lambda_reg
     lambda_kl = args.lambda_kl
@@ -209,7 +212,7 @@ def main():
         l_reg = jnp.mean(delta_z ** 2)
 
         # Total
-        total = l_recon + lambda_regret * l_regret + lambda_reg * l_reg + lambda_pred * l_pred
+        total = lambda_recon * l_recon + lambda_regret * l_regret + lambda_reg * l_reg + lambda_pred * l_pred
 
         # Optional KL on z'
         l_kl = jnp.float32(0.0)
@@ -258,8 +261,8 @@ def main():
     epochs_without_improvement = 0
     t0 = time.time()
 
-    print(f"\nJoint training (lambda_pred={lambda_pred}, lambda_regret={lambda_regret}, "
-          f"lambda_reg={lambda_reg}, lambda_kl={lambda_kl})...")
+    print(f"\nJoint training (lambda_recon={lambda_recon}, lambda_pred={lambda_pred}, "
+          f"lambda_regret={lambda_regret}, lambda_reg={lambda_reg}, lambda_kl={lambda_kl})...")
 
     for epoch in range(args.epochs):
         rng, rng_perm = jax.random.split(rng)
