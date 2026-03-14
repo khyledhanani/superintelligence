@@ -57,15 +57,8 @@ def load_vae_decoder(vae_checkpoint_path, vae_config_path):
 
 
 def compute_training_weights(regret_scores):
-    """Upweight frontier levels (intermediate regret)."""
-    median_regret = np.median(regret_scores)
-    regret_distance = np.abs(regret_scores - median_regret)
-    temperature = np.std(regret_scores)
-    if temperature < 1e-8:
-        return np.ones_like(regret_scores)
-    weights = np.exp(-regret_distance / temperature)
-    weights = weights / weights.mean()
-    return weights
+    """Uniform weights — let all levels contribute equally."""
+    return np.ones_like(regret_scores)
 
 
 def main():
