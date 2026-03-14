@@ -36,6 +36,10 @@ from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_
 from cmaes_manager import CMAESManager
 from cenie_scorer import CENIEScorer
 
+# Adapter imports (conditional on --adapter_path flag)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'adapter'))
+from adapter_model import AdapterMLP
+
 class UpdateState(IntEnum):
     DR = 0
     REPLAY = 1
@@ -608,6 +612,33 @@ def main(config=None, project="JAXUED_TEST"):
         # Build pure encode function: tokens (batch, seq_len) -> (mean, logvar)
         def vae_encode_fn(tokens):
             return vae.apply({"params": vae_params}, tokens, train=False, method=vae.encode)
+
+        # --- Adapter: z' = z + adapter(z) before decoding ---
+        if config.get("adapter_path"):
+            print(f"[Adapter] Loading from {config['adapter_path']}...")
+            with open(config["adapter_path"], "rb") as f:
+                adapter_ckpt = pickle.load(f)
+            adapter_cfg = adapter_ckpt["config"]
+            adapter_model = AdapterMLP(
+                latent_dim=adapter_cfg["latent_dim"],
+                hidden_dim=adapter_cfg["hidden_dim"],
+                n_layers=adapter_cfg["n_layers"],
+            )
+            adapter_params = adapter_ckpt["params"]
+            _raw_decode_fn = vae_decode_fn
+
+            def vae_decode_fn(z):
+                """Apply adapter correction before decoding: z' = z + adapter(z)."""
+                delta_z = adapter_model.apply({"params": adapter_params}, z)
+                z_prime = z + delta_z
+                return _raw_decode_fn(z_prime)
+
+            print(f"[Adapter] latent_dim={adapter_cfg['latent_dim']}, "
+                  f"hidden_dim={adapter_cfg['hidden_dim']}, n_layers={adapter_cfg['n_layers']}")
+            if "metrics" in adapter_ckpt:
+                m = adapter_ckpt["metrics"]
+                print(f"[Adapter] Training metrics: val_loss={m.get('val_loss', '?'):.4f}, "
+                      f"||delta_z||={m.get('delta_z_norm', '?'):.3f}")
 
     if config.get("use_dred"):
         print(f"[DRED] VAE loaded from {config['vae_checkpoint_path']}")
@@ -1806,7 +1837,7 @@ def main(config=None, project="JAXUED_TEST"):
             "update_num": update_num,
         }
 
-        dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+        dump_dir = os.path.join(os.environ.get("BUFFER_DUMP_DIR", "/tmp/buffer_dumps"), f"{config['run_name']}", str(config["seed"]))
         os.makedirs(dump_dir, exist_ok=True)
         tag = f"_{update_num}k" if update_num > 0 else "_final"
         tokens_path = os.path.join(dump_dir, f"buffer_tokens{tag}.npy")
@@ -2047,7 +2078,7 @@ def main(config=None, project="JAXUED_TEST"):
     print(f"  Unsolved (0%): {(solve_rates == 0).sum()} | Fully solved (100%): {(solve_rates == 1.0).sum()}")
 
     # Save evaluation results
-    dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+    dump_dir = os.path.join(os.environ.get("BUFFER_DUMP_DIR", "/tmp/buffer_dumps"), f"{config['run_name']}", str(config["seed"]))
     os.makedirs(dump_dir, exist_ok=True)
     gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
     eval_path = os.path.join(dump_dir, "buffer_eval.npz")
@@ -2131,7 +2162,7 @@ def main(config=None, project="JAXUED_TEST"):
                 return mean
 
             # Collect all periodic buffer dumps + final
-            dump_dir_pca = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+            dump_dir_pca = os.path.join(os.environ.get("BUFFER_DUMP_DIR", "/tmp/buffer_dumps"), f"{config['run_name']}", str(config["seed"]))
             snapshot_labels = []
             snapshot_latents = []
             snapshot_scores = []
@@ -2329,6 +2360,9 @@ if __name__=="__main__":
                        help="Offset for update counter so wandb logs continue from this step")
     group.add_argument("--save_cmaes_populations", action=argparse.BooleanOptionalAction, default=True,
                        help="Save CMA-ES population archive before each reset for latent visualization")
+    # === ADAPTER CONFIG ===
+    group.add_argument("--adapter_path", type=str, default=None,
+                       help="Path to trained adapter .pkl checkpoint. Applies z' = z + adapter(z) before decoding.")
     # === GCS CONFIG ===
     group.add_argument("--gcs_bucket", type=str, default=None,
                        help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
