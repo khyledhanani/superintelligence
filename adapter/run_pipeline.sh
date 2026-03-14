@@ -1,17 +1,17 @@
 #!/bin/bash
 set -e
-export WANDB_DIR=/cs/student/project_msc/2025/csml/rhautier/tmp/wandb_logs
+export WANDB_DIR=${WANDB_DIR:-/cs/student/project_msc/2025/csml/rhautier/tmp/wandb_logs}
 
-# === CONFIG ===
-VAE_CKPT="/tmp/vae_beta10/checkpoint_500000.pkl"
-VAE_CFG="/tmp/vae_beta10/config.yaml"
-BUFFER="/cs/student/project_msc/2025/csml/rhautier/tmp/buffer_dumps/cmaes_pca30_start6k_refit1halfk_kl_s/1/buffer_dump_10k.npz"
-OUT_DIR="/cs/student/project_msc/2025/csml/rhautier/tmp/adapter_data"
-KL_THRESHOLD=0.1
-PRIOR_MULT=3       # sample 3x buffer_size from prior N(0,I)
-TEST_SPLIT=0.2      # 20% held out for test
-EPOCHS=300
-PROJECT="ADAPTER_TRAINING"
+# === CONFIG (all overridable via env vars) ===
+VAE_CKPT="${VAE_CKPT:-/tmp/vae_beta10/checkpoint_500000.pkl}"
+VAE_CFG="${VAE_CFG:-/tmp/vae_beta10/config.yaml}"
+BUFFER="${BUFFER:-/cs/student/project_msc/2025/csml/rhautier/tmp/buffer_dumps/cmaes_pca30_start6k_refit1halfk_kl_s/1/buffer_dump_10k.npz}"
+OUT_DIR="${OUT_DIR:-/cs/student/project_msc/2025/csml/rhautier/tmp/adapter_data}"
+KL_THRESHOLD="${KL_THRESHOLD:-0.1}"
+PRIOR_MULT="${PRIOR_MULT:-3}"        # sample 3x buffer_size from prior N(0,I)
+TEST_SPLIT="${TEST_SPLIT:-0.2}"      # 20% held out for test
+EPOCHS="${EPOCHS:-300}"
+PROJECT="${PROJECT:-ADAPTER_TRAINING}"
 
 mkdir -p "${OUT_DIR}"
 
