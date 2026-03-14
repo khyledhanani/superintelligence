@@ -205,9 +205,12 @@ def main():
         ce_per_sample = -jnp.sum(token_one_hot * jax.nn.log_softmax(logits, axis=-1), axis=(-1, -2))
         l_recon = jnp.mean(ce_per_sample * weights_batch)
 
-        # Regret coherence: predictor on original z should match actual regret
-        # (this term is the same as l_pred but weighted differently in the total)
-        l_regret = l_pred  # reuse — same computation
+        # Regret maximisation: adapter should move z to where predictor predicts higher regret
+        # Stop gradient on predictor params so predictor doesn't learn to inflate predictions
+        pred_regret_adapted = predictor.apply(
+            {"params": jax.lax.stop_gradient(pred_params)}, z_prime
+        )
+        l_regret = -jnp.mean(weights_batch * pred_regret_adapted)  # negative to maximise
 
         # Regularisation: keep corrections small
         l_reg = jnp.mean(delta_z ** 2)

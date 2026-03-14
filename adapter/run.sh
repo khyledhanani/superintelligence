@@ -29,14 +29,14 @@ WEIGHT_DECAY=1e-5
 
 # -- Loss weights --
 LAMBDA_PRED=1.0       # predictor MSE (z -> score)
-LAMBDA_REGRET=5.0     # regret-maximising direction for adapter
-LAMBDA_REG=0.1        # ||delta_z||^2 regularisation
+LAMBDA_REGRET=1.0     # regret-maximising direction for adapter (now functional!)
+LAMBDA_REG=0.01       # ||delta_z||^2 regularisation
 LAMBDA_KL=0.0         # KL penalty on adapted z
 
 # -- Logging --
 export WANDB_DIR="${WANDB_DIR:-/tmp/wandb_logs}"
 PROJECT="ADAPTER_TRAINING"
-RUN_NAME="maxmc_lr${LAMBDA_REGRET}_reg${LAMBDA_REG}"
+RUN_NAME="maxmc_regretfix_lr${LAMBDA_REGRET}_reg${LAMBDA_REG}"
 
 # -- GCS upload --
 GCS_BUCKET="gs://ucl-ued-project-bucket"
