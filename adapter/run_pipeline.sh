@@ -10,6 +10,9 @@ OUT_DIR="${OUT_DIR:-/cs/student/project_msc/2025/csml/rhautier/tmp/adapter_data}
 KL_THRESHOLD="${KL_THRESHOLD:-0.1}"
 PRIOR_MULT="${PRIOR_MULT:-3}"        # sample 3x buffer_size from prior N(0,I)
 TEST_SPLIT="${TEST_SPLIT:-0.2}"      # 20% held out for test
+AGENT_CKPT="${AGENT_CKPT:-}"          # orbax checkpoint dir (e.g. /tmp/agent_checkpoint/40)
+NUM_ROLLOUTS="${NUM_ROLLOUTS:-5}"     # rollouts per level for SFL scoring
+ROLLOUT_BATCH="${ROLLOUT_BATCH:-256}" # batch size for rollouts
 EPOCHS="${EPOCHS:-300}"
 PROJECT="${PROJECT:-ADAPTER_TRAINING}"
 
@@ -18,6 +21,13 @@ mkdir -p "${OUT_DIR}"
 echo "=========================================="
 echo "Step 1: Prepare data (buffer + ${PRIOR_MULT}x prior + KL eviction + train/test split)"
 echo "=========================================="
+AGENT_ARGS=""
+if [ -n "${AGENT_CKPT}" ]; then
+    AGENT_ARGS="--agent_checkpoint_path ${AGENT_CKPT} --num_rollouts ${NUM_ROLLOUTS} --rollout_batch_size ${ROLLOUT_BATCH}"
+    echo "  Agent checkpoint: ${AGENT_CKPT} (${NUM_ROLLOUTS} rollouts/level)"
+else
+    echo "  WARNING: No AGENT_CKPT set — prior samples will get score=0"
+fi
 python3 adapter/prepare_data_from_buffer.py \
     --buffer_path "${BUFFER}" \
     --vae_checkpoint_path "${VAE_CKPT}" \
@@ -25,7 +35,8 @@ python3 adapter/prepare_data_from_buffer.py \
     --kl_threshold ${KL_THRESHOLD} \
     --prior_multiplier ${PRIOR_MULT} \
     --test_split ${TEST_SPLIT} \
-    --output_path "${OUT_DIR}/train_data.npz"
+    --output_path "${OUT_DIR}/train_data.npz" \
+    ${AGENT_ARGS}
 
 echo ""
 echo "=========================================="
