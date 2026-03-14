@@ -382,7 +382,7 @@ def main():
             "lambda_kl": args.lambda_kl,
         },
         "metrics": {
-            "val_loss": best_val_loss,
+            "val_r2": best_val_r2,
             "val_recon": float(final_metrics["l_recon"]),
             "val_regret": float(final_metrics["l_regret"]),
             "val_reg": float(final_metrics["l_reg"]),
