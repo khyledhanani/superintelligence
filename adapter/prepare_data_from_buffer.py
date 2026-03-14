@@ -280,6 +280,7 @@ def main():
         restored = handler.restore(ckpt_path, args=ocp.args.PyTreeRestore(
             item={"params": network_params},
             restore_args={"params": param_restore_args},
+            partial_restore=True,
         ))
         agent_train_state = agent_train_state.replace(params=restored["params"])
 
