@@ -240,9 +240,9 @@ def main():
         prior_tokens.append(np.array(tok))
     prior_tokens = np.concatenate(prior_tokens, axis=0)
 
-    # --- Score prior samples ---
+    # --- Score all levels with agent rollouts ---
     if args.agent_checkpoint_path is not None:
-        print(f"  Scoring prior samples with agent rollouts ({args.num_rollouts} rollouts each)...")
+        print(f"\n[3.5/5] Loading agent and scoring ALL levels ({args.num_rollouts} rollouts each)...")
 
         # Set up environment
         env = Maze(max_height=13, max_width=13, agent_view_size=args.agent_view_size, normalize_obs=True)
@@ -250,7 +250,6 @@ def main():
 
         # Load agent checkpoint (orbax)
         network = ActorCritic(action_dim=env.action_space(env_params).n)
-        # Init network to get param structure
         rng, rng_init = jax.random.split(rng)
         init_obs_dummy, _ = env.reset_to_level(
             jax.random.PRNGKey(0),
@@ -260,22 +259,51 @@ def main():
         init_x = jax.tree_util.tree_map(lambda x: x[None, None, ...], (init_obs_dummy, jnp.zeros((), dtype=bool)))
         network_params = network.init(rng_init, init_x, ActorCritic.initialize_carry((1,)))
 
-        # Create a minimal train state for evaluate_rnn
-        tx = optax.sgd(1e-3)  # dummy optimizer, not used
+        tx = optax.sgd(1e-3)  # dummy optimizer, not used for inference
         agent_train_state = BaseTrainState.create(
             apply_fn=network.apply, params=network_params, tx=tx,
         )
 
-        # Restore checkpoint params
+        # Restore checkpoint params (cross-device safe: GPU checkpoint → TPU/CPU)
         print(f"  Loading agent from {args.agent_checkpoint_path}...")
-        ckpt_mgr = ocp.CheckpointManager(os.path.dirname(args.agent_checkpoint_path))
+        ckpt_dir = os.path.dirname(args.agent_checkpoint_path)
         step = int(os.path.basename(args.agent_checkpoint_path))
-        restored = ckpt_mgr.restore(step)
-        agent_params = restored["params"] if isinstance(restored, dict) and "params" in restored else restored.params
-        agent_train_state = agent_train_state.replace(params=agent_params)
+        ckpt_path = os.path.join(ckpt_dir, str(step), "default")
 
-        # Decode prior z to levels (not tokens — we need Level dataclass for rollouts)
-        print(f"  Decoding {n_prior} prior samples to levels for rollout...")
+        # Use PyTreeCheckpointHandler to restore only "params" subtree as numpy
+        handler = ocp.PyTreeCheckpointHandler()
+        param_restore_args = jax.tree_util.tree_map(
+            lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray),
+            network_params,
+        )
+        restored = handler.restore(ckpt_path, args=ocp.args.PyTreeRestore(
+            item={"params": network_params},
+            restore_args={"params": param_restore_args},
+        ))
+        agent_train_state = agent_train_state.replace(params=restored["params"])
+
+        # --- Re-score buffer levels ---
+        print(f"  Re-scoring {buf_size} buffer levels with consistent agent...")
+        # Convert buffer tokens directly to Level dataclass (no re-decode needed)
+        buf_levels_list = []
+        for i in range(0, buf_size, args.batch_size):
+            end = min(i + args.batch_size, buf_size)
+            lvls = jax.vmap(tokens_to_level)(buf_tokens[i:end])
+            buf_levels_list.append(lvls)
+        buf_levels = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *buf_levels_list)
+
+        rng, rng_score_buf = jax.random.split(rng)
+        buf_scores_old = buf_scores.copy()
+        buf_scores = score_levels_sfl(
+            rng_score_buf, env, env_params, agent_train_state, buf_levels,
+            args.num_rollouts, args.rollout_batch_size,
+        )
+        print(f"  Buffer SFL scores (re-evaluated): mean={buf_scores.mean():.4f}, std={buf_scores.std():.4f}, "
+              f"max={buf_scores.max():.4f}, nonzero={np.count_nonzero(buf_scores)}/{buf_size}")
+        print(f"  (Original buffer scores were: mean={buf_scores_old.mean():.4f}, std={buf_scores_old.std():.4f})")
+
+        # --- Score prior levels ---
+        print(f"  Decoding and scoring {n_prior} prior samples...")
         rng, rng_decode = jax.random.split(rng)
         prior_levels_list = []
         for i in range(0, n_prior, args.batch_size):
@@ -283,10 +311,8 @@ def main():
             rng_decode, rng_dec_batch = jax.random.split(rng_decode)
             lvls = decode_latent_to_levels(decode_fn, jnp.array(prior_z[i:end]), rng_dec_batch)
             prior_levels_list.append(lvls)
-        # Stack all level batches
         prior_levels = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *prior_levels_list)
 
-        # Score with SFL
         rng, rng_score = jax.random.split(rng)
         prior_scores = score_levels_sfl(
             rng_score, env, env_params, agent_train_state, prior_levels,
@@ -296,7 +322,7 @@ def main():
               f"max={prior_scores.max():.4f}, nonzero={np.count_nonzero(prior_scores)}/{n_prior}")
     else:
         prior_scores = np.zeros(n_prior, dtype=np.float32)
-        print(f"  Prior samples: {n_prior} levels with score=0 (no agent provided)")
+        print(f"  WARNING: No agent — using original buffer scores and score=0 for prior samples")
 
     # Encode prior tokens back through VAE to get consistent z
     # (the prior_z we sampled won't perfectly match decode→encode round-trip)
