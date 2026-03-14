@@ -258,9 +258,11 @@ def main():
         return metrics
 
     # --- Training loop ---
-    best_val_loss = float("inf")
+    best_val_r2 = -float("inf")
     best_params = None
     best_epoch = 0
+    patience = 50  # early stopping patience on val R²
+    epochs_without_improvement = 0
     t0 = time.time()
 
     print(f"\nJoint training (lambda_pred={lambda_pred}, lambda_regret={lambda_regret}, "
@@ -301,13 +303,20 @@ def main():
             "val/pred_r2": float(val_metrics["pred_r2"]),
             "val/delta_z_norm": float(val_metrics["delta_z_norm"]),
             "val/delta_z_max": float(val_metrics["delta_z_max"]),
-            "val/best_loss": min(best_val_loss, val_loss),
+            "val/best_r2": max(best_val_r2, float(val_metrics["pred_r2"])),
         })
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        val_r2 = float(val_metrics["pred_r2"])
+        if val_r2 > best_val_r2:
+            best_val_r2 = val_r2
             best_params = jax.tree_util.tree_map(lambda x: np.array(x), state.params)
             best_epoch = epoch
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(f"  Early stopping at epoch {epoch+1} (no val R² improvement for {patience} epochs)")
+                break
 
         if (epoch + 1) % 25 == 0 or epoch == 0:
             elapsed = time.time() - t0
@@ -319,10 +328,10 @@ def main():
                   f"best={best_epoch+1} ({elapsed:.1f}s)")
 
     # --- Final metrics ---
-    print(f"\nBest model at epoch {best_epoch+1}, val_loss={best_val_loss:.6f}")
+    print(f"\nBest model at epoch {best_epoch+1}, val_R²={best_val_r2:.4f}")
     final_metrics = eval_metrics(best_params, z_val, tokens_val, regret_val, weights_val)
 
-    wandb.run.summary["best_val_loss"] = best_val_loss
+    wandb.run.summary["best_val_r2"] = best_val_r2
     wandb.run.summary["best_epoch"] = best_epoch + 1
     wandb.run.summary["final_pred_r2"] = float(final_metrics["pred_r2"])
     wandb.run.summary["final_delta_z_norm"] = float(final_metrics["delta_z_norm"])

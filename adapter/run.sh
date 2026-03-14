@@ -25,7 +25,7 @@ LR=1e-4
 BATCH_SIZE=256
 HIDDEN_DIM=128
 N_LAYERS=2
-WEIGHT_DECAY=1e-5
+WEIGHT_DECAY=1e-3
 
 # -- Loss weights --
 LAMBDA_PRED=1.0       # predictor MSE (z -> score)
@@ -43,7 +43,7 @@ GCS_BUCKET="gs://ucl-ued-project-bucket"
 GCS_PREFIX="adapter_results"
 
 # -- Steps to run (comment out to skip) --
-RUN_STEP1=1   # data preparation
+#RUN_STEP1=1   # data preparation
 RUN_STEP2=1   # training
 RUN_STEP3=1   # diagnostics
 RUN_STEP4=1   # GCS upload
