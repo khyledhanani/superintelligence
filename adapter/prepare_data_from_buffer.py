@@ -274,19 +274,24 @@ def main():
 
     # --- Sample from prior ---
     n_prior = args.prior_multiplier * buf_size
-    print(f"[3/5] Sampling {n_prior} latent vectors from prior N(0,I)...")
-    rng, rng_sample = jax.random.split(rng)
-    prior_z = np.array(jax.random.normal(rng_sample, (n_prior, latent_dim)))
+    if n_prior > 0:
+        print(f"[3/5] Sampling {n_prior} latent vectors from prior N(0,I)...")
+        rng, rng_sample = jax.random.split(rng)
+        prior_z = np.array(jax.random.normal(rng_sample, (n_prior, latent_dim)))
 
-    # Decode prior samples to get tokens (for reconstruction target)
-    print(f"  Decoding prior samples to tokens...")
-    prior_tokens = []
-    for i in range(0, n_prior, args.batch_size):
-        end = min(i + args.batch_size, n_prior)
-        rng, rng_dec = jax.random.split(rng)
-        tok = decode_to_tokens(jnp.array(prior_z[i:end]), rng_dec)
-        prior_tokens.append(np.array(tok))
-    prior_tokens = np.concatenate(prior_tokens, axis=0)
+        # Decode prior samples to get tokens (for reconstruction target)
+        print(f"  Decoding prior samples to tokens...")
+        prior_tokens = []
+        for i in range(0, n_prior, args.batch_size):
+            end = min(i + args.batch_size, n_prior)
+            rng, rng_dec = jax.random.split(rng)
+            tok = decode_to_tokens(jnp.array(prior_z[i:end]), rng_dec)
+            prior_tokens.append(np.array(tok))
+        prior_tokens = np.concatenate(prior_tokens, axis=0)
+    else:
+        print(f"[3/5] Skipping prior sampling (prior_multiplier=0)")
+        prior_z = np.zeros((0, latent_dim))
+        prior_tokens = np.zeros((0, buf_tokens.shape[1] if hasattr(buf_tokens, 'shape') else 52), dtype=np.int32)
 
     # --- Score all levels with agent rollouts ---
     if args.agent_checkpoint_path is not None:
@@ -354,39 +359,45 @@ def main():
         print(f"  (Original buffer scores were: mean={buf_scores_old.mean():.4f}, std={buf_scores_old.std():.4f})")
 
         # --- Score prior levels ---
-        print(f"  Decoding and scoring {n_prior} prior samples...")
-        rng, rng_decode = jax.random.split(rng)
-        prior_levels_list = []
-        for i in range(0, n_prior, args.batch_size):
-            end = min(i + args.batch_size, n_prior)
-            rng_decode, rng_dec_batch = jax.random.split(rng_decode)
-            lvls = decode_latent_to_levels(decode_fn, jnp.array(prior_z[i:end]), rng_dec_batch)
-            prior_levels_list.append(lvls)
-        prior_levels = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *prior_levels_list)
+        if n_prior > 0:
+            print(f"  Decoding and scoring {n_prior} prior samples...")
+            rng, rng_decode = jax.random.split(rng)
+            prior_levels_list = []
+            for i in range(0, n_prior, args.batch_size):
+                end = min(i + args.batch_size, n_prior)
+                rng_decode, rng_dec_batch = jax.random.split(rng_decode)
+                lvls = decode_latent_to_levels(decode_fn, jnp.array(prior_z[i:end]), rng_dec_batch)
+                prior_levels_list.append(lvls)
+            prior_levels = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *prior_levels_list)
 
-        rng, rng_score = jax.random.split(rng)
-        prior_scores = score_fn(
-            rng_score, env, env_params, agent_train_state, prior_levels,
-            args.num_rollouts, args.rollout_batch_size,
-        )
-        print(f"  Prior {score_fn_name} scores: mean={prior_scores.mean():.4f}, std={prior_scores.std():.4f}, "
-              f"max={prior_scores.max():.4f}, nonzero={np.count_nonzero(prior_scores)}/{n_prior}")
+            rng, rng_score = jax.random.split(rng)
+            prior_scores = score_fn(
+                rng_score, env, env_params, agent_train_state, prior_levels,
+                args.num_rollouts, args.rollout_batch_size,
+            )
+            print(f"  Prior {score_fn_name} scores: mean={prior_scores.mean():.4f}, std={prior_scores.std():.4f}, "
+                  f"max={prior_scores.max():.4f}, nonzero={np.count_nonzero(prior_scores)}/{n_prior}")
+        else:
+            prior_scores = np.zeros(0, dtype=np.float32)
     else:
         prior_scores = np.zeros(n_prior, dtype=np.float32)
         print(f"  WARNING: No agent — using original buffer scores and score=0 for prior samples")
 
     # Encode prior tokens back through VAE to get consistent z
-    # (the prior_z we sampled won't perfectly match decode→encode round-trip)
-    print(f"  Re-encoding prior tokens for consistent z...")
-    prior_z_enc = []
-    prior_logvar_enc = []
-    for i in range(0, n_prior, args.batch_size):
-        end = min(i + args.batch_size, n_prior)
-        means, logvars = encode_batch(jnp.array(prior_tokens[i:end]))
-        prior_z_enc.append(np.array(means))
-        prior_logvar_enc.append(np.array(logvars))
-    prior_z_enc = np.concatenate(prior_z_enc, axis=0)
-    prior_logvar_enc = np.concatenate(prior_logvar_enc, axis=0)
+    if n_prior > 0:
+        print(f"  Re-encoding prior tokens for consistent z...")
+        prior_z_enc = []
+        prior_logvar_enc = []
+        for i in range(0, n_prior, args.batch_size):
+            end = min(i + args.batch_size, n_prior)
+            means, logvars = encode_batch(jnp.array(prior_tokens[i:end]))
+            prior_z_enc.append(np.array(means))
+            prior_logvar_enc.append(np.array(logvars))
+        prior_z_enc = np.concatenate(prior_z_enc, axis=0)
+        prior_logvar_enc = np.concatenate(prior_logvar_enc, axis=0)
+    else:
+        prior_z_enc = np.zeros((0, latent_dim))
+        prior_logvar_enc = np.zeros((0, latent_dim))
 
     # --- Combine ---
     all_z = np.concatenate([buf_z, prior_z_enc], axis=0)
