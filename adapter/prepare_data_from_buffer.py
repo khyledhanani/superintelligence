@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 import pickle
+from pathlib import Path
 from typing import Sequence
 
 import jax
@@ -268,7 +269,7 @@ def main():
         print(f"  Loading agent from {args.agent_checkpoint_path}...")
         ckpt_dir = os.path.dirname(args.agent_checkpoint_path)
         step = int(os.path.basename(args.agent_checkpoint_path))
-        ckpt_path = os.path.join(ckpt_dir, str(step), "default")
+        ckpt_path = Path(ckpt_dir) / str(step) / "default"
 
         # Use PyTreeCheckpointHandler to restore only "params" subtree as numpy
         handler = ocp.PyTreeCheckpointHandler()
