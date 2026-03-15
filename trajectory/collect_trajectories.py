@@ -208,9 +208,12 @@ def main():
         buf_tokens = buf["tokens"]
         buf_size = int(buf["size"]) if "size" in buf else len(buf_tokens)
         buf_tokens = jnp.array(buf_tokens[:buf_size])
+        buf_scores = np.array(buf["scores"][:buf_size])
         # Use exactly the buffer levels, override n_levels
         args.n_levels = buf_size
         print(f"  Buffer has {buf_size} levels, using all of them")
+        print(f"  Buffer scores: mean={buf_scores.mean():.4f}, std={buf_scores.std():.4f}, "
+              f"min={buf_scores.min():.4f}, max={buf_scores.max():.4f}")
 
         # Pre-convert all buffer levels
         all_buf_levels = jax.vmap(tokens_to_level)(buf_tokens)
@@ -263,8 +266,11 @@ def main():
         rewards_np = np.array(rewards)
         dones_np = np.array(dones)
 
-        # Compute regret
-        regret = np.array(compute_maxmc_regret(rewards, dones, values))
+        # Get regret: use buffer's own scores if available, otherwise compute
+        if args.source == "buffer":
+            regret = buf_scores[start:start+bs]
+        else:
+            regret = np.array(compute_maxmc_regret(rewards, dones, values))
 
         # Episode length: first done index + 1 (or max_steps if never done)
         first_done = np.argmax(dones_np, axis=0)  # (N,)
