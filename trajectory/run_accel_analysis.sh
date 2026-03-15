@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-PYTHON="/cs/student/msc/csml/2025/rhautier/miniforge3/envs/jaxued_env/bin/python"
-GSUTIL="gsutil"
+PYTHON="${PYTHON:-python}"
+GCS_CP="gcloud storage cp"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 GCS_BUCKET="gs://ucl-ued-project-bucket"
@@ -47,7 +47,7 @@ for STAGE in $STAGES; do
     BUFF_LOCAL="${BUFFER_DIR}/buffer_dump_${STAGE}.npz"
     if [ ! -f "$BUFF_LOCAL" ]; then
         echo "  Pulling buffer_dump_${STAGE}.npz..."
-        $GSUTIL -q cp "${BUFFER_PREFIX}/buffer_dump_${STAGE}.npz" "$BUFF_LOCAL"
+        $GCS_CP "${BUFFER_PREFIX}/buffer_dump_${STAGE}.npz" "$BUFF_LOCAL"
     else
         echo "  Buffer ${STAGE} already cached."
     fi
@@ -56,7 +56,7 @@ for STAGE in $STAGES; do
     CKPT_LOCAL="${CKPT_DIR}/${STEP}"
     if [ ! -d "$CKPT_LOCAL" ]; then
         echo "  Pulling checkpoint step ${STEP}..."
-        $GSUTIL -q -m cp -r "${CKPT_PREFIX}/${STEP}" "$CKPT_LOCAL"
+        $GCS_CP --recursive "${CKPT_PREFIX}/${STEP}" "$CKPT_LOCAL"
     else
         echo "  Checkpoint ${STEP} already cached."
     fi
@@ -135,4 +135,4 @@ echo ""
 echo "=== Done ==="
 echo "  Per-stage plots: ${ANALYSIS_DIR}/<stage>/"
 echo "  Run on TPU. Copy results back with:"
-echo "    gsutil -m cp -r ${ANALYSIS_DIR} ${GCS_BUCKET}/accel/trajectory_analysis/"
+echo "    gcloud storage cp --recursive ${ANALYSIS_DIR} ${GCS_BUCKET}/accel/trajectory_analysis/"
