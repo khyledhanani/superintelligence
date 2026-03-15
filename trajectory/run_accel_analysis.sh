@@ -52,8 +52,9 @@ for STAGE in $STAGES; do
         echo "  Buffer ${STAGE} already cached."
     fi
 
-    # Pull checkpoint
-    CKPT_LOCAL="${CKPT_DIR}/${STEP}"
+    # Pull checkpoint — orbax expects parent/step/ structure
+    CKPT_PARENT="${CKPT_DIR}/stage_${STAGE}"
+    CKPT_LOCAL="${CKPT_PARENT}/${STEP}"
     if [ ! -d "$CKPT_LOCAL" ]; then
         echo "  Pulling checkpoint step ${STEP}..."
         mkdir -p "$CKPT_LOCAL"
@@ -77,7 +78,7 @@ for STAGE in $STAGES; do
 
     echo "  Stage ${STAGE}: rolling out agent (ckpt ${STEP}) on buffer levels..."
     $PYTHON "$BASE_DIR/collect_trajectories.py" \
-        --agent_checkpoint "${CKPT_DIR}/${STEP}" \
+        --agent_checkpoint "${CKPT_DIR}/stage_${STAGE}" \
         --buffer_path "${BUFFER_DIR}/buffer_dump_${STAGE}.npz" \
         --source buffer \
         --n_levels 5000 \
