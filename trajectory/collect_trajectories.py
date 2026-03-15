@@ -45,20 +45,7 @@ import distrax
 
 GRID_SIZE = 13
 
-
-class ResetRNN(nn.Module):
-    cell: nn.RNNCellBase
-
-    @nn.compact
-    def __call__(self, inputs, initial_carry=None):
-        x, resets = inputs
-        carry = self.variable("carry", "hidden", lambda: initial_carry).value
-        carry = jax.tree_util.tree_map(
-            lambda c, ic: jnp.where(resets[:, None], ic, c), carry, initial_carry
-        )
-        carry, y = self.cell(carry, x)
-        self.variable("carry", "hidden").value = carry
-        return carry, y
+from jaxued.linen import ResetRNN
 
 
 class ActorCritic(nn.Module):
@@ -222,14 +209,16 @@ def main():
         buf_tokens = buf["tokens"]
         buf_size = int(buf["size"]) if "size" in buf else len(buf_tokens)
         buf_tokens = jnp.array(buf_tokens[:buf_size])
-        print(f"  Buffer has {buf_size} levels")
+        # Use exactly the buffer levels, override n_levels
+        args.n_levels = buf_size
+        print(f"  Buffer has {buf_size} levels, using all of them")
 
         # Pre-convert all buffer levels
         all_buf_levels = jax.vmap(tokens_to_level)(buf_tokens)
-        # Sample with replacement if n_levels > buf_size
+
         def get_levels_batch(rng, batch_size):
-            idx = jax.random.randint(rng, (batch_size,), 0, buf_size)
-            return jax.tree_util.tree_map(lambda x: x[idx], all_buf_levels)
+            """Not used for buffer — we slice directly in the collection loop."""
+            raise RuntimeError("Should not be called for buffer source")
 
     elif args.source == "random":
         from jaxued.environments.maze import make_level_generator
@@ -259,10 +248,14 @@ def main():
     t0 = time.time()
 
     for i in range(n_batches):
-        bs = min(args.batch_size, args.n_levels - i * args.batch_size)
+        start = i * args.batch_size
+        bs = min(args.batch_size, args.n_levels - start)
         rng, rng_levels, rng_roll = jax.random.split(rng, 3)
 
-        levels = get_levels_batch(rng_levels, bs)
+        if args.source == "buffer":
+            levels = jax.tree_util.tree_map(lambda x: x[start:start+bs], all_buf_levels)
+        else:
+            levels = get_levels_batch(rng_levels, bs)
         tokens = _get_tokens(levels)
         positions, rewards, dones, values = _rollout_batch(rng_roll, levels)
 

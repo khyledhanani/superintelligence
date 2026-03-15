@@ -81,7 +81,6 @@ for STAGE in $STAGES; do
         --agent_checkpoint "${CKPT_DIR}/stage_${STAGE}" \
         --buffer_path "${BUFFER_DIR}/buffer_dump_${STAGE}.npz" \
         --source buffer \
-        --n_levels 5000 \
         --output_path "$TRAJ_PATH" \
         --batch_size 256
     echo ""
