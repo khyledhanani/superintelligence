@@ -1,6 +1,7 @@
 #!/bin/bash
-# Run trajectory feature analysis across 5 ACCEL training stages.
-# Designed to run on TPU where JAX rollouts work.
+# Run trajectory behavior analysis across ACCEL training stages.
+# Extracts spatial/behavioral features from agent trajectories and
+# tests their correlation with regret — no VAE needed.
 #
 # Usage (on TPU):
 #   bash trajectory/run_accel_analysis.sh
@@ -34,7 +35,7 @@ CKPT_MAP[50k]=198
 
 STAGES="20k 30k 40k 50k"
 
-echo "=== Trajectory Feature Analysis: Plain ACCEL ==="
+echo "=== Trajectory Behavior Analysis: Plain ACCEL ==="
 echo "  Stages: $STAGES"
 echo "  Output: $ANALYSIS_DIR"
 echo ""
@@ -87,8 +88,8 @@ for STAGE in $STAGES; do
     echo ""
 done
 
-# --- Step 3: Run raw feature analysis on each stage ---
-echo "[Step 3] Analyzing trajectory features vs regret..."
+# --- Step 3: Analyze trajectory behavior vs regret ---
+echo "[Step 3] Analyzing trajectory behavior vs regret..."
 for STAGE in $STAGES; do
     TRAJ_PATH="${DATA_DIR}/trajectories_${STAGE}.npz"
     STAGE_DIR="${ANALYSIS_DIR}/${STAGE}"
@@ -101,40 +102,77 @@ for STAGE in $STAGES; do
     echo ""
 done
 
-# --- Step 4: Summary across stages ---
+# --- Step 4: Cross-stage summary ---
 echo "[Step 4] Cross-stage summary..."
 $PYTHON -c "
 import numpy as np
 from scipy import stats
-import os
+import os, pickle
 
 stages = '$STAGES'.split()
 data_dir = '$DATA_DIR'
+analysis_dir = '$ANALYSIS_DIR'
+
 print()
-print(f\"{'Stage':>6s} | {'N':>5s} | {'Regret mean':>11s} | {'Ep len mean':>11s} | {'Goal %':>6s} | {'len↔regret ρ':>12s} | {'unique↔regret ρ':>15s} | {'revisit↔regret ρ':>16s}\")
-print('-' * 110)
+print('=== Cross-Stage Overview ===')
+print(f\"{'Stage':>6s} | {'N':>5s} | {'Regret mean':>11s} | {'Goal %':>6s} | {'All R²':>8s} | {'Solved R²':>10s}\")
+print('-' * 65)
 
 for stage in stages:
     d = np.load(os.path.join(data_dir, f'trajectories_{stage}.npz'), allow_pickle=True)
-    traj = d['trajectories']
+    n = len(d['trajectories'])
     regret = d['regret']
-    ep_len = d['episode_lengths']
     goal = d['reached_goal']
 
-    traj_len = (traj > 0).sum(axis=1)
-    unique = np.array([len(np.unique(t[t > 0])) for t in traj])
-    revisit = traj_len / np.maximum(unique, 1)
+    # Load analysis results
+    results_path = os.path.join(analysis_dir, stage, 'results.pkl')
+    r2_all = r2_solved = '   N/A'
+    if os.path.exists(results_path):
+        with open(results_path, 'rb') as f:
+            res = pickle.load(f)
+        if res.get('all'):
+            r2_all = f'{res[\"all\"][\"r2_mean\"]:8.4f}'
+        if res.get('solved') and res['solved'] is not None:
+            r2_solved = f'{res[\"solved\"][\"r2_mean\"]:10.4f}'
 
-    rho_len, _ = stats.spearmanr(traj_len, regret)
-    rho_uniq, _ = stats.spearmanr(unique, regret)
-    rho_rev, _ = stats.spearmanr(revisit, regret)
+    print(f'{stage:>6s} | {n:5d} | {regret.mean():11.4f} | {goal.mean()*100:5.1f}% | {r2_all} | {r2_solved}')
 
-    print(f'{stage:>6s} | {len(traj):5d} | {regret.mean():11.4f} | {ep_len.mean():11.1f} | {goal.mean()*100:5.1f}% | {rho_len:+12.4f} | {rho_uniq:+15.4f} | {rho_rev:+16.4f}')
+print()
+
+# Print top features across stages
+print('=== Top Correlated Features (All Levels) ===')
+for stage in stages:
+    results_path = os.path.join(analysis_dir, stage, 'results.pkl')
+    if not os.path.exists(results_path):
+        continue
+    with open(results_path, 'rb') as f:
+        res = pickle.load(f)
+    if not res.get('all'):
+        continue
+    spearman = res['all']['spearman']
+    top3 = spearman[:3]
+    top_str = ', '.join([f'{name}: {rho:+.3f}' for name, rho, _, _ in top3])
+    print(f'  {stage:>5s}: {top_str}')
+
+print()
+print('=== Top Correlated Features (Solved Only) ===')
+for stage in stages:
+    results_path = os.path.join(analysis_dir, stage, 'results.pkl')
+    if not os.path.exists(results_path):
+        continue
+    with open(results_path, 'rb') as f:
+        res = pickle.load(f)
+    if not res.get('solved') or res['solved'] is None:
+        continue
+    spearman = res['solved']['spearman']
+    top3 = spearman[:3]
+    top_str = ', '.join([f'{name}: {rho:+.3f}' for name, rho, _, _ in top3])
+    print(f'  {stage:>5s}: {top_str}')
 print()
 "
 
 echo ""
 echo "=== Done ==="
-echo "  Per-stage plots: ${ANALYSIS_DIR}/<stage>/"
-echo "  Run on TPU. Copy results back with:"
+echo "  Per-stage results: ${ANALYSIS_DIR}/<stage>/"
+echo "  Copy results back with:"
 echo "    gcloud storage cp --recursive ${ANALYSIS_DIR} ${GCS_BUCKET}/accel/trajectory_analysis/"

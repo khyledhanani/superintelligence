@@ -1,235 +1,269 @@
 """
-Analyze whether the trajectory VAE latent space correlates with regret.
+Analyze whether agent trajectory behavior correlates with regret.
 
-Compares:
-  1. Trajectory VAE latent z_traj → regret correlation
-  2. Level VAE latent z_level → regret correlation (baseline)
+Extracts behavioral features directly from the raw position sequence
+(no VAE needed) and tests their correlation with regret scores.
 
-Outputs:
-  - Per-dimension Spearman correlations
-  - Linear regression R² (z → regret)
-  - PCA visualization colored by regret
-  - Summary statistics
+Features capture the spatial structure of the agent's path:
+  - Path efficiency (how directly agent reaches goal)
+  - Backtracking / revisit patterns
+  - Spatial coverage and entropy
+  - Wall-bumping (stalling on same cell)
+  - Directional changes (turning frequency)
+  - Goal-progress curve shape
 
 Usage:
     python trajectory/analyze_correlation.py \
         --data_path trajectory/data/trajectories.npz \
-        --traj_vae_path trajectory/checkpoints/run1/best_model.pkl \
-        --level_vae_path /path/to/vae_checkpoint.pkl \
-        --level_vae_config /path/to/vae_config.yaml \
         --output_dir trajectory/analysis
 """
 import argparse
 import os
 import sys
-import pickle
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 from scipy import stats
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import StandardScaler
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vae"))
-
-from trajectory_vae import TrajectoryVAE
+GRID_SIZE = 13
 
 
-def encode_trajectories(model, params, trajectories, batch_size=512):
-    """Encode trajectories to latent vectors."""
-    @jax.jit
-    def _encode(batch):
-        return model.apply({"params": params}, batch, train=False, method=model.encode)
-
-    all_means = []
-    for i in range(0, len(trajectories), batch_size):
-        batch = jnp.array(trajectories[i:i+batch_size])
-        means, _ = _encode(batch)
-        all_means.append(np.array(means))
-    return np.concatenate(all_means, axis=0)
+def pos_to_xy(pos):
+    """Convert 1-based position index to (x, y). 0 → (-1, -1) for padding."""
+    x = (pos - 1) % GRID_SIZE
+    y = (pos - 1) // GRID_SIZE
+    # mask padding
+    valid = pos > 0
+    x = np.where(valid, x, -1)
+    y = np.where(valid, y, -1)
+    return x, y
 
 
-def encode_levels(level_vae, level_params, tokens, batch_size=512):
-    """Encode level tokens to latent vectors."""
-    @jax.jit
-    def _encode(batch):
-        return level_vae.apply({"params": level_params}, batch, train=False, method=level_vae.encode)
+def extract_features(trajectories, reached_goal):
+    """Extract behavioral features from raw position trajectories.
 
-    all_means = []
-    for i in range(0, len(tokens), batch_size):
-        batch = jnp.array(tokens[i:i+batch_size])
-        means, _ = _encode(batch)
-        all_means.append(np.array(means))
-    return np.concatenate(all_means, axis=0)
+    Args:
+        trajectories: (N, max_steps) int32 position tokens (1-based, 0=pad)
+        reached_goal: (N,) bool
+
+    Returns:
+        features: dict of {name: (N,) array}
+    """
+    N, T = trajectories.shape
+    features = {}
+
+    # Basic: trajectory length, unique positions
+    mask = trajectories > 0  # (N, T)
+    traj_len = mask.sum(axis=1).astype(float)
+    features["traj_length"] = traj_len
+
+    unique_pos = np.array([len(np.unique(t[t > 0])) for t in trajectories], dtype=float)
+    features["unique_positions"] = unique_pos
+
+    # Revisit ratio: steps / unique cells (>1 means backtracking)
+    features["revisit_ratio"] = traj_len / np.maximum(unique_pos, 1)
+
+    # Coverage: fraction of 13x13 grid visited
+    features["grid_coverage"] = unique_pos / (GRID_SIZE * GRID_SIZE)
+
+    # Convert to xy for spatial features
+    # Work per-trajectory for variable-length sequences
+    stall_counts = np.zeros(N)
+    backtrack_counts = np.zeros(N)
+    turn_counts = np.zeros(N)
+    total_displacement = np.zeros(N)
+    max_displacement = np.zeros(N)
+    spatial_entropy = np.zeros(N)
+    mean_step_size = np.zeros(N)
+    goal_pos_x = np.zeros(N)
+    goal_pos_y = np.zeros(N)
+    start_goal_dist = np.zeros(N)
+    final_goal_dist = np.zeros(N)
+    path_straightness = np.zeros(N)
+
+    for i in range(N):
+        t = trajectories[i]
+        valid = t > 0
+        n_steps = valid.sum()
+        if n_steps < 2:
+            continue
+
+        pos = t[valid]
+        x = (pos - 1) % GRID_SIZE
+        y = (pos - 1) // GRID_SIZE
+
+        # Stalling: consecutive identical positions (agent bumped a wall)
+        stall_counts[i] = np.sum(pos[1:] == pos[:-1])
+
+        # Step displacements
+        dx = np.diff(x).astype(float)
+        dy = np.diff(y).astype(float)
+        step_sizes = np.abs(dx) + np.abs(dy)  # Manhattan per step
+        mean_step_size[i] = step_sizes.mean() if len(step_sizes) > 0 else 0
+
+        # Total Manhattan displacement from start
+        total_displacement[i] = abs(x[-1] - x[0]) + abs(y[-1] - y[0])
+
+        # Max displacement from start during trajectory
+        disp_from_start = np.abs(x - x[0]) + np.abs(y - y[0])
+        max_displacement[i] = disp_from_start.max()
+
+        # Backtracking: how many times agent revisits a cell it already visited
+        seen = set()
+        bt = 0
+        for p in pos:
+            if p in seen:
+                bt += 1
+            seen.add(p)
+        backtrack_counts[i] = bt
+
+        # Turning: direction changes (count transitions between different move directions)
+        if len(dx) >= 2:
+            # Direction as (sign(dx), sign(dy))
+            dirs = np.stack([np.sign(dx), np.sign(dy)], axis=1)
+            # Count direction changes (excluding stalls where dir=(0,0))
+            moving = (dirs != 0).any(axis=1)
+            moving_dirs = dirs[moving]
+            if len(moving_dirs) >= 2:
+                turns = np.sum((moving_dirs[1:] != moving_dirs[:-1]).any(axis=1))
+                turn_counts[i] = turns
+
+        # Spatial entropy of visited positions
+        _, counts = np.unique(pos, return_counts=True)
+        probs = counts / counts.sum()
+        spatial_entropy[i] = -np.sum(probs * np.log2(probs + 1e-10))
+
+        # Path straightness: displacement / path_length
+        if n_steps > 1:
+            path_straightness[i] = total_displacement[i] / max(n_steps - 1, 1)
+
+        # Goal position (last unique position before padding — for solved levels this is the goal)
+        if reached_goal[i]:
+            goal_pos_x[i] = x[-1]
+            goal_pos_y[i] = y[-1]
+            start_goal_dist[i] = abs(x[-1] - x[0]) + abs(y[-1] - y[0])
+            # Final distance to goal (should be 0 for solved)
+            final_goal_dist[i] = 0
+        else:
+            goal_pos_x[i] = -1
+            goal_pos_y[i] = -1
+
+    features["stall_count"] = stall_counts
+    features["stall_fraction"] = stall_counts / np.maximum(traj_len - 1, 1)
+    features["backtrack_count"] = backtrack_counts
+    features["backtrack_fraction"] = backtrack_counts / np.maximum(traj_len, 1)
+    features["turn_count"] = turn_counts
+    features["turn_rate"] = turn_counts / np.maximum(traj_len - 2, 1)
+    features["total_displacement"] = total_displacement
+    features["max_displacement"] = max_displacement
+    features["spatial_entropy"] = spatial_entropy
+    features["mean_step_size"] = mean_step_size
+    features["path_straightness"] = path_straightness
+
+    # Solved-specific: path efficiency (start-goal distance / steps taken)
+    # Only meaningful for solved levels
+    solved = reached_goal.astype(bool)
+    path_efficiency = np.zeros(N)
+    path_efficiency[solved] = start_goal_dist[solved] / np.maximum(traj_len[solved], 1)
+    features["path_efficiency_solved"] = path_efficiency
+
+    return features
 
 
-def compute_correlations(z, regret, name=""):
-    """Compute per-dimension and aggregate correlations."""
-    n_dims = z.shape[1]
+def plot_feature_correlations(features, regret, output_dir, reached_goal=None, tag="all"):
+    """Scatter plots of each feature vs regret with Spearman rho."""
+    feat_names = [k for k in features.keys() if not k.endswith("_solved")]
+    n_feats = len(feat_names)
+    n_cols = 4
+    n_rows = (n_feats + n_cols - 1) // n_cols
 
-    # Per-dimension Spearman correlation
-    spearman_per_dim = []
-    for d in range(n_dims):
-        rho, pval = stats.spearmanr(z[:, d], regret)
-        spearman_per_dim.append((d, rho, pval))
-    spearman_per_dim.sort(key=lambda x: -abs(x[1]))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows))
+    axes = axes.flatten()
 
-    # Linear regression R² (5-fold CV)
+    for j, name in enumerate(feat_names):
+        ax = axes[j]
+        feat = features[name]
+        ax.scatter(feat, regret, alpha=0.1, s=3, rasterized=True)
+        rho, pval = stats.spearmanr(feat, regret)
+        ax.set_xlabel(name.replace("_", " "))
+        ax.set_ylabel("Regret")
+        ax.set_title(f"ρ={rho:+.3f} (p={pval:.1e})", fontsize=9)
+
+    # Hide unused axes
+    for j in range(n_feats, len(axes)):
+        axes[j].set_visible(False)
+
+    plt.suptitle(f"Trajectory Features vs Regret — {tag} (N={len(regret)})", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"features_vs_regret_{tag}.png"), dpi=150)
+    plt.close()
+
+
+def run_regression_analysis(features, regret, output_dir, tag="all"):
+    """Ridge regression: all features → regret, with feature importances."""
+    feat_names = [k for k in features.keys() if not k.endswith("_solved")]
+    X = np.column_stack([features[k] for k in feat_names])
+
+    # Handle NaN/Inf
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # 5-fold CV R²
     ridge = Ridge(alpha=1.0)
-    r2_scores = cross_val_score(ridge, z, regret, cv=5, scoring="r2")
+    r2_scores = cross_val_score(ridge, X_scaled, regret, cv=5, scoring="r2")
 
-    print(f"\n{'='*60}")
-    print(f"  {name} ({n_dims} dims)")
-    print(f"{'='*60}")
-    print(f"  Linear R² (5-fold CV): {r2_scores.mean():.4f} ± {r2_scores.std():.4f}")
-    print(f"  Top 10 Spearman correlations (|rho|):")
-    for d, rho, pval in spearman_per_dim[:10]:
+    # Fit on all data for feature importances
+    ridge.fit(X_scaled, regret)
+    coefs = ridge.coef_
+
+    # Per-feature Spearman
+    spearman = []
+    for j, name in enumerate(feat_names):
+        rho, pval = stats.spearmanr(X[:, j], regret)
+        spearman.append((name, rho, pval, coefs[j]))
+    spearman.sort(key=lambda x: -abs(x[1]))
+
+    print(f"\n  --- {tag} (N={len(regret)}) ---")
+    print(f"  Combined Ridge R² (5-fold CV): {r2_scores.mean():.4f} ± {r2_scores.std():.4f}")
+    print(f"  {'Feature':>25s} | {'Spearman ρ':>12s} | {'p-value':>10s} | {'Ridge coef':>10s}")
+    print(f"  {'-'*25}-+-{'-'*12}-+-{'-'*10}-+-{'-'*10}")
+    for name, rho, pval, coef in spearman:
         sig = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else ""
-        print(f"    dim {d:3d}: rho={rho:+.4f} (p={pval:.2e}) {sig}")
+        print(f"  {name:>25s} | {rho:+12.4f} | {pval:10.2e} | {coef:+10.4f} {sig}")
 
-    # Mean absolute Spearman
-    mean_abs_rho = np.mean([abs(x[1]) for x in spearman_per_dim])
-    max_abs_rho = max(abs(x[1]) for x in spearman_per_dim)
-    print(f"  Mean |rho|: {mean_abs_rho:.4f}")
-    print(f"  Max  |rho|: {max_abs_rho:.4f}")
+    # Feature importance bar plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    names_sorted = [x[0] for x in spearman]
+    rhos_sorted = [x[1] for x in spearman]
+    colors = ["#2196F3" if r > 0 else "#F44336" for r in rhos_sorted]
+    ax.barh(range(len(names_sorted)), rhos_sorted, color=colors)
+    ax.set_yticks(range(len(names_sorted)))
+    ax.set_yticklabels([n.replace("_", " ") for n in names_sorted], fontsize=9)
+    ax.set_xlabel("Spearman ρ with regret")
+    ax.set_title(f"Feature-Regret Correlations — {tag}\nCombined R²={r2_scores.mean():.4f}")
+    ax.axvline(0, color="k", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"feature_importance_{tag}.png"), dpi=150)
+    plt.close()
 
     return {
         "r2_mean": r2_scores.mean(),
         "r2_std": r2_scores.std(),
-        "r2_scores": r2_scores,
-        "mean_abs_rho": mean_abs_rho,
-        "max_abs_rho": max_abs_rho,
-        "spearman_per_dim": spearman_per_dim,
+        "spearman": spearman,
     }
 
 
-def plot_pca_comparison(z_traj, z_level, regret, output_dir):
-    """PCA visualization of both latent spaces colored by regret."""
-    from sklearn.decomposition import PCA
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    for ax, z, title in [
-        (axes[0], z_traj, "Trajectory VAE"),
-        (axes[1], z_level, "Level VAE"),
-    ]:
-        if z is None:
-            ax.set_title(f"{title}\n(not available)")
-            continue
-        pca = PCA(n_components=2)
-        z_2d = pca.fit_transform(z)
-        sc = ax.scatter(z_2d[:, 0], z_2d[:, 1], c=regret, cmap="viridis",
-                        alpha=0.3, s=5, rasterized=True)
-        ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
-        ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
-        ax.set_title(f"{title}\nPCA colored by regret")
-        plt.colorbar(sc, ax=ax, label="regret")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "pca_comparison.png"), dpi=150)
-    plt.close()
-    print(f"  Saved PCA comparison to {output_dir}/pca_comparison.png")
-
-
-def plot_correlation_bars(results_traj, results_level, output_dir):
-    """Bar chart comparing key metrics."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    # R² comparison
-    ax = axes[0]
-    names = []
-    r2s = []
-    r2_errs = []
-    if results_traj:
-        names.append("Trajectory VAE")
-        r2s.append(results_traj["r2_mean"])
-        r2_errs.append(results_traj["r2_std"])
-    if results_level:
-        names.append("Level VAE")
-        r2s.append(results_level["r2_mean"])
-        r2_errs.append(results_level["r2_std"])
-    ax.bar(names, r2s, yerr=r2_errs, capsize=5, color=["#2196F3", "#FF9800"][:len(names)])
-    ax.set_ylabel("R² (5-fold CV)")
-    ax.set_title("Linear Regression: z → regret")
-    ax.set_ylim(bottom=0)
-
-    # Mean |rho|
-    ax = axes[1]
-    vals = []
-    if results_traj:
-        vals.append(results_traj["mean_abs_rho"])
-    if results_level:
-        vals.append(results_level["mean_abs_rho"])
-    ax.bar(names, vals, color=["#2196F3", "#FF9800"][:len(names)])
-    ax.set_ylabel("Mean |Spearman ρ|")
-    ax.set_title("Average per-dim correlation")
-    ax.set_ylim(bottom=0)
-
-    # Max |rho|
-    ax = axes[2]
-    vals = []
-    if results_traj:
-        vals.append(results_traj["max_abs_rho"])
-    if results_level:
-        vals.append(results_level["max_abs_rho"])
-    ax.bar(names, vals, color=["#2196F3", "#FF9800"][:len(names)])
-    ax.set_ylabel("Max |Spearman ρ|")
-    ax.set_title("Best single-dim correlation")
-    ax.set_ylim(bottom=0)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "correlation_comparison.png"), dpi=150)
-    plt.close()
-    print(f"  Saved correlation comparison to {output_dir}/correlation_comparison.png")
-
-
-def plot_trajectory_features(trajectories, regret, output_dir):
-    """Plot simple trajectory features vs regret (no VAE needed)."""
-    n = len(trajectories)
-
-    # Feature 1: trajectory length (non-zero positions)
-    traj_lengths = (trajectories > 0).sum(axis=1)
-
-    # Feature 2: number of unique positions visited
-    unique_positions = np.array([len(np.unique(t[t > 0])) for t in trajectories])
-
-    # Feature 3: revisit ratio = total_steps / unique_positions
-    revisit_ratio = traj_lengths / np.maximum(unique_positions, 1)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    for ax, feat, name in [
-        (axes[0], traj_lengths, "Trajectory length"),
-        (axes[1], unique_positions, "Unique positions"),
-        (axes[2], revisit_ratio, "Revisit ratio"),
-    ]:
-        ax.scatter(feat, regret, alpha=0.1, s=3, rasterized=True)
-        rho, pval = stats.spearmanr(feat, regret)
-        ax.set_xlabel(name)
-        ax.set_ylabel("Regret")
-        ax.set_title(f"{name} vs Regret\nSpearman ρ={rho:.4f} (p={pval:.2e})")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "trajectory_features_vs_regret.png"), dpi=150)
-    plt.close()
-    print(f"  Saved trajectory features plot to {output_dir}/trajectory_features_vs_regret.png")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Analyze trajectory vs level VAE latent-regret correlation")
+    parser = argparse.ArgumentParser(description="Analyze trajectory behavior vs regret")
     parser.add_argument("--data_path", type=str, required=True,
                         help="Path to trajectories.npz from collect_trajectories.py")
-    parser.add_argument("--traj_vae_path", type=str, default=None,
-                        help="Path to trained trajectory VAE checkpoint")
-    parser.add_argument("--level_vae_path", type=str, default=None,
-                        help="Path to level VAE checkpoint (for baseline comparison)")
-    parser.add_argument("--level_vae_config", type=str, default=None,
-                        help="Path to level VAE config.yaml")
     parser.add_argument("--output_dir", type=str, default="trajectory/analysis")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Cap number of samples (for speed)")
@@ -238,102 +272,57 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Load data ---
-    print("[1/4] Loading data...")
+    print("[1/3] Loading data...")
     data = np.load(args.data_path, allow_pickle=True)
     trajectories = data["trajectories"]
     regret = data["regret"]
-    tokens = data["tokens"] if "tokens" in data else None
+    reached_goal = data["reached_goal"] if "reached_goal" in data else np.zeros(len(trajectories), dtype=bool)
 
     if args.max_samples and len(trajectories) > args.max_samples:
         idx = np.random.RandomState(42).choice(len(trajectories), args.max_samples, replace=False)
         trajectories = trajectories[idx]
         regret = regret[idx]
-        if tokens is not None:
-            tokens = tokens[idx]
+        reached_goal = reached_goal[idx]
 
     print(f"  {len(trajectories)} samples, regret range [{regret.min():.4f}, {regret.max():.4f}]")
+    print(f"  Reached goal: {reached_goal.sum()}/{len(reached_goal)} ({reached_goal.mean()*100:.1f}%)")
 
-    # --- Raw trajectory features (no VAE needed) ---
-    print("\n[2/4] Analyzing raw trajectory features...")
-    plot_trajectory_features(trajectories, regret, args.output_dir)
+    # --- Extract features ---
+    print("\n[2/3] Extracting trajectory features...")
+    features = extract_features(trajectories, reached_goal)
+    print(f"  Extracted {len(features)} features")
 
-    # Raw feature correlations
-    traj_lengths = (trajectories > 0).sum(axis=1)
-    unique_pos = np.array([len(np.unique(t[t > 0])) for t in trajectories])
-    revisit_ratio = traj_lengths / np.maximum(unique_pos, 1)
+    # --- Analysis: all levels ---
+    print("\n[3/3] Correlation analysis...")
+    plot_feature_correlations(features, regret, args.output_dir, reached_goal, tag="all")
+    results_all = run_regression_analysis(features, regret, args.output_dir, tag="all")
 
-    for feat, name in [(traj_lengths, "traj_length"), (unique_pos, "unique_positions"), (revisit_ratio, "revisit_ratio")]:
-        rho, pval = stats.spearmanr(feat, regret)
-        print(f"  {name:20s}: Spearman ρ = {rho:+.4f} (p={pval:.2e})")
-
-    # --- Trajectory VAE encoding ---
-    results_traj = None
-    z_traj = None
-    if args.traj_vae_path:
-        print("\n[3/4] Encoding with trajectory VAE...")
-        with open(args.traj_vae_path, "rb") as f:
-            traj_ckpt = pickle.load(f)
-        traj_cfg = traj_ckpt["config"]
-        traj_model = TrajectoryVAE(
-            vocab_size=170,
-            embed_dim=traj_cfg["embed_dim"],
-            latent_dim=traj_cfg["latent_dim"],
-            max_steps=int(data["max_steps"]),
-        )
-        z_traj = encode_trajectories(traj_model, traj_ckpt["params"], trajectories)
-        results_traj = compute_correlations(z_traj, regret, "Trajectory VAE")
+    # --- Analysis: solved only ---
+    solved = reached_goal.astype(bool)
+    n_solved = solved.sum()
+    if n_solved > 30:
+        features_solved = {k: v[solved] for k, v in features.items()}
+        regret_solved = regret[solved]
+        plot_feature_correlations(features_solved, regret_solved, args.output_dir, tag="solved")
+        results_solved = run_regression_analysis(features_solved, regret_solved, args.output_dir, tag="solved")
     else:
-        print("\n[3/4] Skipping trajectory VAE (no --traj_vae_path)")
-
-    # --- Level VAE encoding (baseline) ---
-    results_level = None
-    z_level = None
-    if args.level_vae_path and args.level_vae_config and tokens is not None:
-        print("\n[4/4] Encoding with level VAE (baseline)...")
-        import yaml
-        from vae_model import CluttrVAE
-        with open(args.level_vae_config) as f:
-            lvl_cfg = yaml.safe_load(f)
-        level_vae = CluttrVAE(
-            vocab_size=lvl_cfg["vocab_size"], embed_dim=lvl_cfg["embed_dim"],
-            latent_dim=lvl_cfg["latent_dim"], seq_len=lvl_cfg["seq_len"],
-        )
-        with open(args.level_vae_path, "rb") as f:
-            lvl_ckpt = pickle.load(f)
-        lvl_params = lvl_ckpt["params"] if isinstance(lvl_ckpt, dict) and "params" in lvl_ckpt else lvl_ckpt
-        z_level = encode_levels(level_vae, lvl_params, tokens)
-        results_level = compute_correlations(z_level, regret, "Level VAE (baseline)")
-    else:
-        print("\n[4/4] Skipping level VAE baseline")
-
-    # --- Comparison plots ---
-    if z_traj is not None or z_level is not None:
-        plot_pca_comparison(z_traj, z_level, regret, args.output_dir)
-    if results_traj or results_level:
-        plot_correlation_bars(results_traj, results_level, args.output_dir)
+        print(f"\n  Too few solved levels ({n_solved}) for solved-only analysis")
+        results_solved = None
 
     # --- Summary ---
-    print("\n" + "=" * 60)
-    print("  SUMMARY")
-    print("=" * 60)
-    if results_traj:
-        print(f"  Trajectory VAE:  R² = {results_traj['r2_mean']:.4f} ± {results_traj['r2_std']:.4f}, "
-              f"mean |ρ| = {results_traj['mean_abs_rho']:.4f}")
-    if results_level:
-        print(f"  Level VAE:       R² = {results_level['r2_mean']:.4f} ± {results_level['r2_std']:.4f}, "
-              f"mean |ρ| = {results_level['mean_abs_rho']:.4f}")
-    if results_traj and results_level:
-        r2_diff = results_traj["r2_mean"] - results_level["r2_mean"]
-        print(f"\n  R² difference: {r2_diff:+.4f} ({'trajectory better' if r2_diff > 0 else 'level better'})")
+    print(f"\n{'='*60}")
+    print(f"  SUMMARY")
+    print(f"{'='*60}")
+    print(f"  All levels:    R² = {results_all['r2_mean']:.4f} ± {results_all['r2_std']:.4f}")
+    if results_solved:
+        print(f"  Solved only:   R² = {results_solved['r2_mean']:.4f} ± {results_solved['r2_std']:.4f}")
+    print(f"\n  Plots saved to {args.output_dir}/")
 
     # Save results
+    import pickle
     results_path = os.path.join(args.output_dir, "results.pkl")
     with open(results_path, "wb") as f:
-        pickle.dump({
-            "trajectory_vae": results_traj,
-            "level_vae": results_level,
-        }, f)
-    print(f"\n  Results saved to {results_path}")
+        pickle.dump({"all": results_all, "solved": results_solved}, f)
 
 
 if __name__ == "__main__":
