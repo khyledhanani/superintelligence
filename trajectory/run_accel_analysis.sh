@@ -31,7 +31,7 @@ CKPT_MAP[30k]=116
 CKPT_MAP[40k]=128
 CKPT_MAP[50k]=198
 
-STAGES="10k 20k 30k 40k 50k"
+STAGES="20k 30k 40k 50k"
 
 echo "=== Trajectory Feature Analysis: Plain ACCEL ==="
 echo "  Stages: $STAGES"

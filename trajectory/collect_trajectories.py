@@ -189,6 +189,9 @@ def main():
     ws_step = ws_manager.latest_step()
     ws_ckpt = ws_manager.restore(ws_step)
     agent_params = ws_ckpt["params"] if isinstance(ws_ckpt, dict) and "params" in ws_ckpt else ws_ckpt.params
+    # Unwrap double-nested {"params": {"params": ...}} from orbax
+    if isinstance(agent_params, dict) and "params" in agent_params:
+        agent_params = agent_params["params"]
     print(f"  Loaded checkpoint from step {ws_step}")
 
     # --- Generate levels ---
