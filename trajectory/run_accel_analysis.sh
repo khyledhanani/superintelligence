@@ -56,7 +56,8 @@ for STAGE in $STAGES; do
     CKPT_LOCAL="${CKPT_DIR}/${STEP}"
     if [ ! -d "$CKPT_LOCAL" ]; then
         echo "  Pulling checkpoint step ${STEP}..."
-        $GCS_CP --recursive "${CKPT_PREFIX}/${STEP}" "$CKPT_LOCAL"
+        mkdir -p "$CKPT_LOCAL"
+        $GCS_CP --recursive "${CKPT_PREFIX}/${STEP}/*" "$CKPT_LOCAL/"
     else
         echo "  Checkpoint ${STEP} already cached."
     fi
