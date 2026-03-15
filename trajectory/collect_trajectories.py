@@ -130,11 +130,10 @@ def rollout_with_trajectories(rng, levels, agent_params, network, env, env_param
 
 
 def compute_maxmc_regret(rewards, dones, values):
-    """MaxMC regret proxy: max(0, total_return - V(s0))."""
-    total_returns = rewards.sum(axis=0)
-    max_returns = jnp.maximum(total_returns, 0.0)
-    v0 = values[0]
-    return jnp.maximum(max_returns - v0, 0.0)
+    """Proper MaxMC regret using jaxued.utils."""
+    from jaxued.utils import compute_max_returns, max_mc
+    max_returns = compute_max_returns(dones, rewards)
+    return max_mc(dones, values, max_returns, incomplete_value=0.0)
 
 
 def main():
