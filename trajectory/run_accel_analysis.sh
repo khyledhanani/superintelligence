@@ -28,8 +28,8 @@ declare -A CKPT_MAP
 # eval_freq=250, save_interval=2 → ckpt at even eval_steps
 # buffer Nk → eval_step = N*1000/250, max_to_keep=60 evicts < step 80
 CKPT_MAP[20k]=80
-CKPT_MAP[30k]=120
-CKPT_MAP[40k]=160
+CKPT_MAP[30k]=118
+CKPT_MAP[40k]=158
 CKPT_MAP[50k]=198
 
 STAGES="20k 30k 40k 50k"
