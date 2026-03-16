@@ -76,11 +76,11 @@ class TrainState(BaseTrainState):
     replay_last_level_inds: chex.Array = struct.field(pytree_node=True)
     mutation_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     # Online frontier estimator (run-local, task-specific).
-    frontier_w: chex.Array = struct.field(pytree_node=True)
-    frontier_b: chex.Array = struct.field(pytree_node=True)
+    frontier_params: core.FrozenDict[str, chex.Array] = struct.field(pytree_node=True)
     frontier_updates: int
     frontier_last_loss: chex.Array
     frontier_last_p_mae: chex.Array
+    frontier_last_std: chex.Array
     # PCA directions over buffer latents (for --plwm_use_pca_mutation)
     plwm_pca_eigvecs: chex.Array = struct.field(pytree_node=True)   # (D, D)
     plwm_pca_eigvals: chex.Array = struct.field(pytree_node=True)   # (D,)
@@ -464,6 +464,7 @@ def train_state_to_log_dict(
         log["plwm/frontier_updates"] = train_state.frontier_updates
         log["plwm/frontier_last_loss"] = train_state.frontier_last_loss
         log["plwm/frontier_last_p_mae"] = train_state.frontier_last_p_mae
+        log["plwm/frontier_last_std"] = train_state.frontier_last_std
 
     return {
         "log": log,
@@ -529,41 +530,109 @@ def compute_structural_frontier_stats(levels: Level) -> dict[str, chex.Array]:
     }
 
 
-def frontier_predict_prob(
+def init_frontier_params(
+    rng: chex.PRNGKey,
+    feature_dim: int,
+    hidden_dim: int,
+    ensemble_size: int,
+) -> core.FrozenDict[str, chex.Array]:
+    """Initialize a small frontier MLP ensemble."""
+    rng_w1, rng_w2 = jax.random.split(rng)
+    scale1 = jnp.sqrt(2.0 / float(max(feature_dim, 1)))
+    scale2 = jnp.sqrt(2.0 / float(max(hidden_dim, 1)))
+    return core.freeze(
+        {
+            "w1": (
+                scale1
+                * jax.random.normal(
+                    rng_w1,
+                    (ensemble_size, feature_dim, hidden_dim),
+                    dtype=jnp.float32,
+                )
+            ),
+            "b1": jnp.zeros((ensemble_size, hidden_dim), dtype=jnp.float32),
+            "w2": (
+                scale2
+                * jax.random.normal(
+                    rng_w2,
+                    (ensemble_size, hidden_dim),
+                    dtype=jnp.float32,
+                )
+            ),
+            "b2": jnp.zeros((ensemble_size,), dtype=jnp.float32),
+        }
+    )
+
+
+def frontier_predict_members(
     features: chex.Array,
-    w: chex.Array,
-    b: chex.Array,
+    params: core.FrozenDict[str, chex.Array],
 ) -> chex.Array:
-    logits = jnp.matmul(features, w) + b
+    """Predict success probabilities for each ensemble member, shape (batch, ensemble)."""
+    hidden = jnp.einsum("bd,edh->beh", features, params["w1"]) + params["b1"][None, :, :]
+    hidden = jax.nn.relu(hidden)
+    logits = jnp.einsum("beh,eh->be", hidden, params["w2"]) + params["b2"][None, :]
     return jax.nn.sigmoid(logits)
 
 
+def frontier_predict_stats(
+    features: chex.Array,
+    params: core.FrozenDict[str, chex.Array],
+) -> tuple[chex.Array, chex.Array]:
+    preds = frontier_predict_members(features, params)
+    return preds.mean(axis=-1), preds.std(axis=-1)
+
+
+def frontier_candidate_novelty(
+    candidate_latents: chex.Array,
+    parent_latents: chex.Array,
+    knn_k: int,
+) -> chex.Array:
+    """Explicit novelty bonus: move away from the current replay batch, not just the parent."""
+    batch_size, num_candidates, latent_dim = candidate_latents.shape
+    delta = jnp.linalg.norm(candidate_latents - parent_latents[:, None, :], axis=-1)
+    if batch_size <= 1:
+        return delta / jnp.sqrt(float(latent_dim))
+
+    flat = candidate_latents.reshape((batch_size * num_candidates, latent_dim))
+    dists = jnp.linalg.norm(flat[:, None, :] - parent_latents[None, :, :], axis=-1)
+    parent_idx = jnp.repeat(jnp.arange(batch_size), num_candidates)
+    dists = dists.at[jnp.arange(batch_size * num_candidates), parent_idx].set(jnp.inf)
+    knn = jnp.sort(dists, axis=-1)[:, :knn_k].mean(axis=-1).reshape((batch_size, num_candidates))
+    scale = jnp.sqrt(float(latent_dim))
+    return 0.5 * (delta / scale) + 0.5 * (knn / scale)
+
+
 def frontier_update_step(
-    w: chex.Array,
-    b: chex.Array,
+    params: core.FrozenDict[str, chex.Array],
     features: chex.Array,
     targets: chex.Array,
     weights: chex.Array,
     lr: float,
     l2: float,
-) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
-    """Single weighted SGD update for online logistic frontier estimator."""
-    logits = jnp.matmul(features, w) + b
-    preds = jax.nn.sigmoid(logits)
+) -> tuple[core.FrozenDict[str, chex.Array], chex.Array, chex.Array, chex.Array]:
+    """Single weighted SGD update for an ensemble MLP frontier estimator."""
     denom = jnp.maximum(weights.sum(), 1e-6)
 
-    # d/dlogit BCE(sigmoid(logit), y) = sigmoid(logit) - y
-    err = (preds - targets) * weights
-    grad_w = jnp.matmul(features.T, err) / denom + l2 * w
-    grad_b = err.sum() / denom
+    def loss_fn(curr_params):
+        preds = frontier_predict_members(features, curr_params)
+        logits = jnp.log(jnp.clip(preds, 1e-6, 1.0 - 1e-6)) - jnp.log1p(-jnp.clip(preds, 1e-6, 1.0 - 1e-6))
+        bce = optax.sigmoid_binary_cross_entropy(logits, targets[:, None])
+        data_loss = (weights[:, None] * bce).sum() / jnp.maximum(
+            denom * preds.shape[-1], 1e-6
+        )
+        reg = 0.5 * (
+            jnp.sum(curr_params["w1"] ** 2) + jnp.sum(curr_params["w2"] ** 2)
+        ) / float(preds.shape[-1])
+        loss = data_loss + l2 * reg
+        mean_pred = preds.mean(axis=-1)
+        p_mae = (weights * jnp.abs(mean_pred - targets)).sum() / denom
+        pred_std = (weights * preds.std(axis=-1)).sum() / denom
+        return loss, (p_mae, pred_std)
 
-    new_w = w - lr * grad_w
-    new_b = b - lr * grad_b
-
-    bce = optax.sigmoid_binary_cross_entropy(logits, targets)
-    loss = (weights * bce).sum() / denom
-    p_mae = (weights * jnp.abs(preds - targets)).sum() / denom
-    return new_w, new_b, loss, p_mae
+    (loss, (p_mae, pred_std)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    new_params = jax.tree_util.tree_map(lambda p, g: p - lr * g, params, grads)
+    return core.freeze(new_params), loss, p_mae, pred_std
 
 
 def structural_difficulty_surrogate(
@@ -732,6 +801,12 @@ def main(config=None, project="JAXUED_TEST"):
             raise ValueError("--plwm_online_frontier_guided and --plwm_task_aware_guided are mutually exclusive.")
         if config["plwm_surrogate_guided"] and config["plwm_task_aware_guided"] and not config["plwm_use_maze_ae"]:
             raise ValueError("--plwm_task_aware_guided currently requires --plwm_use_maze_ae")
+        if int(config["plwm_frontier_hidden_dim"]) < 1:
+            raise ValueError("--plwm_frontier_hidden_dim must be >= 1.")
+        if int(config["plwm_frontier_ensemble_size"]) < 1:
+            raise ValueError("--plwm_frontier_ensemble_size must be >= 1.")
+        if int(config["plwm_frontier_novelty_knn"]) < 1:
+            raise ValueError("--plwm_frontier_novelty_knn must be >= 1.")
 
         if config["plwm_use_maze_ae"]:
             # Grid-based CNN AE path — load only the MazeAE checkpoint
@@ -797,6 +872,15 @@ def main(config=None, project="JAXUED_TEST"):
                 f"branch={config['plwm_surrogate_weight_branches']}), "
                 f"require_solvable={config['plwm_surrogate_require_solvable']}"
             )
+            if config["plwm_online_frontier_guided"]:
+                print(
+                    "Frontier ensemble: "
+                    f"hidden={config['plwm_frontier_hidden_dim']}, "
+                    f"ensemble={config['plwm_frontier_ensemble_size']}, "
+                    f"uncertainty_w={config['plwm_frontier_uncertainty_weight']}, "
+                    f"novelty_w={config['plwm_frontier_novelty_weight']}, "
+                    f"novelty_knn={config['plwm_frontier_novelty_knn']}"
+                )
         elif config["plwm_online_frontier_guided"] or config["plwm_task_aware_guided"]:
             raise ValueError(
                 "--plwm_online_frontier_guided and --plwm_task_aware_guided require "
@@ -852,14 +936,15 @@ def main(config=None, project="JAXUED_TEST"):
                 / config["num_updates"]
             )
             return config["lr"] * frac
-        obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
+        rng_model, rng_frontier, rng_level = jax.random.split(rng, 3)
+        obs, _ = env.reset_to_level(rng_level, sample_random_level(rng_level), env_params)
         obs = jax.tree_util.tree_map(
             lambda x: jnp.repeat(jnp.repeat(x[None, ...], config["num_train_envs"], axis=0)[None, ...], 256, axis=0),
             obs,
         )
         init_x = (obs, jnp.zeros((256, config["num_train_envs"])))
         network = ActorCritic(env.action_space(env_params).n)
-        network_params = network.init(rng, init_x, ActorCritic.initialize_carry((config["num_train_envs"],)))
+        network_params = network.init(rng_model, init_x, ActorCritic.initialize_carry((config["num_train_envs"],)))
         tx = optax.chain(
             optax.clip_by_global_norm(config["max_grad_norm"]),
             optax.adam(learning_rate=linear_schedule, eps=1e-5),
@@ -894,11 +979,16 @@ def main(config=None, project="JAXUED_TEST"):
             replay_last_level_batch=pholder_level_batch,
             replay_last_level_inds=pholder_level_inds,
             mutation_last_level_batch=pholder_level_batch,
-            frontier_w=jnp.zeros((frontier_feature_dim,), dtype=jnp.float32),
-            frontier_b=jnp.array(0.0, dtype=jnp.float32),
+            frontier_params=init_frontier_params(
+                rng_frontier,
+                frontier_feature_dim,
+                int(config["plwm_frontier_hidden_dim"]),
+                int(config["plwm_frontier_ensemble_size"]),
+            ),
             frontier_updates=0,
             frontier_last_loss=jnp.array(0.0, dtype=jnp.float32),
             frontier_last_p_mae=jnp.array(0.0, dtype=jnp.float32),
+            frontier_last_std=jnp.array(0.0, dtype=jnp.float32),
             plwm_pca_eigvecs=jnp.eye(plwm_latent_dim, dtype=jnp.float32),
             plwm_pca_eigvals=jnp.ones(plwm_latent_dim, dtype=jnp.float32),
         )
@@ -1015,11 +1105,11 @@ def main(config=None, project="JAXUED_TEST"):
                 float(config["success_ema_alpha"]),
             )
 
-            frontier_w = train_state.frontier_w
-            frontier_b = train_state.frontier_b
+            frontier_params = train_state.frontier_params
             frontier_updates_inc = jnp.array(0, dtype=jnp.int32)
             frontier_last_loss = train_state.frontier_last_loss
             frontier_last_p_mae = train_state.frontier_last_p_mae
+            frontier_last_std = train_state.frontier_last_std
             if (
                 config["use_plwm_mutation"]
                 and config["plwm_surrogate_guided"]
@@ -1056,9 +1146,8 @@ def main(config=None, project="JAXUED_TEST"):
                     1.0,
                     new_success_obs_count / float(config["plwm_frontier_conf_ref"]),
                 )
-                frontier_w, frontier_b, frontier_last_loss, frontier_last_p_mae = frontier_update_step(
-                    frontier_w,
-                    frontier_b,
+                frontier_params, frontier_last_loss, frontier_last_p_mae, frontier_last_std = frontier_update_step(
+                    frontier_params,
                     replay_features,
                     frontier_targets,
                     frontier_weights,
@@ -1107,11 +1196,11 @@ def main(config=None, project="JAXUED_TEST"):
                 num_replay_updates=train_state.num_replay_updates + 1,
                 replay_last_level_batch=levels,
                 replay_last_level_inds=level_inds,
-                frontier_w=frontier_w,
-                frontier_b=frontier_b,
+                frontier_params=frontier_params,
                 frontier_updates=train_state.frontier_updates + frontier_updates_inc,
                 frontier_last_loss=frontier_last_loss,
                 frontier_last_p_mae=frontier_last_p_mae,
+                frontier_last_std=frontier_last_std,
             )
             return (rng, train_state), metrics
         
@@ -1199,12 +1288,18 @@ def main(config=None, project="JAXUED_TEST"):
                                 cand_preds["static_reg"],
                                 cand_preds["valid_prob"],
                             )
-                            p_frontier = frontier_predict_prob(
+                            p_frontier, p_frontier_std = frontier_predict_stats(
                                 cand_features,
-                                train_state.frontier_w,
-                                train_state.frontier_b,
-                            ).reshape((batch_size, num_candidates))
+                                train_state.frontier_params,
+                            )
+                            p_frontier = p_frontier.reshape((batch_size, num_candidates))
+                            p_frontier_std = p_frontier_std.reshape((batch_size, num_candidates))
                             l_frontier = p_frontier * (1.0 - p_frontier)
+                            novelty_bonus = frontier_candidate_novelty(
+                                candidate_latents,
+                                parent_latents,
+                                max(1, int(config["plwm_frontier_novelty_knn"])),
+                            )
 
                             task_scores = plwm_scoring.task_aware_objective(
                                 p_pred=p_frontier,
@@ -1223,7 +1318,11 @@ def main(config=None, project="JAXUED_TEST"):
                                 high=float(config["plwm_target_success_high"]),
                                 delta_bfs_norm=float(config["plwm_task_delta_bfs_steps"]) / 169.0,
                             )
-                            surrogate_scores = task_scores
+                            surrogate_scores = (
+                                task_scores
+                                + float(config["plwm_frontier_uncertainty_weight"]) * p_frontier_std
+                                + float(config["plwm_frontier_novelty_weight"]) * novelty_bonus
+                            )
                         elif config["plwm_task_aware_guided"]:
                             parent_preds = predict_task_targets(maze_full_params, parent_grids)
                             candidate_grids_flat = jax.vmap(maze_level_to_grid)(
@@ -1336,12 +1435,18 @@ def main(config=None, project="JAXUED_TEST"):
                                 cand_struct["static_reg"],
                                 cand_struct["valid_prob"],
                             )
-                            p_frontier = frontier_predict_prob(
+                            p_frontier, p_frontier_std = frontier_predict_stats(
                                 cand_features,
-                                train_state.frontier_w,
-                                train_state.frontier_b,
-                            ).reshape((batch_size, num_candidates))
+                                train_state.frontier_params,
+                            )
+                            p_frontier = p_frontier.reshape((batch_size, num_candidates))
+                            p_frontier_std = p_frontier_std.reshape((batch_size, num_candidates))
                             l_frontier = p_frontier * (1.0 - p_frontier)
+                            novelty_bonus = frontier_candidate_novelty(
+                                candidate_latents,
+                                parent_latents,
+                                max(1, int(config["plwm_frontier_novelty_knn"])),
+                            )
                             surrogate_scores = plwm_scoring.task_aware_objective(
                                 p_pred=p_frontier,
                                 learnability_pred=l_frontier,
@@ -1358,6 +1463,11 @@ def main(config=None, project="JAXUED_TEST"):
                                 low=float(config["plwm_target_success_low"]),
                                 high=float(config["plwm_target_success_high"]),
                                 delta_bfs_norm=float(config["plwm_task_delta_bfs_steps"]) / 169.0,
+                            )
+                            surrogate_scores = (
+                                surrogate_scores
+                                + float(config["plwm_frontier_uncertainty_weight"]) * p_frontier_std
+                                + float(config["plwm_frontier_novelty_weight"]) * novelty_bonus
                             )
                         else:
                             surrogate_scores_flat = structural_difficulty_surrogate(
@@ -1813,8 +1923,18 @@ if __name__=="__main__":
                        help="Learning rate for online frontier estimator SGD updates.")
     group.add_argument("--plwm_frontier_l2", type=float, default=1e-4,
                        help="L2 regularization for online frontier estimator weights.")
+    group.add_argument("--plwm_frontier_hidden_dim", type=int, default=64,
+                       help="Hidden width of each frontier ensemble member.")
+    group.add_argument("--plwm_frontier_ensemble_size", type=int, default=4,
+                       help="Number of ensemble members in the frontier scorer.")
     group.add_argument("--plwm_frontier_conf_ref", type=float, default=20.0,
                        help="Confidence reference count in w=min(1,count/ref) for online frontier updates.")
+    group.add_argument("--plwm_frontier_uncertainty_weight", type=float, default=0.25,
+                       help="Bonus weight on frontier ensemble std during candidate ranking.")
+    group.add_argument("--plwm_frontier_novelty_weight", type=float, default=0.15,
+                       help="Bonus weight on explicit latent novelty during candidate ranking.")
+    group.add_argument("--plwm_frontier_novelty_knn", type=int, default=3,
+                       help="Number of nearest replay parents used for novelty scoring.")
     group.add_argument("--plwm_target_success_low", type=float, default=0.3,
                        help="Lower bound of the target success-probability band.")
     group.add_argument("--plwm_target_success_high", type=float, default=0.7,
