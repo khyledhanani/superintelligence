@@ -515,9 +515,12 @@ def main(config=None, project="JAXUED_TEST"):
 
     if _needs_vae and not config.get("use_clutr_vae"):
         # CNN-VAE path (default when --use_cmaes without --use_clutr_vae)
-        _ckpt_abs = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vae', 'checkpoints', 'cnn_vae', 'default')
-        )
+        if config.get("vae_checkpoint_path"):
+            _ckpt_abs = os.path.abspath(config["vae_checkpoint_path"])
+        else:
+            _ckpt_abs = os.path.abspath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vae', 'checkpoints', 'cnn_vae', 'default')
+            )
         _checkpointer = ocp.PyTreeCheckpointer()
         _restored = _checkpointer.restore(_ckpt_abs)
         _decoder_params = _restored["params"]["decoder"]
@@ -531,6 +534,7 @@ def main(config=None, project="JAXUED_TEST"):
             return wl[0], gl[0], al[0]                            # each (13, 13)
 
         cnn_base_decode_fn = vae_decode_fn  # Save unwrapped reference for PCA wrapping
+        _base_decode_fn = vae_decode_fn  # Generic reference for PCA wrapping
 
         print(f"[CMA-ES] CNN-VAE loaded from {_ckpt_abs}")
         print(f"[CMA-ES] latent_dim={_cnn_vae_latent_dim}, popsize={config['num_train_envs']}")
@@ -560,6 +564,8 @@ def main(config=None, project="JAXUED_TEST"):
         def vae_encode_fn(tokens):
             return vae.apply({"params": vae_params}, tokens, train=False, method=vae.encode)
 
+        _base_decode_fn = vae_decode_fn  # Generic reference for PCA wrapping
+
         print(f"[CMA-ES] CluttrVAE loaded from {config['vae_checkpoint_path']}")
         print(f"[CMA-ES] latent_dim={vae_cfg['latent_dim']}, popsize={config['num_train_envs']}")
 
@@ -574,13 +580,20 @@ def main(config=None, project="JAXUED_TEST"):
 
     # --- PCA-space CMA-ES setup (Stage 1: variance-pruned dims) ---
     _pca_stage = 0  # 0 = no PCA, 1 = variance-pruned, 2 = buffer PCA
+    _last_pca_refit_step = 0
     _effective_latent_dim = _latent_dim_for_cmaes if config["use_cmaes"] else None
 
-    if config.get("use_pca_search") and config["use_cmaes"] and not config.get("use_clutr_vae"):
+    if config.get("use_pca_search") and config["use_cmaes"]:
         import numpy as _np_pca
 
         # Stage 1: Select active dims via mean_layer weight norms (no dataset needed)
-        _mean_layer_kernel = _np_pca.array(_cnn_vae_params['mean_layer']['kernel'])  # (512, 64)
+        # Both CNN-VAE and CluttrVAE have a mean_layer Dense(latent_dim)
+        if config.get("use_clutr_vae"):
+            _mean_layer_kernel = _np_pca.array(vae_params['mean_layer']['kernel'])  # (600, 64)
+            _vae_latent_dim = vae_cfg["latent_dim"]
+        else:
+            _mean_layer_kernel = _np_pca.array(_cnn_vae_params['mean_layer']['kernel'])  # (512, 64)
+            _vae_latent_dim = _cnn_vae_latent_dim
         print(f"[PCA Stage 1] Analyzing mean_layer weights: {_mean_layer_kernel.shape}")
 
         _pca_stage1_k = config.get("pca_stage1_k")  # None = auto
@@ -588,20 +601,20 @@ def main(config=None, project="JAXUED_TEST"):
             _mean_layer_kernel, K=_pca_stage1_k, cum_threshold=0.85
         )
         _cumnorm_pct = _per_dim_norms[_kept_dims].sum() / _per_dim_norms.sum() * 100
-        print(f"[PCA Stage 1] Keeping {_K_stage1} of 64 dims (cumulative norm: {_cumnorm_pct:.1f}%)")
+        print(f"[PCA Stage 1] Keeping {_K_stage1} of {_vae_latent_dim} dims (cumulative norm: {_cumnorm_pct:.1f}%)")
         print(f"[PCA Stage 1] Kept dims: {_kept_dims}")
 
         # Wrap decode function for Stage 1
-        _mu_mean_zeros = jnp.zeros(_cnn_vae_latent_dim)  # Use VAE prior mean (zeros) for dropped dims
+        _mu_mean_zeros = jnp.zeros(_vae_latent_dim)  # Use VAE prior mean (zeros) for dropped dims
         _kept_dims_jnp = jnp.array(_kept_dims, dtype=jnp.int32)
-        vae_decode_fn = make_variance_pruned_decode_fn(cnn_base_decode_fn, _mu_mean_zeros, _kept_dims_jnp)
+        vae_decode_fn = make_variance_pruned_decode_fn(_base_decode_fn, _mu_mean_zeros, _kept_dims_jnp)
         _effective_latent_dim = _K_stage1
 
         # Reinitialize CMAESManager with reduced dims
         cmaes_mgr = CMAESManager(
             popsize=config["num_train_envs"],
             latent_dim=_K_stage1,
-            sigma_init=config["cmaes_sigma_init"],  # Keep same sigma for Stage 1 (latent space, not whitened)
+            sigma_init=config["cmaes_sigma_init"],
         )
         print(f"[PCA Stage 1] CMAESManager reinitialized: latent_dim={_K_stage1}, sigma={config['cmaes_sigma_init']}")
 
@@ -1425,6 +1438,7 @@ def main(config=None, project="JAXUED_TEST"):
             wandb.log({
                 "pca/stage": _pca_stage,
                 "pca/K": _effective_latent_dim or 0,
+                "pca/last_refit_step": _last_pca_refit_step,
             }, commit=False)
         if config["checkpoint_save_interval"] > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
@@ -1450,14 +1464,22 @@ def main(config=None, project="JAXUED_TEST"):
         if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
             dump_buffer(runner_state[1], updates_so_far // 1000)
 
-        # === PCA Stage 2 transition ===
-        if (config.get("use_pca_search") and config["use_cmaes"]
-                and not config.get("use_clutr_vae")
-                and _pca_stage == 1
-                and updates_so_far >= config.get("pca_stage2_step", 10000)):
+        # === PCA Stage 2 transition / periodic refit ===
+        _should_refit_pca = False
+        _is_initial_transition = False
+        if (config.get("use_pca_search") and config["use_cmaes"]):
+            if _pca_stage == 1 and updates_so_far >= config.get("pca_stage2_step", 10000):
+                _should_refit_pca = True
+                _is_initial_transition = True
+            elif (_pca_stage == 2
+                  and config.get("pca_refit_interval")
+                  and updates_so_far - _last_pca_refit_step >= config["pca_refit_interval"]):
+                _should_refit_pca = True
 
+        if _should_refit_pca:
+            _refit_label = "[PCA Stage 2]" if _is_initial_transition else "[PCA Refit]"
             print(f"\n{'='*60}")
-            print(f"[PCA Stage 2] Transitioning at update {updates_so_far}...")
+            print(f"{_refit_label} {'Transitioning' if _is_initial_transition else 'Refitting'} at update {updates_so_far}...")
 
             # Step 1: Extract buffer levels and encode to mu vectors
             ts = runner_state[1]
@@ -1468,25 +1490,35 @@ def main(config=None, project="JAXUED_TEST"):
             min_buf_for_pca = K_stage2 * 10
 
             if buf_size < min_buf_for_pca:
-                print(f"[PCA Stage 2] WARNING: Buffer too small ({buf_size} < {min_buf_for_pca}). "
-                      f"Staying in Stage 1.")
+                print(f"{_refit_label} WARNING: Buffer too small ({buf_size} < {min_buf_for_pca}). "
+                      f"Skipping.")
             else:
-                print(f"[PCA Stage 2] Buffer has {buf_size} levels. Encoding to mu vectors...")
+                print(f"{_refit_label} Buffer has {buf_size} levels. Encoding to mu vectors...")
 
                 buffer_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], sampler["levels"])
                 tokens_jax = jax.vmap(level_to_tokens)(buffer_levels)  # (buf_size, 52)
                 tokens_np = np.array(tokens_jax)  # CRITICAL: convert to numpy before clutr_to_grid
 
-                mu_buf = encode_mazes_to_mu(_cnn_vae_params, tokens_np, latent_dim=_cnn_vae_latent_dim)
-                print(f"[PCA Stage 2] Encoded {buf_size} buffer levels -> mu ({mu_buf.shape})")
+                if config.get("use_clutr_vae"):
+                    # CluttrVAE: encode tokens directly via vae_encode_fn
+                    mu_list = []
+                    _enc_batch = 256
+                    for _s in range(0, buf_size, _enc_batch):
+                        _e = min(_s + _enc_batch, buf_size)
+                        _mean, _ = vae_encode_fn(tokens_jax[_s:_e])
+                        mu_list.append(np.array(_mean))
+                    mu_buf = np.concatenate(mu_list, axis=0)
+                else:
+                    mu_buf = encode_mazes_to_mu(_cnn_vae_params, tokens_np, latent_dim=_cnn_vae_latent_dim)
+                print(f"{_refit_label} Encoded {buf_size} buffer levels -> mu ({mu_buf.shape})")
 
                 # Step 2: Compute PCA
                 mu_mean_s2, pc_axes_s2, pc_stds_s2, evr_s2 = compute_pca_axes(mu_buf, K_stage2)
-                print(f"[PCA Stage 2] Top {K_stage2} PCs explain {evr_s2.sum()*100:.1f}% variance")
+                print(f"{_refit_label} Top {K_stage2} PCs explain {evr_s2.sum()*100:.1f}% variance")
 
                 # Step 3: Wrap decode function with PCA projection
                 vae_decode_fn = make_pc_decode_fn(
-                    cnn_base_decode_fn,
+                    _base_decode_fn,
                     jnp.array(mu_mean_s2),
                     jnp.array(pc_axes_s2),
                     jnp.array(pc_stds_s2),
@@ -1499,7 +1531,7 @@ def main(config=None, project="JAXUED_TEST"):
                     latent_dim=K_stage2,
                     sigma_init=_sigma_s2,
                 )
-                print(f"[PCA Stage 2] CMAESManager reinitialized: latent_dim={K_stage2}, sigma={_sigma_s2}")
+                print(f"{_refit_label} CMAESManager reinitialized: latent_dim={K_stage2}, sigma={_sigma_s2}")
 
                 # Step 5: Reinitialize es_state and inject into runner_state
                 rng_cur, ts_cur = runner_state
@@ -1513,20 +1545,27 @@ def main(config=None, project="JAXUED_TEST"):
                 # cmaes_mgr and vae_decode_fn. By reassigning above and re-jitting,
                 # JAX will trace fresh functions with the new objects.
                 train_and_eval_step_jitted = jax.jit(train_and_eval_step)
-                print(f"[PCA Stage 2] JIT recompilation scheduled (next call will retrace)")
+                print(f"{_refit_label} JIT recompilation scheduled (next call will retrace)")
 
                 _pca_stage = 2
                 _effective_latent_dim = K_stage2
+                _last_pca_refit_step = updates_so_far
 
-                # Log transition to WandB
+                # Switch CMA-ES reset interval after PCA transition
+                if _is_initial_transition and config.get("cmaes_reset_interval_post_pca"):
+                    _old_interval = config["cmaes_reset_interval"]
+                    config.update({"cmaes_reset_interval": config["cmaes_reset_interval_post_pca"]}, allow_val_change=True)
+                    print(f"{_refit_label} CMA-ES reset interval: {_old_interval} -> {config['cmaes_reset_interval']}")
+
+                # Log transition/refit to WandB
                 wandb.log({
                     "pca/stage": 2,
                     "pca/K": K_stage2,
                     "pca/explained_var": float(evr_s2.sum()),
-                    "pca/transition_step": updates_so_far,
+                    "pca/refit_step": updates_so_far,
                 }, commit=False)
 
-                print(f"[PCA Stage 2] Transition complete. CMA-ES now searching in {K_stage2}-dim PCA space.")
+                print(f"{_refit_label} Complete. CMA-ES now searching in {K_stage2}-dim PCA space.")
                 print(f"{'='*60}\n")
 
     # === End-of-run buffer dump ===
@@ -1827,6 +1866,8 @@ if __name__=="__main__":
                        help="CMA-ES population size. Overrides num_train_envs when set (they must be equal).")
     group.add_argument("--cmaes_reset_interval", type=int, default=500,
                        help="Reset CMA-ES every N DR updates to prevent stagnation")
+    group.add_argument("--cmaes_reset_interval_post_pca", type=int, default=None,
+                       help="Switch CMA-ES reset interval after PCA Stage 2 (default: keep same)")
     group.add_argument("--save_cmaes_populations", action=argparse.BooleanOptionalAction, default=True,
                        help="Save CMA-ES population archive before each reset for latent visualization")
     # === PCA-SPACE CMA-ES CONFIG ===
@@ -1844,6 +1885,8 @@ if __name__=="__main__":
                        help="Override Stage 1 K (default: auto via 85%% cumulative variance)")
     group.add_argument("--pca_sigma_init", type=float, default=0.5,
                        help="CMA-ES sigma_init for Stage 2 (whitened PCA space, default: 0.5)")
+    group.add_argument("--pca_refit_interval", type=int, default=None,
+                       help="Refit PCA every N updates after Stage 2 (default: None = refit once)")
     # === GCS CONFIG ===
     group.add_argument("--gcs_bucket", type=str, default=None,
                        help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
