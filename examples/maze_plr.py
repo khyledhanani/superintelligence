@@ -34,6 +34,7 @@ from es.env_bridge import level_to_cluttr_sequence, cluttr_sequence_to_level
 from es.maze_ae import (
     load_maze_ae_params, extract_maze_encoder_params, extract_maze_decoder_params,
     maze_level_to_grid, encode_maze_levels, decode_maze_latents, predict_task_targets,
+    compute_structural_targets,
 )
 from es import plwm_scoring
 from es.online_level_model import (
@@ -510,6 +511,24 @@ def build_frontier_features(
     return jnp.concatenate([z, s, v], axis=-1)
 
 
+def compute_structural_frontier_stats(levels: Level) -> dict[str, chex.Array]:
+    """Build CLUTTR-path frontier features from decoded level geometry."""
+    targets = compute_structural_targets(
+        levels.wall_map,
+        levels.goal_pos,
+        levels.agent_pos,
+    )
+    valid_prob = jnp.clip(targets[:, 0], 0.0, 1.0)
+    static_reg = jnp.clip(targets[:, 1:], 0.0, 1.0)
+    return {
+        "static_reg": static_reg,
+        "valid_prob": valid_prob,
+        "invalid_prob": 1.0 - valid_prob,
+        "wall_density_pred": static_reg[:, 0],
+        "bfs_norm_pred": static_reg[:, 1],
+    }
+
+
 def frontier_predict_prob(
     features: chex.Array,
     w: chex.Array,
@@ -713,8 +732,6 @@ def main(config=None, project="JAXUED_TEST"):
             raise ValueError("--plwm_online_frontier_guided and --plwm_task_aware_guided are mutually exclusive.")
         if config["plwm_surrogate_guided"] and config["plwm_task_aware_guided"] and not config["plwm_use_maze_ae"]:
             raise ValueError("--plwm_task_aware_guided currently requires --plwm_use_maze_ae")
-        if config["plwm_surrogate_guided"] and config["plwm_online_frontier_guided"] and not config["plwm_use_maze_ae"]:
-            raise ValueError("--plwm_online_frontier_guided currently requires --plwm_use_maze_ae")
 
         if config["plwm_use_maze_ae"]:
             # Grid-based CNN AE path — load only the MazeAE checkpoint
@@ -755,6 +772,7 @@ def main(config=None, project="JAXUED_TEST"):
             full_vae_params = load_vae_params(plwm_checkpoint_path)
             encoder_params = extract_encoder_params(full_vae_params)
             decoder_params = extract_decoder_params(full_vae_params)
+            frontier_feature_dim = int(encoder_params["mean_layer"]["kernel"].shape[-1]) + 6 + 1
             print(
                 f"PLWM mutation enabled (CLUTTR VAE): latent_dim={me_latent_dim}, "
                 f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
@@ -1006,20 +1024,33 @@ def main(config=None, project="JAXUED_TEST"):
                 config["use_plwm_mutation"]
                 and config["plwm_surrogate_guided"]
                 and config["plwm_online_frontier_guided"]
-                and config["plwm_use_maze_ae"]
             ):
-                replay_grids = jax.vmap(maze_level_to_grid)(
-                    levels.wall_map,
-                    levels.goal_pos,
-                    levels.agent_pos,
-                )
-                replay_latents = encode_maze_levels(maze_encoder_params, replay_grids)
-                replay_preds = predict_task_targets(maze_full_params, replay_grids)
-                replay_features = build_frontier_features(
-                    replay_latents,
-                    replay_preds["static_reg"],
-                    replay_preds["valid_prob"],
-                )
+                if config["plwm_use_maze_ae"]:
+                    replay_grids = jax.vmap(maze_level_to_grid)(
+                        levels.wall_map,
+                        levels.goal_pos,
+                        levels.agent_pos,
+                    )
+                    replay_latents = encode_maze_levels(maze_encoder_params, replay_grids)
+                    replay_preds = predict_task_targets(maze_full_params, replay_grids)
+                    replay_features = build_frontier_features(
+                        replay_latents,
+                        replay_preds["static_reg"],
+                        replay_preds["valid_prob"],
+                    )
+                else:
+                    replay_seqs = jax.vmap(level_to_cluttr_sequence)(
+                        levels.wall_map,
+                        levels.goal_pos,
+                        levels.agent_pos,
+                    )
+                    replay_latents = encode_levels_to_latents(encoder_params, replay_seqs)
+                    replay_preds = compute_structural_frontier_stats(levels)
+                    replay_features = build_frontier_features(
+                        replay_latents,
+                        replay_preds["static_reg"],
+                        replay_preds["valid_prob"],
+                    )
                 frontier_targets = new_success_ema
                 frontier_weights = jnp.minimum(
                     1.0,
@@ -1297,18 +1328,50 @@ def main(config=None, project="JAXUED_TEST"):
                             child_sequences_flat,
                             jax.random.split(rng_levels_key, batch_size * num_candidates),
                         )
-                        surrogate_scores_flat = structural_difficulty_surrogate(
-                            candidate_levels_flat.wall_map,
-                            candidate_levels_flat.goal_pos,
-                            candidate_levels_flat.agent_pos,
-                            weight_bfs=float(config["plwm_surrogate_weight_bfs"]),
-                            weight_slack=float(config["plwm_surrogate_weight_slack"]),
-                            weight_dead_ends=float(config["plwm_surrogate_weight_dead_ends"]),
-                            weight_walls=float(config["plwm_surrogate_weight_walls"]),
-                            weight_branches=float(config["plwm_surrogate_weight_branches"]),
-                            require_solvable=bool(config["plwm_surrogate_require_solvable"]),
-                        )
-                        surrogate_scores = surrogate_scores_flat.reshape((batch_size, num_candidates))
+                        if config["plwm_online_frontier_guided"]:
+                            parent_struct = compute_structural_frontier_stats(parent_levels)
+                            cand_struct = compute_structural_frontier_stats(candidate_levels_flat)
+                            cand_features = build_frontier_features(
+                                flat_latents,
+                                cand_struct["static_reg"],
+                                cand_struct["valid_prob"],
+                            )
+                            p_frontier = frontier_predict_prob(
+                                cand_features,
+                                train_state.frontier_w,
+                                train_state.frontier_b,
+                            ).reshape((batch_size, num_candidates))
+                            l_frontier = p_frontier * (1.0 - p_frontier)
+                            surrogate_scores = plwm_scoring.task_aware_objective(
+                                p_pred=p_frontier,
+                                learnability_pred=l_frontier,
+                                invalid_prob=cand_struct["invalid_prob"].reshape((batch_size, num_candidates)),
+                                bfs_norm_pred=cand_struct["bfs_norm_pred"].reshape((batch_size, num_candidates)),
+                                wall_density_pred=cand_struct["wall_density_pred"].reshape((batch_size, num_candidates)),
+                                parent_bfs_norm=parent_struct["bfs_norm_pred"][:, None],
+                                parent_wall_density=parent_struct["wall_density_pred"][:, None],
+                                a=float(config["plwm_task_weight_a"]),
+                                b=float(config["plwm_task_weight_b"]),
+                                c=float(config["plwm_task_weight_c"]),
+                                d=float(config["plwm_task_weight_d"]),
+                                e=float(config["plwm_task_weight_e"]),
+                                low=float(config["plwm_target_success_low"]),
+                                high=float(config["plwm_target_success_high"]),
+                                delta_bfs_norm=float(config["plwm_task_delta_bfs_steps"]) / 169.0,
+                            )
+                        else:
+                            surrogate_scores_flat = structural_difficulty_surrogate(
+                                candidate_levels_flat.wall_map,
+                                candidate_levels_flat.goal_pos,
+                                candidate_levels_flat.agent_pos,
+                                weight_bfs=float(config["plwm_surrogate_weight_bfs"]),
+                                weight_slack=float(config["plwm_surrogate_weight_slack"]),
+                                weight_dead_ends=float(config["plwm_surrogate_weight_dead_ends"]),
+                                weight_walls=float(config["plwm_surrogate_weight_walls"]),
+                                weight_branches=float(config["plwm_surrogate_weight_branches"]),
+                                require_solvable=bool(config["plwm_surrogate_require_solvable"]),
+                            )
+                            surrogate_scores = surrogate_scores_flat.reshape((batch_size, num_candidates))
                         best_idx = jnp.argmax(surrogate_scores, axis=1)
                         row_idx = jnp.arange(batch_size)
 
