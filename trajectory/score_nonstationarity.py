@@ -33,7 +33,7 @@ GCS_BUCKET = "ucl-ued-project-bucket"
 GCS_PREFIX = "accel"
 RUN_NAME = "accel_sfl"
 SEED = 1
-GCLOUD_BIN = shutil.which("gsutil") or "/cs/student/project_msc/2025/csml/rhautier/google-cloud-sdk/bin/gsutil"
+GCLOUD_BIN = shutil.which("gcloud") or "/cs/student/project_msc/2025/csml/rhautier/google-cloud-sdk/bin/gcloud"
 
 BUFFER_GCS = f"gs://{GCS_BUCKET}/{GCS_PREFIX}/buffer_dumps/{RUN_NAME}/{SEED}/buffer_dump_10k.npz"
 CKPT_GCS_BASE = f"gs://{GCS_BUCKET}/{GCS_PREFIX}/checkpoints/{RUN_NAME}/{SEED}/models"
@@ -92,12 +92,12 @@ class ActorCritic(nn.Module):
 # ── Data loading ────────────────────────────────────────────────────────────
 def download_gcs(gcs_path, local_path):
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    subprocess.run([GCLOUD_BIN, "cp", gcs_path, local_path], check=True)
+    subprocess.run([GCLOUD_BIN, "storage", "cp", gcs_path, local_path], check=True)
 
 
 def download_gcs_dir(gcs_path, local_path):
     os.makedirs(local_path, exist_ok=True)
-    subprocess.run([GCLOUD_BIN, "-m", "cp", "-r", gcs_path, local_path], check=True)
+    subprocess.run([GCLOUD_BIN, "storage", "cp", "-r", gcs_path, local_path], check=True)
 
 
 def load_buffer_levels(buffer_path):
