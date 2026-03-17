@@ -1,0 +1,33 @@
+{
+  "checkpoint": "/Users/khyledhanani/Documents/openend/superintelligence/vae/checkpoints/cnn_vae/run11_1M",
+  "dataset": "/Users/khyledhanani/Documents/openend/superintelligence/vae/datasets/vae_og/train_200k_grids.npz",
+  "dataset_key": "grids",
+  "num_parents": 2000,
+  "latent_dim": 64,
+  "reconstruction_vs_input": {
+    "mean_step_l2": 0.0,
+    "child_solvable_rate": 0.9995,
+    "solvability_flip_rate": 0.0005,
+    "both_solvable_rate": 0.9995,
+    "exact_match_rate": 0.8695,
+    "same_wall_rate": 0.8695,
+    "same_goal_rate": 0.9995,
+    "same_agent_rate": 0.9995,
+    "mean_wall_hamming": 0.20200000703334808,
+    "mean_wall_hamming_frac": 0.001195266260765493,
+    "mean_abs_wall_delta": 0.14900000393390656,
+    "mean_goal_shift": 0.0005000000237487257,
+    "mean_agent_shift": 0.0005000000237487257,
+    "mean_abs_bfs_delta_both_solvable": 0.015507753876938469
+  },
+  "results_csv": "/Users/khyledhanani/Documents/openend/superintelligence/analysis/cnn_vae_locality/locality_results.csv",
+  "sigmas": [
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0
+  ]
+}

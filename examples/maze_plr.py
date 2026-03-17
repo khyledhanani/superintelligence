@@ -36,6 +36,12 @@ from es.maze_ae import (
     maze_level_to_grid, encode_maze_levels, decode_maze_latents, predict_task_targets,
     compute_structural_targets,
 )
+from es.cnn_maze_vae import (
+    load_cnn_vae_params,
+    encode_cnn_vae_levels,
+    decode_cnn_vae_latents,
+    latent_dim_from_params as cnn_vae_latent_dim,
+)
 from es import plwm_scoring
 from es.online_level_model import (
     compute_pca_from_latents,
@@ -84,6 +90,7 @@ class TrainState(BaseTrainState):
     # PCA directions over buffer latents (for --plwm_use_pca_mutation)
     plwm_pca_eigvecs: chex.Array = struct.field(pytree_node=True)   # (D, D)
     plwm_pca_eigvals: chex.Array = struct.field(pytree_node=True)   # (D,)
+    plwm_pca_mean: chex.Array = struct.field(pytree_node=True)      # (D,)
 
 # region PPO helper functions
 def compute_gae(
@@ -603,6 +610,84 @@ def frontier_candidate_novelty(
     return 0.5 * (delta / scale) + 0.5 * (knn / scale)
 
 
+def frontier_candidate_novelty_from_coords(
+    candidate_coords: chex.Array,
+    parent_coords: chex.Array,
+    knn_k: int,
+) -> chex.Array:
+    """Novelty bonus in a user-specified coordinate system, typically whitened PCA."""
+    batch_size, num_candidates, coord_dim = candidate_coords.shape
+    delta = jnp.linalg.norm(candidate_coords - parent_coords[:, None, :], axis=-1)
+    if batch_size <= 1:
+        return delta / jnp.sqrt(float(coord_dim))
+
+    flat = candidate_coords.reshape((batch_size * num_candidates, coord_dim))
+    dists = jnp.linalg.norm(flat[:, None, :] - parent_coords[None, :, :], axis=-1)
+    parent_idx = jnp.repeat(jnp.arange(batch_size), num_candidates)
+    dists = dists.at[jnp.arange(batch_size * num_candidates), parent_idx].set(jnp.inf)
+    knn = jnp.sort(dists, axis=-1)[:, :knn_k].mean(axis=-1).reshape((batch_size, num_candidates))
+    scale = jnp.sqrt(float(coord_dim))
+    return 0.5 * (delta / scale) + 0.5 * (knn / scale)
+
+
+def project_to_whitened_pca(
+    latents: chex.Array,
+    pca_mean: chex.Array,
+    pca_eigvecs: chex.Array,
+    pca_eigvals: chex.Array,
+) -> chex.Array:
+    centered = latents - pca_mean[None, :]
+    coords = centered @ pca_eigvecs.T
+    return coords / jnp.sqrt(jnp.maximum(pca_eigvals[None, :], 1e-8))
+
+
+def build_structured_pca_offset_bank(
+    latent_dim: int,
+    num_candidates: int,
+    local_top_k: int,
+    pc1_scale: float,
+    pc1_fraction: float,
+) -> jnp.ndarray:
+    """Create a small interpretable PCA candidate bank.
+
+    Candidate coefficients live in whitened PCA coordinates. PC1 gets a small
+    dedicated budget because it acts as a coarse global knob; the remaining
+    candidates probe PCs 2..K with signed local steps.
+    """
+    bank = np.zeros((num_candidates, latent_dim), dtype=np.float32)
+    if num_candidates <= 0 or latent_dim <= 0:
+        return jnp.asarray(bank)
+
+    local_ids = list(range(1, min(local_top_k, latent_dim)))
+    if not local_ids:
+        local_ids = [0]
+
+    if latent_dim == 1:
+        for i in range(num_candidates):
+            bank[i, 0] = pc1_scale if (i % 2 == 0) else -pc1_scale
+        return jnp.asarray(bank)
+
+    pc1_count = int(round(pc1_fraction * num_candidates))
+    if pc1_fraction > 0.0:
+        pc1_count = max(2, pc1_count)
+    pc1_count = min(num_candidates, pc1_count)
+    if pc1_count == num_candidates:
+        pc1_count = max(1, num_candidates - 1)
+    if pc1_count % 2 == 1 and pc1_count < num_candidates:
+        pc1_count += 1
+
+    for i in range(pc1_count):
+        bank[i, 0] = pc1_scale if (i % 2 == 0) else -pc1_scale
+
+    for i in range(pc1_count, num_candidates):
+        j = i - pc1_count
+        pc = local_ids[j % len(local_ids)]
+        sign = 1.0 if ((j // len(local_ids)) % 2 == 0) else -1.0
+        bank[i, pc] = sign
+
+    return jnp.asarray(bank)
+
+
 def frontier_update_step(
     params: core.FrozenDict[str, chex.Array],
     features: chex.Array,
@@ -729,6 +814,7 @@ def main(config=None, project="JAXUED_TEST"):
     maze_encoder_params = None
     maze_decoder_params = None
     maze_full_params = None
+    cnn_vae_params = None
     frontier_feature_dim = 1
     me_latent_dim = int(config["me_latent_dim"])
     me_descriptor_mode = str(config["me_descriptor_mode"]).lower()
@@ -799,8 +885,12 @@ def main(config=None, project="JAXUED_TEST"):
             raise ValueError("--use_plwm_mutation and --use_map_elites_mutation are mutually exclusive")
         if config["plwm_online_frontier_guided"] and config["plwm_task_aware_guided"]:
             raise ValueError("--plwm_online_frontier_guided and --plwm_task_aware_guided are mutually exclusive.")
-        if config["plwm_surrogate_guided"] and config["plwm_task_aware_guided"] and not config["plwm_use_maze_ae"]:
-            raise ValueError("--plwm_task_aware_guided currently requires --plwm_use_maze_ae")
+        if config["plwm_use_maze_ae"] and config["plwm_use_cnn_vae"]:
+            raise ValueError("--plwm_use_maze_ae and --plwm_use_cnn_vae are mutually exclusive.")
+        if config["plwm_surrogate_guided"] and config["plwm_task_aware_guided"] and (
+            (not config["plwm_use_maze_ae"]) or config["plwm_use_cnn_vae"]
+        ):
+            raise ValueError("--plwm_task_aware_guided currently requires --plwm_use_maze_ae and does not support --plwm_use_cnn_vae.")
         if int(config["plwm_frontier_hidden_dim"]) < 1:
             raise ValueError("--plwm_frontier_hidden_dim must be >= 1.")
         if int(config["plwm_frontier_ensemble_size"]) < 1:
@@ -835,6 +925,19 @@ def main(config=None, project="JAXUED_TEST"):
             print(
                 f"PLWM mutation enabled (Maze AE, grid-based): "
                 f"sigma={config['plwm_sigma']}, temp={config['plwm_decode_temperature']}"
+            )
+        elif config["plwm_use_cnn_vae"]:
+            cnn_path = config["plwm_cnn_vae_checkpoint"]
+            if cnn_path is None:
+                cnn_path = os.path.join(ROOT_DIR, "vae", "checkpoints", "cnn_vae", "run11_1M")
+            elif not os.path.isabs(cnn_path):
+                cnn_path = os.path.abspath(os.path.join(os.getcwd(), cnn_path))
+            print(f"Loading CNN maze VAE from {cnn_path}...")
+            cnn_vae_params = load_cnn_vae_params(cnn_path)
+            frontier_feature_dim = int(cnn_vae_latent_dim(cnn_vae_params)) + 6 + 1
+            print(
+                "PLWM mutation enabled (CNN VAE, grid-based): "
+                f"sigma={config['plwm_sigma']}, temp=deterministic-walls"
             )
         else:
             # CLUTTR sequence VAE path
@@ -897,10 +1000,20 @@ def main(config=None, project="JAXUED_TEST"):
             elif "Dense_1" in maze_encoder_params:
                 # Deterministic legacy encoder: use last Dense output dim
                 plwm_latent_dim = int(maze_encoder_params["Dense_1"]["kernel"].shape[-1])
+        elif config["plwm_use_cnn_vae"] and cnn_vae_params is not None:
+            plwm_latent_dim = int(cnn_vae_latent_dim(cnn_vae_params))
         elif not config["plwm_use_maze_ae"] and encoder_params is not None:
             # CLUTTR VAE encoder also has mean_layer key
             if "mean_layer" in encoder_params:
                 plwm_latent_dim = int(encoder_params["mean_layer"]["kernel"].shape[-1])
+
+    plwm_pca_offset_bank = build_structured_pca_offset_bank(
+        latent_dim=plwm_latent_dim,
+        num_candidates=int(config["plwm_surrogate_num_candidates"]),
+        local_top_k=int(config["plwm_pca_local_top_k"]),
+        pc1_scale=float(config["plwm_pca_pc1_scale"]),
+        pc1_fraction=float(config["plwm_pca_pc1_candidate_fraction"]),
+    )
 
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
@@ -991,6 +1104,7 @@ def main(config=None, project="JAXUED_TEST"):
             frontier_last_std=jnp.array(0.0, dtype=jnp.float32),
             plwm_pca_eigvecs=jnp.eye(plwm_latent_dim, dtype=jnp.float32),
             plwm_pca_eigvals=jnp.ones(plwm_latent_dim, dtype=jnp.float32),
+            plwm_pca_mean=jnp.zeros(plwm_latent_dim, dtype=jnp.float32),
         )
 
     def train_step(carry: Tuple[chex.PRNGKey, TrainState], _):
@@ -1115,14 +1229,18 @@ def main(config=None, project="JAXUED_TEST"):
                 and config["plwm_surrogate_guided"]
                 and config["plwm_online_frontier_guided"]
             ):
-                if config["plwm_use_maze_ae"]:
+                if config["plwm_use_maze_ae"] or config["plwm_use_cnn_vae"]:
                     replay_grids = jax.vmap(maze_level_to_grid)(
                         levels.wall_map,
                         levels.goal_pos,
                         levels.agent_pos,
                     )
-                    replay_latents = encode_maze_levels(maze_encoder_params, replay_grids)
-                    replay_preds = predict_task_targets(maze_full_params, replay_grids)
+                    if config["plwm_use_maze_ae"]:
+                        replay_latents = encode_maze_levels(maze_encoder_params, replay_grids)
+                        replay_preds = predict_task_targets(maze_full_params, replay_grids)
+                    else:
+                        replay_latents = encode_cnn_vae_levels(cnn_vae_params, replay_grids)
+                        replay_preds = compute_structural_frontier_stats(levels)
                     replay_features = build_frontier_features(
                         replay_latents,
                         replay_preds["static_reg"],
@@ -1238,8 +1356,8 @@ def main(config=None, project="JAXUED_TEST"):
                 batch_size = config["num_train_envs"]
                 num_candidates = int(config["plwm_surrogate_num_candidates"])
 
-                if config["plwm_use_maze_ae"]:
-                    # ---- Grid-based CNN AE path (full wall coverage) ----
+                if config["plwm_use_maze_ae"] or config["plwm_use_cnn_vae"]:
+                    # ---- Grid-based latent model path (MazeAE or CNN-VAE) ----
                     # Convert Level -> (H, W, 3) grid
                     parent_grids = jax.vmap(maze_level_to_grid)(
                         parent_levels.wall_map,
@@ -1248,40 +1366,98 @@ def main(config=None, project="JAXUED_TEST"):
                     )  # (batch, H, W, 3)
 
                     # Encode
-                    parent_latents = encode_maze_levels(maze_encoder_params, parent_grids)
+                    if config["plwm_use_maze_ae"]:
+                        parent_latents = encode_maze_levels(maze_encoder_params, parent_grids)
+                    else:
+                        parent_latents = encode_cnn_vae_levels(cnn_vae_params, parent_grids)
 
                     if config["plwm_surrogate_guided"]:
                         # Sample multiple perturbation candidates per parent and keep the
                         # highest-scoring candidate under the selected ranking objective.
-                        candidate_noise = jax.random.normal(
-                            rng_encode,
-                            (batch_size, num_candidates, parent_latents.shape[-1]),
-                        )
+                        candidate_noise = None
+                        novelty_parent_coords = None
+                        novelty_candidate_coords = None
                         if config["plwm_use_pca_mutation"]:
-                            scaled = candidate_noise * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8)) * float(config["plwm_sigma"])
-                            candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                            if config["plwm_pca_structured_candidates"]:
+                                parent_pca_coords = project_to_whitened_pca(
+                                    parent_latents,
+                                    train_state.plwm_pca_mean,
+                                    train_state.plwm_pca_eigvecs,
+                                    train_state.plwm_pca_eigvals,
+                                )
+                                candidate_offsets_white = (
+                                    float(config["plwm_sigma"])
+                                    * jnp.broadcast_to(
+                                        plwm_pca_offset_bank[None, :, :],
+                                        (batch_size, num_candidates, parent_latents.shape[-1]),
+                                    )
+                                )
+                                scaled = (
+                                    candidate_offsets_white
+                                    * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8))
+                                )
+                                candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                                novelty_parent_coords = parent_pca_coords
+                                novelty_candidate_coords = parent_pca_coords[:, None, :] + candidate_offsets_white
+                            else:
+                                candidate_noise = jax.random.normal(
+                                    rng_encode,
+                                    (batch_size, num_candidates, parent_latents.shape[-1]),
+                                )
+                                scaled = candidate_noise * jnp.sqrt(
+                                    jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8)
+                                ) * float(config["plwm_sigma"])
+                                candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                                if config["plwm_pca_whitened_novelty"]:
+                                    novelty_parent_coords = project_to_whitened_pca(
+                                        parent_latents,
+                                        train_state.plwm_pca_mean,
+                                        train_state.plwm_pca_eigvecs,
+                                        train_state.plwm_pca_eigvals,
+                                    )
+                                    novelty_candidate_coords = project_to_whitened_pca(
+                                        candidate_latents.reshape((batch_size * num_candidates, -1)),
+                                        train_state.plwm_pca_mean,
+                                        train_state.plwm_pca_eigvecs,
+                                        train_state.plwm_pca_eigvals,
+                                    ).reshape((batch_size, num_candidates, -1))
                         else:
+                            candidate_noise = jax.random.normal(
+                                rng_encode,
+                                (batch_size, num_candidates, parent_latents.shape[-1]),
+                            )
                             candidate_latents = (
                                 parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
                             )
                         flat_latents = candidate_latents.reshape((batch_size * num_candidates, -1))
 
-                        candidate_levels_flat = decode_maze_latents(
-                            maze_decoder_params,
-                            flat_latents,
-                            jax.random.split(rng_decode, batch_size * num_candidates),
-                            wall_threshold=0.5,
-                            temperature=float(config["plwm_decode_temperature"]),
-                        )
+                        if config["plwm_use_maze_ae"]:
+                            candidate_levels_flat = decode_maze_latents(
+                                maze_decoder_params,
+                                flat_latents,
+                                jax.random.split(rng_decode, batch_size * num_candidates),
+                                wall_threshold=0.5,
+                                temperature=float(config["plwm_decode_temperature"]),
+                            )
+                        else:
+                            candidate_levels_flat = decode_cnn_vae_latents(
+                                cnn_vae_params,
+                                flat_latents,
+                                rng_decode,
+                            )
 
                         if config["plwm_online_frontier_guided"]:
-                            parent_preds = predict_task_targets(maze_full_params, parent_grids)
-                            candidate_grids_flat = jax.vmap(maze_level_to_grid)(
-                                candidate_levels_flat.wall_map,
-                                candidate_levels_flat.goal_pos,
-                                candidate_levels_flat.agent_pos,
-                            )
-                            cand_preds = predict_task_targets(maze_full_params, candidate_grids_flat)
+                            if config["plwm_use_maze_ae"]:
+                                parent_preds = predict_task_targets(maze_full_params, parent_grids)
+                                candidate_grids_flat = jax.vmap(maze_level_to_grid)(
+                                    candidate_levels_flat.wall_map,
+                                    candidate_levels_flat.goal_pos,
+                                    candidate_levels_flat.agent_pos,
+                                )
+                                cand_preds = predict_task_targets(maze_full_params, candidate_grids_flat)
+                            else:
+                                parent_preds = compute_structural_frontier_stats(parent_levels)
+                                cand_preds = compute_structural_frontier_stats(candidate_levels_flat)
 
                             cand_features = build_frontier_features(
                                 flat_latents,
@@ -1295,11 +1471,18 @@ def main(config=None, project="JAXUED_TEST"):
                             p_frontier = p_frontier.reshape((batch_size, num_candidates))
                             p_frontier_std = p_frontier_std.reshape((batch_size, num_candidates))
                             l_frontier = p_frontier * (1.0 - p_frontier)
-                            novelty_bonus = frontier_candidate_novelty(
-                                candidate_latents,
-                                parent_latents,
-                                max(1, int(config["plwm_frontier_novelty_knn"])),
-                            )
+                            if config["plwm_use_pca_mutation"] and config["plwm_pca_whitened_novelty"]:
+                                novelty_bonus = frontier_candidate_novelty_from_coords(
+                                    novelty_candidate_coords,
+                                    novelty_parent_coords,
+                                    max(1, int(config["plwm_frontier_novelty_knn"])),
+                                )
+                            else:
+                                novelty_bonus = frontier_candidate_novelty(
+                                    candidate_latents,
+                                    parent_latents,
+                                    max(1, int(config["plwm_frontier_novelty_knn"])),
+                                )
 
                             task_scores = plwm_scoring.task_aware_objective(
                                 p_pred=p_frontier,
@@ -1384,14 +1567,21 @@ def main(config=None, project="JAXUED_TEST"):
                         else:
                             child_latents = parent_latents + float(config["plwm_sigma"]) * noise
 
-                        # Decode -> Level (with Gumbel-max sampling + repair)
-                        child_levels = decode_maze_latents(
-                            maze_decoder_params,
-                            child_latents,
-                            jax.random.split(rng_decode, batch_size),
-                            wall_threshold=0.5,
-                            temperature=float(config["plwm_decode_temperature"]),
-                        )
+                        # Decode -> Level
+                        if config["plwm_use_maze_ae"]:
+                            child_levels = decode_maze_latents(
+                                maze_decoder_params,
+                                child_latents,
+                                jax.random.split(rng_decode, batch_size),
+                                wall_threshold=0.5,
+                                temperature=float(config["plwm_decode_temperature"]),
+                            )
+                        else:
+                            child_levels = decode_cnn_vae_latents(
+                                cnn_vae_params,
+                                child_latents,
+                                rng_decode,
+                            )
                 else:
                     # ---- CLUTTR sequence VAE path (legacy, ≤50 walls) ----
                     parent_seqs = jax.vmap(level_to_cluttr_sequence)(
@@ -1403,14 +1593,58 @@ def main(config=None, project="JAXUED_TEST"):
                     parent_latents = encode_levels_to_latents(encoder_params, parent_seqs)
 
                     if config["plwm_surrogate_guided"]:
-                        candidate_noise = jax.random.normal(
-                            rng_encode,
-                            (batch_size, num_candidates, parent_latents.shape[-1]),
-                        )
+                        candidate_noise = None
+                        novelty_parent_coords = None
+                        novelty_candidate_coords = None
                         if config["plwm_use_pca_mutation"]:
-                            scaled = candidate_noise * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8)) * float(config["plwm_sigma"])
-                            candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                            if config["plwm_pca_structured_candidates"]:
+                                parent_pca_coords = project_to_whitened_pca(
+                                    parent_latents,
+                                    train_state.plwm_pca_mean,
+                                    train_state.plwm_pca_eigvecs,
+                                    train_state.plwm_pca_eigvals,
+                                )
+                                candidate_offsets_white = (
+                                    float(config["plwm_sigma"])
+                                    * jnp.broadcast_to(
+                                        plwm_pca_offset_bank[None, :, :],
+                                        (batch_size, num_candidates, parent_latents.shape[-1]),
+                                    )
+                                )
+                                scaled = (
+                                    candidate_offsets_white
+                                    * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8))
+                                )
+                                candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                                novelty_parent_coords = parent_pca_coords
+                                novelty_candidate_coords = parent_pca_coords[:, None, :] + candidate_offsets_white
+                            else:
+                                candidate_noise = jax.random.normal(
+                                    rng_encode,
+                                    (batch_size, num_candidates, parent_latents.shape[-1]),
+                                )
+                                scaled = candidate_noise * jnp.sqrt(
+                                    jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8)
+                                ) * float(config["plwm_sigma"])
+                                candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+                                if config["plwm_pca_whitened_novelty"]:
+                                    novelty_parent_coords = project_to_whitened_pca(
+                                        parent_latents,
+                                        train_state.plwm_pca_mean,
+                                        train_state.plwm_pca_eigvecs,
+                                        train_state.plwm_pca_eigvals,
+                                    )
+                                    novelty_candidate_coords = project_to_whitened_pca(
+                                        candidate_latents.reshape((batch_size * num_candidates, -1)),
+                                        train_state.plwm_pca_mean,
+                                        train_state.plwm_pca_eigvecs,
+                                        train_state.plwm_pca_eigvals,
+                                    ).reshape((batch_size, num_candidates, -1))
                         else:
+                            candidate_noise = jax.random.normal(
+                                rng_encode,
+                                (batch_size, num_candidates, parent_latents.shape[-1]),
+                            )
                             candidate_latents = (
                                 parent_latents[:, None, :] + float(config["plwm_sigma"]) * candidate_noise
                             )
@@ -1442,11 +1676,18 @@ def main(config=None, project="JAXUED_TEST"):
                             p_frontier = p_frontier.reshape((batch_size, num_candidates))
                             p_frontier_std = p_frontier_std.reshape((batch_size, num_candidates))
                             l_frontier = p_frontier * (1.0 - p_frontier)
-                            novelty_bonus = frontier_candidate_novelty(
-                                candidate_latents,
-                                parent_latents,
-                                max(1, int(config["plwm_frontier_novelty_knn"])),
-                            )
+                            if config["plwm_use_pca_mutation"] and config["plwm_pca_whitened_novelty"]:
+                                novelty_bonus = frontier_candidate_novelty_from_coords(
+                                    novelty_candidate_coords,
+                                    novelty_parent_coords,
+                                    max(1, int(config["plwm_frontier_novelty_knn"])),
+                                )
+                            else:
+                                novelty_bonus = frontier_candidate_novelty(
+                                    candidate_latents,
+                                    parent_latents,
+                                    max(1, int(config["plwm_frontier_novelty_knn"])),
+                                )
                             surrogate_scores = plwm_scoring.task_aware_objective(
                                 p_pred=p_frontier,
                                 learnability_pred=l_frontier,
@@ -1767,12 +2008,14 @@ def main(config=None, project="JAXUED_TEST"):
             if _buf_size >= plwm_latent_dim + 1:
                 _chunk_size = 256
                 _latent_chunks = []
-                if config["plwm_use_maze_ae"]:
+                if config["plwm_use_maze_ae"] or config["plwm_use_cnn_vae"]:
                     _grids = extract_buffer_grids(runner_state[1].sampler, eval_env.max_height, eval_env.max_width)
-                    # encode_maze_levels handles both variational and legacy deterministic encoders
                     for _i in range(0, len(_grids), _chunk_size):
                         _chunk = jnp.array(_grids[_i : _i + _chunk_size])
-                        _latent_chunks.append(np.array(encode_maze_levels(maze_encoder_params, _chunk)))
+                        if config["plwm_use_maze_ae"]:
+                            _latent_chunks.append(np.array(encode_maze_levels(maze_encoder_params, _chunk)))
+                        else:
+                            _latent_chunks.append(np.array(encode_cnn_vae_levels(cnn_vae_params, _chunk)))
                 else:
                     # CLUTTR VAE path: extract sequences from buffer and encode
                     _lvls = runner_state[1].sampler["levels"]
@@ -1785,11 +2028,13 @@ def main(config=None, project="JAXUED_TEST"):
                         _latent_chunks.append(np.array(encode_levels_to_latents(encoder_params, _chunk_seqs)))
                 _latents = np.concatenate(_latent_chunks, axis=0)
                 _eigvecs, _eigvals = compute_pca_from_latents(_latents)
+                _mean = _latents.mean(axis=0).astype(np.float32)
                 runner_state = (
                     runner_state[0],
                     runner_state[1].replace(
                         plwm_pca_eigvecs=jnp.array(_eigvecs),
                         plwm_pca_eigvals=jnp.array(_eigvals),
+                        plwm_pca_mean=jnp.array(_mean),
                     ),
                 )
 
@@ -1971,15 +2216,36 @@ if __name__=="__main__":
                        help="Use the grid-based task-aware Maze beta-VAE instead of the CLUTTR sequence "
                             "VAE for PLWM encoding/decoding. Requires --use_plwm_mutation. "
                             "Supports any wall count (no 50-wall truncation).")
+    group.add_argument("--plwm_use_cnn_vae", action=argparse.BooleanOptionalAction, default=False,
+                       help="Use the CNN maze VAE checkpoint for PLWM encoding/decoding. "
+                            "Intended for structural or online-frontier guided PLWM; "
+                            "task-aware-guided PLWM still requires --plwm_use_maze_ae.")
     group.add_argument("--plwm_mae_checkpoint", type=str, default=None,
                        help="Path to the MazeAE checkpoint pickle. Defaults to "
                             "vae/model_maze_ae/checkpoint_final.pkl relative to project root.")
+    group.add_argument("--plwm_cnn_vae_checkpoint", type=str, default=None,
+                       help="Path to the CNN maze VAE Orbax checkpoint directory. Defaults to "
+                            "vae/checkpoints/cnn_vae/run11_1M relative to project root.")
     group.add_argument("--plwm_use_pca_mutation", action=argparse.BooleanOptionalAction, default=False,
                        help="Scale PLWM latent perturbations along PCA directions of the replay buffer "
                             "latents instead of isotropic Gaussian. Requires --use_plwm_mutation "
-                            "--plwm_use_maze_ae.")
+                            "and supports --plwm_use_maze_ae or --plwm_use_cnn_vae.")
     group.add_argument("--plwm_pca_update_every", type=int, default=1,
                        help="Recompute buffer-latent PCA every N eval cycles. Default 1 (every eval).")
+    group.add_argument("--plwm_pca_structured_candidates", action=argparse.BooleanOptionalAction, default=True,
+                       help="When surrogate-guided PCA mutation is enabled, use a structured candidate bank: "
+                            "small signed PC1 probes plus mostly local PCs 2..K.")
+    group.add_argument("--plwm_pca_whitened_novelty", action=argparse.BooleanOptionalAction, default=True,
+                       help="When using PCA mutation with online frontier guidance, compute novelty in "
+                            "whitened PCA coordinates instead of raw latent L2.")
+    group.add_argument("--plwm_pca_local_top_k", type=int, default=5,
+                       help="Number of top PCs reserved for local structured candidates. "
+                            "PC1 is handled separately.")
+    group.add_argument("--plwm_pca_pc1_scale", type=float, default=0.25,
+                       help="Relative scale for explicit PC1 probes inside the structured PCA bank, "
+                            "expressed as a multiplier on --plwm_sigma.")
+    group.add_argument("--plwm_pca_pc1_candidate_fraction", type=float, default=0.25,
+                       help="Fraction of surrogate-guided PCA candidates allocated to explicit PC1 probes.")
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===

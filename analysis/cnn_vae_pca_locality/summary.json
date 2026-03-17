@@ -1,0 +1,30 @@
+{
+  "checkpoint": "/Users/khyledhanani/Documents/openend/superintelligence/vae/checkpoints/cnn_vae/run11_1M",
+  "dataset": "/Users/khyledhanani/Documents/openend/superintelligence/vae/datasets/vae_og/train_200k_grids.npz",
+  "dataset_key": "grids",
+  "pca_fit_count": 5000,
+  "num_parents": 1000,
+  "num_pcs": 5,
+  "step_multipliers": [
+    0.25,
+    0.5,
+    1.0,
+    2.0
+  ],
+  "top5_pca_std": [
+    1.646477460861206,
+    0.745114803314209,
+    0.7403270602226257,
+    0.7290570735931396,
+    0.7110965847969055
+  ],
+  "top5_pca_var_ratio": [
+    0.17193907499313354,
+    0.03521351516246796,
+    0.034762438386678696,
+    0.03371212258934975,
+    0.03207157179713249
+  ],
+  "results_csv": "/Users/khyledhanani/Documents/openend/superintelligence/analysis/cnn_vae_pca_locality/locality_results.csv",
+  "summary_table_csv": "/Users/khyledhanani/Documents/openend/superintelligence/analysis/cnn_vae_pca_locality/summary_table.csv"
+}
