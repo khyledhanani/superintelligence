@@ -76,7 +76,19 @@ class TrainState(BaseTrainState):
     num_mutation_updates: int
     num_plwm_compared: int
     num_plwm_improved: int
+    num_plwm_inserted: int
+    num_plwm_inserted_improved: int
     plwm_last_uphill_fraction: chex.Array
+    plwm_last_insert_fraction: chex.Array
+    plwm_last_accepted_uphill_fraction: chex.Array
+    plwm_delta_score_sum: chex.Array
+    plwm_accepted_delta_score_sum: chex.Array
+    plwm_last_mean_delta_score: chex.Array
+    plwm_last_mean_accepted_delta_score: chex.Array
+    plwm_last_scale_global_fraction: chex.Array
+    plwm_last_scale_meso_fraction: chex.Array
+    plwm_last_scale_local_fraction: chex.Array
+    plwm_last_schedule_progress: chex.Array
     dr_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     replay_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     replay_last_level_inds: chex.Array = struct.field(pytree_node=True)
@@ -460,6 +472,28 @@ def train_state_to_log_dict(
     )
     log["mutation/num_compared"] = train_state.num_plwm_compared
     log["mutation/num_improved"] = train_state.num_plwm_improved
+    log["mutation/last_insert_fraction"] = train_state.plwm_last_insert_fraction
+    log["mutation/cumulative_insert_fraction"] = (
+        train_state.num_plwm_inserted / jnp.maximum(train_state.num_plwm_compared, 1)
+    )
+    log["mutation/num_inserted"] = train_state.num_plwm_inserted
+    log["mutation/last_accepted_uphill_fraction"] = train_state.plwm_last_accepted_uphill_fraction
+    log["mutation/cumulative_accepted_uphill_fraction"] = (
+        train_state.num_plwm_inserted_improved / jnp.maximum(train_state.num_plwm_inserted, 1)
+    )
+    log["mutation/num_inserted_improved"] = train_state.num_plwm_inserted_improved
+    log["mutation/last_mean_delta_score"] = train_state.plwm_last_mean_delta_score
+    log["mutation/cumulative_mean_delta_score"] = (
+        train_state.plwm_delta_score_sum / jnp.maximum(train_state.num_plwm_compared, 1)
+    )
+    log["mutation/last_mean_accepted_delta_score"] = train_state.plwm_last_mean_accepted_delta_score
+    log["mutation/cumulative_mean_accepted_delta_score"] = (
+        train_state.plwm_accepted_delta_score_sum / jnp.maximum(train_state.num_plwm_inserted, 1)
+    )
+    log["mutation/scale_fraction_global"] = train_state.plwm_last_scale_global_fraction
+    log["mutation/scale_fraction_meso"] = train_state.plwm_last_scale_meso_fraction
+    log["mutation/scale_fraction_local"] = train_state.plwm_last_scale_local_fraction
+    log["mutation/schedule_progress"] = train_state.plwm_last_schedule_progress
 
     if use_plwm:
         # Backward-compatible aliases for existing dashboards.
@@ -468,6 +502,20 @@ def train_state_to_log_dict(
         log["plwm/cumulative_uphill_fraction"] = log["mutation/cumulative_uphill_fraction"]
         log["plwm/num_compared"] = log["mutation/num_compared"]
         log["plwm/num_improved"] = log["mutation/num_improved"]
+        log["plwm/last_insert_fraction"] = log["mutation/last_insert_fraction"]
+        log["plwm/cumulative_insert_fraction"] = log["mutation/cumulative_insert_fraction"]
+        log["plwm/num_inserted"] = log["mutation/num_inserted"]
+        log["plwm/last_accepted_uphill_fraction"] = log["mutation/last_accepted_uphill_fraction"]
+        log["plwm/cumulative_accepted_uphill_fraction"] = log["mutation/cumulative_accepted_uphill_fraction"]
+        log["plwm/num_inserted_improved"] = log["mutation/num_inserted_improved"]
+        log["plwm/last_mean_delta_score"] = log["mutation/last_mean_delta_score"]
+        log["plwm/cumulative_mean_delta_score"] = log["mutation/cumulative_mean_delta_score"]
+        log["plwm/last_mean_accepted_delta_score"] = log["mutation/last_mean_accepted_delta_score"]
+        log["plwm/cumulative_mean_accepted_delta_score"] = log["mutation/cumulative_mean_accepted_delta_score"]
+        log["plwm/scale_fraction_global"] = log["mutation/scale_fraction_global"]
+        log["plwm/scale_fraction_meso"] = log["mutation/scale_fraction_meso"]
+        log["plwm/scale_fraction_local"] = log["mutation/scale_fraction_local"]
+        log["plwm/schedule_progress"] = log["mutation/schedule_progress"]
         log["plwm/frontier_updates"] = train_state.frontier_updates
         log["plwm/frontier_last_loss"] = train_state.frontier_last_loss
         log["plwm/frontier_last_p_mae"] = train_state.frontier_last_p_mae
@@ -641,51 +689,195 @@ def project_to_whitened_pca(
     return coords / jnp.sqrt(jnp.maximum(pca_eigvals[None, :], 1e-8))
 
 
-def build_structured_pca_offset_bank(
+def build_signed_pc_bank(
     latent_dim: int,
     num_candidates: int,
-    local_top_k: int,
+    pc_ids: Sequence[int],
+    primary_pc_scale: float = 1.0,
+) -> jnp.ndarray:
+    bank = np.zeros((num_candidates, latent_dim), dtype=np.float32)
+    if num_candidates <= 0 or latent_dim <= 0 or not pc_ids:
+        return jnp.asarray(bank)
+
+    valid_pc_ids = [int(pc) for pc in pc_ids if 0 <= int(pc) < latent_dim]
+    if not valid_pc_ids:
+        valid_pc_ids = [0]
+
+    for i in range(num_candidates):
+        pc = valid_pc_ids[i % len(valid_pc_ids)]
+        sign = 1.0 if ((i // len(valid_pc_ids)) % 2 == 0) else -1.0
+        scale = primary_pc_scale if pc == 0 else 1.0
+        bank[i, pc] = sign * scale
+
+    return jnp.asarray(bank)
+
+
+def build_global_pca_offset_bank(
+    latent_dim: int,
+    num_candidates: int,
+    global_top_k: int,
     pc1_scale: float,
     pc1_fraction: float,
 ) -> jnp.ndarray:
-    """Create a small interpretable PCA candidate bank.
-
-    Candidate coefficients live in whitened PCA coordinates. PC1 gets a small
-    dedicated budget because it acts as a coarse global knob; the remaining
-    candidates probe PCs 2..K with signed local steps.
-    """
+    """Create coarse PCA probes: capped PC1 plus a few top local PCs."""
     bank = np.zeros((num_candidates, latent_dim), dtype=np.float32)
     if num_candidates <= 0 or latent_dim <= 0:
         return jnp.asarray(bank)
 
-    local_ids = list(range(1, min(local_top_k, latent_dim)))
-    if not local_ids:
-        local_ids = [0]
-
     if latent_dim == 1:
-        for i in range(num_candidates):
-            bank[i, 0] = pc1_scale if (i % 2 == 0) else -pc1_scale
-        return jnp.asarray(bank)
+        return build_signed_pc_bank(latent_dim, num_candidates, [0], primary_pc_scale=pc1_scale)
 
+    other_ids = list(range(1, min(global_top_k, latent_dim)))
     pc1_count = int(round(pc1_fraction * num_candidates))
     if pc1_fraction > 0.0:
         pc1_count = max(2, pc1_count)
     pc1_count = min(num_candidates, pc1_count)
-    if pc1_count == num_candidates:
+    if not other_ids:
+        pc1_count = num_candidates
+    elif pc1_count == num_candidates:
         pc1_count = max(1, num_candidates - 1)
     if pc1_count % 2 == 1 and pc1_count < num_candidates:
         pc1_count += 1
 
-    for i in range(pc1_count):
-        bank[i, 0] = pc1_scale if (i % 2 == 0) else -pc1_scale
-
-    for i in range(pc1_count, num_candidates):
-        j = i - pc1_count
-        pc = local_ids[j % len(local_ids)]
-        sign = 1.0 if ((j // len(local_ids)) % 2 == 0) else -1.0
-        bank[i, pc] = sign
-
+    if pc1_count > 0:
+        bank[:pc1_count] = np.asarray(
+            build_signed_pc_bank(latent_dim, pc1_count, [0], primary_pc_scale=pc1_scale)
+        )
+    if pc1_count < num_candidates:
+        bank[pc1_count:] = np.asarray(
+            build_signed_pc_bank(latent_dim, num_candidates - pc1_count, other_ids, primary_pc_scale=pc1_scale)
+        )
     return jnp.asarray(bank)
+
+
+def training_progress_fraction(train_state: TrainState, total_updates: int) -> chex.Array:
+    total = (
+        train_state.num_dr_updates
+        + train_state.num_replay_updates
+        + train_state.num_mutation_updates
+    )
+    return jnp.clip(
+        total / jnp.maximum(jnp.asarray(total_updates, dtype=jnp.float32), 1.0),
+        0.0,
+        1.0,
+    )
+
+
+def annealed_pca_scale_mix(
+    progress: chex.Array,
+    global_start: float,
+    global_end: float,
+    local_start: float,
+    local_end: float,
+) -> chex.Array:
+    global_w = (1.0 - progress) * float(global_start) + progress * float(global_end)
+    local_w = (1.0 - progress) * float(local_start) + progress * float(local_end)
+    meso_w = jnp.maximum(1e-3, 1.0 - global_w - local_w)
+    weights = jnp.stack([global_w, meso_w, local_w], axis=0)
+    return weights / jnp.maximum(weights.sum(), 1e-6)
+
+
+def condition_pca_scale_mix(
+    base_weights: chex.Array,
+    parent_success_ema: chex.Array,
+    low: float,
+    high: float,
+    strength: float,
+) -> chex.Array:
+    band_width = max(float(high) - float(low), 1e-3)
+    outside_dist = jnp.where(
+        parent_success_ema < float(low),
+        float(low) - parent_success_ema,
+        jnp.where(parent_success_ema > float(high), parent_success_ema - float(high), 0.0),
+    )
+    frontier_proximity = jnp.clip(1.0 - outside_dist / band_width, 0.0, 1.0)
+    weights = jnp.broadcast_to(base_weights[None, :], (parent_success_ema.shape[0], 3))
+    weights = weights.at[:, 0].set(weights[:, 0] * (1.0 + float(strength) * (1.0 - frontier_proximity)))
+    weights = weights.at[:, 2].set(weights[:, 2] * (1.0 + float(strength) * frontier_proximity))
+    return weights / jnp.maximum(weights.sum(axis=1, keepdims=True), 1e-6)
+
+
+def expand_multiscale_pca_candidate_offsets(
+    global_bank: chex.Array,
+    meso_bank: chex.Array,
+    local_bank: chex.Array,
+    mix_weights: chex.Array,
+) -> tuple[chex.Array, chex.Array]:
+    """Map per-parent scale weights to a deterministic candidate bank allocation."""
+    num_candidates = global_bank.shape[0]
+    positions = (jnp.arange(num_candidates, dtype=jnp.float32) + 0.5) / jnp.maximum(float(num_candidates), 1.0)
+    global_cut = mix_weights[:, 0:1]
+    meso_cut = mix_weights[:, 0:1] + mix_weights[:, 1:2]
+    is_global = positions[None, :] < global_cut
+    is_meso = (positions[None, :] >= global_cut) & (positions[None, :] < meso_cut)
+    is_local = ~(is_global | is_meso)
+    offsets = jnp.where(
+        is_global[..., None],
+        global_bank[None, :, :],
+        jnp.where(is_meso[..., None], meso_bank[None, :, :], local_bank[None, :, :]),
+    )
+    fractions = jnp.stack(
+        [
+            is_global.astype(jnp.float32).mean(axis=1),
+            is_meso.astype(jnp.float32).mean(axis=1),
+            is_local.astype(jnp.float32).mean(axis=1),
+        ],
+        axis=-1,
+    )
+    return offsets, fractions
+
+
+def build_structured_pca_candidates(
+    parent_latents: chex.Array,
+    parent_success_ema: chex.Array,
+    train_state: TrainState,
+    config: dict,
+    global_bank: chex.Array,
+    meso_bank: chex.Array,
+    local_bank: chex.Array,
+) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+    """Create multi-scale PCA candidates with annealed and parent-conditioned allocation."""
+    progress = training_progress_fraction(train_state, int(config["num_updates"]))
+    base_mix = annealed_pca_scale_mix(
+        progress,
+        config["plwm_pca_global_weight_start"],
+        config["plwm_pca_global_weight_end"],
+        config["plwm_pca_local_weight_start"],
+        config["plwm_pca_local_weight_end"],
+    )
+    mix_weights = condition_pca_scale_mix(
+        base_mix,
+        parent_success_ema,
+        config["plwm_target_success_low"],
+        config["plwm_target_success_high"],
+        config["plwm_pca_success_conditioning"],
+    )
+    candidate_offsets_white_unit, scale_fractions = expand_multiscale_pca_candidate_offsets(
+        global_bank,
+        meso_bank,
+        local_bank,
+        mix_weights,
+    )
+    parent_pca_coords = project_to_whitened_pca(
+        parent_latents,
+        train_state.plwm_pca_mean,
+        train_state.plwm_pca_eigvecs,
+        train_state.plwm_pca_eigvals,
+    )
+    candidate_offsets_white = float(config["plwm_sigma"]) * candidate_offsets_white_unit
+    scaled = candidate_offsets_white * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8))
+    candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
+    novelty_candidate_coords = parent_pca_coords[:, None, :] + candidate_offsets_white
+    schedule_stats = jnp.array(
+        [
+            scale_fractions[:, 0].mean(),
+            scale_fractions[:, 1].mean(),
+            scale_fractions[:, 2].mean(),
+            progress,
+        ],
+        dtype=jnp.float32,
+    )
+    return candidate_latents, parent_pca_coords, novelty_candidate_coords, mix_weights, schedule_stats
 
 
 def frontier_update_step(
@@ -1007,12 +1199,25 @@ def main(config=None, project="JAXUED_TEST"):
             if "mean_layer" in encoder_params:
                 plwm_latent_dim = int(encoder_params["mean_layer"]["kernel"].shape[-1])
 
-    plwm_pca_offset_bank = build_structured_pca_offset_bank(
+    local_pc_ids = list(range(1, min(int(config["plwm_pca_local_top_k"]), plwm_latent_dim)))
+    if not local_pc_ids:
+        local_pc_ids = [0]
+    plwm_pca_global_bank = float(config["plwm_pca_global_scale"]) * build_global_pca_offset_bank(
         latent_dim=plwm_latent_dim,
         num_candidates=int(config["plwm_surrogate_num_candidates"]),
-        local_top_k=int(config["plwm_pca_local_top_k"]),
+        global_top_k=int(config["plwm_pca_global_top_k"]),
         pc1_scale=float(config["plwm_pca_pc1_scale"]),
         pc1_fraction=float(config["plwm_pca_pc1_candidate_fraction"]),
+    )
+    plwm_pca_meso_bank = float(config["plwm_pca_meso_scale"]) * build_signed_pc_bank(
+        latent_dim=plwm_latent_dim,
+        num_candidates=int(config["plwm_surrogate_num_candidates"]),
+        pc_ids=local_pc_ids,
+    )
+    plwm_pca_local_bank = float(config["plwm_pca_local_scale"]) * build_signed_pc_bank(
+        latent_dim=plwm_latent_dim,
+        num_candidates=int(config["plwm_surrogate_num_candidates"]),
+        pc_ids=local_pc_ids,
     )
 
     # Setup the environment
@@ -1087,7 +1292,19 @@ def main(config=None, project="JAXUED_TEST"):
             num_mutation_updates=0,
             num_plwm_compared=0,
             num_plwm_improved=0,
+            num_plwm_inserted=0,
+            num_plwm_inserted_improved=0,
             plwm_last_uphill_fraction=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_insert_fraction=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_accepted_uphill_fraction=jnp.array(0.0, dtype=jnp.float32),
+            plwm_delta_score_sum=jnp.array(0.0, dtype=jnp.float32),
+            plwm_accepted_delta_score_sum=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_mean_delta_score=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_mean_accepted_delta_score=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_scale_global_fraction=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_scale_meso_fraction=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_scale_local_fraction=jnp.array(0.0, dtype=jnp.float32),
+            plwm_last_schedule_progress=jnp.array(0.0, dtype=jnp.float32),
             dr_last_level_batch=pholder_level_batch,
             replay_last_level_batch=pholder_level_batch,
             replay_last_level_inds=pholder_level_inds,
@@ -1173,6 +1390,9 @@ def main(config=None, project="JAXUED_TEST"):
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "me_insertions": jnp.array(0, dtype=jnp.int32),
                 "plwm_batch_uphill_fraction": jnp.array(0.0, dtype=jnp.float32),
+                "plwm_batch_insert_fraction": jnp.array(0.0, dtype=jnp.float32),
+                "plwm_batch_accepted_uphill_fraction": jnp.array(0.0, dtype=jnp.float32),
+                "plwm_batch_mean_delta_score": jnp.array(0.0, dtype=jnp.float32),
             }
             
             train_state = train_state.replace(
@@ -1306,6 +1526,9 @@ def main(config=None, project="JAXUED_TEST"):
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "me_insertions": jnp.array(0, dtype=jnp.int32),
                 "plwm_batch_uphill_fraction": jnp.array(0.0, dtype=jnp.float32),
+                "plwm_batch_insert_fraction": jnp.array(0.0, dtype=jnp.float32),
+                "plwm_batch_accepted_uphill_fraction": jnp.array(0.0, dtype=jnp.float32),
+                "plwm_batch_mean_delta_score": jnp.array(0.0, dtype=jnp.float32),
             }
             
             train_state = train_state.replace(
@@ -1330,6 +1553,7 @@ def main(config=None, project="JAXUED_TEST"):
             sampler = train_state.sampler
             me_archive = train_state.me_archive
             rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
+            plwm_schedule_stats = jnp.zeros((4,), dtype=jnp.float32)
             
             # mutate
             if config["use_map_elites_mutation"]:
@@ -1352,6 +1576,8 @@ def main(config=None, project="JAXUED_TEST"):
                 parent_levels = train_state.replay_last_level_batch
                 parent_level_inds = train_state.replay_last_level_inds
                 parent_scores = train_state.sampler["scores"][parent_level_inds]
+                parent_extras = level_sampler.get_levels_extra(train_state.sampler, parent_level_inds)
+                parent_success_ema = parent_extras["success_ema"]
                 rng_mutate, rng_encode, rng_decode, rng_levels_key = jax.random.split(rng_mutate, 4)
                 batch_size = config["num_train_envs"]
                 num_candidates = int(config["plwm_surrogate_num_candidates"])
@@ -1379,26 +1605,22 @@ def main(config=None, project="JAXUED_TEST"):
                         novelty_candidate_coords = None
                         if config["plwm_use_pca_mutation"]:
                             if config["plwm_pca_structured_candidates"]:
-                                parent_pca_coords = project_to_whitened_pca(
+                                (
+                                    candidate_latents,
+                                    parent_pca_coords,
+                                    novelty_candidate_coords,
+                                    _mix_weights,
+                                    plwm_schedule_stats,
+                                ) = build_structured_pca_candidates(
                                     parent_latents,
-                                    train_state.plwm_pca_mean,
-                                    train_state.plwm_pca_eigvecs,
-                                    train_state.plwm_pca_eigvals,
+                                    parent_success_ema,
+                                    train_state,
+                                    config,
+                                    plwm_pca_global_bank,
+                                    plwm_pca_meso_bank,
+                                    plwm_pca_local_bank,
                                 )
-                                candidate_offsets_white = (
-                                    float(config["plwm_sigma"])
-                                    * jnp.broadcast_to(
-                                        plwm_pca_offset_bank[None, :, :],
-                                        (batch_size, num_candidates, parent_latents.shape[-1]),
-                                    )
-                                )
-                                scaled = (
-                                    candidate_offsets_white
-                                    * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8))
-                                )
-                                candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
                                 novelty_parent_coords = parent_pca_coords
-                                novelty_candidate_coords = parent_pca_coords[:, None, :] + candidate_offsets_white
                             else:
                                 candidate_noise = jax.random.normal(
                                     rng_encode,
@@ -1598,26 +1820,22 @@ def main(config=None, project="JAXUED_TEST"):
                         novelty_candidate_coords = None
                         if config["plwm_use_pca_mutation"]:
                             if config["plwm_pca_structured_candidates"]:
-                                parent_pca_coords = project_to_whitened_pca(
+                                (
+                                    candidate_latents,
+                                    parent_pca_coords,
+                                    novelty_candidate_coords,
+                                    _mix_weights,
+                                    plwm_schedule_stats,
+                                ) = build_structured_pca_candidates(
                                     parent_latents,
-                                    train_state.plwm_pca_mean,
-                                    train_state.plwm_pca_eigvecs,
-                                    train_state.plwm_pca_eigvals,
+                                    parent_success_ema,
+                                    train_state,
+                                    config,
+                                    plwm_pca_global_bank,
+                                    plwm_pca_meso_bank,
+                                    plwm_pca_local_bank,
                                 )
-                                candidate_offsets_white = (
-                                    float(config["plwm_sigma"])
-                                    * jnp.broadcast_to(
-                                        plwm_pca_offset_bank[None, :, :],
-                                        (batch_size, num_candidates, parent_latents.shape[-1]),
-                                    )
-                                )
-                                scaled = (
-                                    candidate_offsets_white
-                                    * jnp.sqrt(jnp.maximum(train_state.plwm_pca_eigvals[None, None, :], 1e-8))
-                                )
-                                candidate_latents = parent_latents[:, None, :] + scaled @ train_state.plwm_pca_eigvecs
                                 novelty_parent_coords = parent_pca_coords
-                                novelty_candidate_coords = parent_pca_coords[:, None, :] + candidate_offsets_white
                             else:
                                 candidate_noise = jax.random.normal(
                                     rng_encode,
@@ -1786,7 +2004,7 @@ def main(config=None, project="JAXUED_TEST"):
             max_returns = compute_max_returns(dones, rewards)
             scores = compute_score(config, dones, values, max_returns, advantages)
             success = rollout_success_from_rewards(rewards)
-            sampler, _ = level_sampler.insert_batch(
+            sampler, inserted_level_inds = level_sampler.insert_batch(
                 sampler,
                 child_levels,
                 scores,
@@ -1801,11 +2019,37 @@ def main(config=None, project="JAXUED_TEST"):
             plwm_batch_uphill_fraction = jnp.array(0.0, dtype=jnp.float32)
             plwm_batch_compared = jnp.array(0, dtype=jnp.int32)
             plwm_batch_improved = jnp.array(0, dtype=jnp.int32)
+            plwm_batch_inserted = jnp.array(0, dtype=jnp.int32)
+            plwm_batch_inserted_improved = jnp.array(0, dtype=jnp.int32)
+            plwm_batch_insert_fraction = jnp.array(0.0, dtype=jnp.float32)
+            plwm_batch_accepted_uphill_fraction = jnp.array(0.0, dtype=jnp.float32)
+            plwm_batch_mean_delta_score = jnp.array(0.0, dtype=jnp.float32)
+            plwm_batch_mean_accepted_delta_score = jnp.array(0.0, dtype=jnp.float32)
+            plwm_batch_delta_score_sum = jnp.array(0.0, dtype=jnp.float32)
+            plwm_batch_accepted_delta_score_sum = jnp.array(0.0, dtype=jnp.float32)
             if not config["use_map_elites_mutation"]:
+                inserted_mask = inserted_level_inds >= 0
+                delta_scores = scores - parent_scores
                 plwm_batch_compared = jnp.array(config["num_train_envs"], dtype=jnp.int32)
                 plwm_batch_improved = jnp.sum(scores > parent_scores).astype(jnp.int32)
+                plwm_batch_inserted = inserted_mask.astype(jnp.int32).sum()
+                plwm_batch_inserted_improved = jnp.sum(inserted_mask & (scores > parent_scores)).astype(jnp.int32)
                 plwm_batch_uphill_fraction = plwm_batch_improved.astype(jnp.float32) / jnp.maximum(
                     plwm_batch_compared.astype(jnp.float32), 1.0
+                )
+                plwm_batch_insert_fraction = plwm_batch_inserted.astype(jnp.float32) / jnp.maximum(
+                    plwm_batch_compared.astype(jnp.float32), 1.0
+                )
+                plwm_batch_accepted_uphill_fraction = plwm_batch_inserted_improved.astype(jnp.float32) / jnp.maximum(
+                    plwm_batch_inserted.astype(jnp.float32), 1.0
+                )
+                plwm_batch_delta_score_sum = delta_scores.sum(dtype=jnp.float32)
+                plwm_batch_mean_delta_score = plwm_batch_delta_score_sum / jnp.maximum(
+                    plwm_batch_compared.astype(jnp.float32), 1.0
+                )
+                plwm_batch_accepted_delta_score_sum = jnp.where(inserted_mask, delta_scores, 0.0).sum(dtype=jnp.float32)
+                plwm_batch_mean_accepted_delta_score = plwm_batch_accepted_delta_score_sum / jnp.maximum(
+                    plwm_batch_inserted.astype(jnp.float32), 1.0
                 )
 
             if config["use_map_elites_mutation"]:
@@ -1857,6 +2101,9 @@ def main(config=None, project="JAXUED_TEST"):
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
                 "me_insertions": me_insertions,
                 "plwm_batch_uphill_fraction": plwm_batch_uphill_fraction,
+                "plwm_batch_insert_fraction": plwm_batch_insert_fraction,
+                "plwm_batch_accepted_uphill_fraction": plwm_batch_accepted_uphill_fraction,
+                "plwm_batch_mean_delta_score": plwm_batch_mean_delta_score,
             }
             
             train_state = train_state.replace(
@@ -1866,7 +2113,19 @@ def main(config=None, project="JAXUED_TEST"):
                 num_mutation_updates=train_state.num_mutation_updates + 1,
                 num_plwm_compared=train_state.num_plwm_compared + plwm_batch_compared,
                 num_plwm_improved=train_state.num_plwm_improved + plwm_batch_improved,
+                num_plwm_inserted=train_state.num_plwm_inserted + plwm_batch_inserted,
+                num_plwm_inserted_improved=train_state.num_plwm_inserted_improved + plwm_batch_inserted_improved,
                 plwm_last_uphill_fraction=plwm_batch_uphill_fraction,
+                plwm_last_insert_fraction=plwm_batch_insert_fraction,
+                plwm_last_accepted_uphill_fraction=plwm_batch_accepted_uphill_fraction,
+                plwm_delta_score_sum=train_state.plwm_delta_score_sum + plwm_batch_delta_score_sum,
+                plwm_accepted_delta_score_sum=train_state.plwm_accepted_delta_score_sum + plwm_batch_accepted_delta_score_sum,
+                plwm_last_mean_delta_score=plwm_batch_mean_delta_score,
+                plwm_last_mean_accepted_delta_score=plwm_batch_mean_accepted_delta_score,
+                plwm_last_scale_global_fraction=plwm_schedule_stats[0],
+                plwm_last_scale_meso_fraction=plwm_schedule_stats[1],
+                plwm_last_scale_local_fraction=plwm_schedule_stats[2],
+                plwm_last_schedule_progress=plwm_schedule_stats[3],
                 mutation_last_level_batch=child_levels,
             )
             return (rng, train_state), metrics
@@ -2233,19 +2492,38 @@ if __name__=="__main__":
     group.add_argument("--plwm_pca_update_every", type=int, default=1,
                        help="Recompute buffer-latent PCA every N eval cycles. Default 1 (every eval).")
     group.add_argument("--plwm_pca_structured_candidates", action=argparse.BooleanOptionalAction, default=True,
-                       help="When surrogate-guided PCA mutation is enabled, use a structured candidate bank: "
-                            "small signed PC1 probes plus mostly local PCs 2..K.")
+                       help="When surrogate-guided PCA mutation is enabled, use a structured multi-scale "
+                            "candidate bank with global/meso/local PCA probes.")
     group.add_argument("--plwm_pca_whitened_novelty", action=argparse.BooleanOptionalAction, default=True,
                        help="When using PCA mutation with online frontier guidance, compute novelty in "
                             "whitened PCA coordinates instead of raw latent L2.")
     group.add_argument("--plwm_pca_local_top_k", type=int, default=5,
                        help="Number of top PCs reserved for local structured candidates. "
                             "PC1 is handled separately.")
+    group.add_argument("--plwm_pca_global_top_k", type=int, default=3,
+                       help="Number of top PCs reserved for coarse global structured candidates.")
     group.add_argument("--plwm_pca_pc1_scale", type=float, default=0.25,
                        help="Relative scale for explicit PC1 probes inside the structured PCA bank, "
                             "expressed as a multiplier on --plwm_sigma.")
     group.add_argument("--plwm_pca_pc1_candidate_fraction", type=float, default=0.25,
                        help="Fraction of surrogate-guided PCA candidates allocated to explicit PC1 probes.")
+    group.add_argument("--plwm_pca_global_scale", type=float, default=1.2,
+                       help="Relative scale multiplier for global structured PCA candidates.")
+    group.add_argument("--plwm_pca_meso_scale", type=float, default=0.7,
+                       help="Relative scale multiplier for meso structured PCA candidates.")
+    group.add_argument("--plwm_pca_local_scale", type=float, default=0.3,
+                       help="Relative scale multiplier for local structured PCA candidates.")
+    group.add_argument("--plwm_pca_global_weight_start", type=float, default=0.35,
+                       help="Early-training fraction of structured candidates allocated to the global scale.")
+    group.add_argument("--plwm_pca_global_weight_end", type=float, default=0.10,
+                       help="Late-training fraction of structured candidates allocated to the global scale.")
+    group.add_argument("--plwm_pca_local_weight_start", type=float, default=0.20,
+                       help="Early-training fraction of structured candidates allocated to the local scale.")
+    group.add_argument("--plwm_pca_local_weight_end", type=float, default=0.60,
+                       help="Late-training fraction of structured candidates allocated to the local scale.")
+    group.add_argument("--plwm_pca_success_conditioning", type=float, default=0.75,
+                       help="How strongly parent success_ema shifts the structured PCA mix toward "
+                            "global moves away from the target success band and local moves near it.")
     # === ENV CONFIG ===
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
