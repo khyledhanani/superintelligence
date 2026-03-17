@@ -10,6 +10,7 @@ Outputs a .npz + plot showing how scores drift as the policy trains.
 import os
 import sys
 import subprocess
+import shutil
 import numpy as np
 
 import jax
@@ -32,7 +33,7 @@ GCS_BUCKET = "ucl-ued-project-bucket"
 GCS_PREFIX = "accel"
 RUN_NAME = "accel_sfl"
 SEED = 1
-GCLOUD_BIN = "/cs/student/project_msc/2025/csml/rhautier/google-cloud-sdk/bin/gsutil"
+GCLOUD_BIN = shutil.which("gsutil") or "/cs/student/project_msc/2025/csml/rhautier/google-cloud-sdk/bin/gsutil"
 
 BUFFER_GCS = f"gs://{GCS_BUCKET}/{GCS_PREFIX}/buffer_dumps/{RUN_NAME}/{SEED}/buffer_dump_10k.npz"
 CKPT_GCS_BASE = f"gs://{GCS_BUCKET}/{GCS_PREFIX}/checkpoints/{RUN_NAME}/{SEED}/models"
