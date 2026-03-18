@@ -484,13 +484,16 @@ def main():
     # SFL scoring (optional — score levels with a trained agent before fine-tuning)
     parser.add_argument("--agent_checkpoint", type=str, default=None,
                         help="Path to Orbax agent checkpoint dir for SFL scoring. "
-                             "If provided, scores levels with agent rollouts before training.")
+                             "If provided, scores extra levels with agent rollouts before training.")
+    parser.add_argument("--extra_train_data", type=str, default=None,
+                        help="Path to additional training data (.npy or .npz) to sample from. "
+                             "Levels are scored with --agent_checkpoint and merged with --train_data.")
     parser.add_argument("--sfl_rollouts", type=int, default=5,
                         help="Number of rollouts per level for SFL scoring")
     parser.add_argument("--sfl_batch_size", type=int, default=32,
                         help="Batch size for SFL rollout scoring")
     parser.add_argument("--sfl_max_levels", type=int, default=100000,
-                        help="Max levels to sample for SFL scoring (0 = use all)")
+                        help="Max extra levels to sample and score (0 = use all extra data)")
 
     # Saving
     parser.add_argument("--output_dir", type=str, default="vae/finetune_checkpoints",
@@ -533,7 +536,7 @@ def main():
     train_tokens = train_data["tokens"]
     print(f"[Fine-tune] Training set: {len(train_tokens)} levels")
 
-    # ── Optional: SFL scoring with agent rollouts ──
+    # ── Optional: score extra levels with agent and merge ──
     if args.agent_checkpoint:
         import orbax.checkpoint as ocp
         print(f"[Fine-tune] Loading agent from {args.agent_checkpoint} for SFL scoring...")
@@ -542,47 +545,104 @@ def main():
             item_handlers=ocp.StandardCheckpointHandler(),
         )
         ws_step = ws_manager.latest_step()
-        ws_ckpt = ws_manager.restore(ws_step)
+        try:
+            ws_ckpt = ws_manager.restore(ws_step)
+        except (ValueError, KeyError) as e:
+            if "Topology mismatch" in str(e) or "was not found" in str(e):
+                print(f"[Fine-tune] Topology mismatch (GPU→TPU) — loading arrays directly...")
+                import tensorstore as ts
+                import os
+                ckpt_dir = os.path.join(args.agent_checkpoint, str(ws_step), "default")
+                def _load_tree(path):
+                    """Recursively load zarr arrays from Orbax checkpoint as numpy."""
+                    meta_path = os.path.join(path, ".zarray")
+                    if os.path.exists(meta_path):
+                        spec = {"driver": "zarr", "kvstore": {"driver": "file", "path": path}}
+                        return np.array(ts.open(spec).result().read().result())
+                    result = {}
+                    for name in sorted(os.listdir(path)):
+                        sub = os.path.join(path, name)
+                        if os.path.isdir(sub):
+                            val = _load_tree(sub)
+                            if val is not None:
+                                result[name] = val
+                    return result if result else None
+                ws_ckpt = _load_tree(ckpt_dir)
+                if ws_ckpt is None:
+                    raise RuntimeError(f"Could not load checkpoint from {ckpt_dir}")
+                print(f"[Fine-tune] Loaded checkpoint as numpy arrays (keys: {list(ws_ckpt.keys()) if isinstance(ws_ckpt, dict) else type(ws_ckpt)})")
+            else:
+                raise
         agent_params = ws_ckpt["params"] if isinstance(ws_ckpt, dict) and "params" in ws_ckpt else ws_ckpt.params
         print(f"[Fine-tune] Agent loaded from step {ws_step}")
 
-        # Subsample if needed
-        n_total = len(train_tokens)
-        max_lvl = args.sfl_max_levels if args.sfl_max_levels > 0 else n_total
-        if n_total > max_lvl:
+        # Buffer already has SFL scores
+        n_buffer = len(train_tokens)
+        buffer_scores = train_data.get("scores", None)
+        if buffer_scores is not None:
+            print(f"[Fine-tune] Buffer has existing SFL scores for {n_buffer} levels "
+                  f"(mean={buffer_scores.mean():.4f}, nonzero={int((buffer_scores > 0).sum())})")
+
+        # Load and score extra levels from general training set
+        if args.extra_train_data:
+            extra_data = load_train_data(args.extra_train_data)
+            extra_tokens_all = extra_data["tokens"]
+            n_extra_available = len(extra_tokens_all)
+
+            # Sample up to sfl_max_levels extra levels
+            max_extra = args.sfl_max_levels if args.sfl_max_levels > 0 else n_extra_available
+            max_extra = min(max_extra, n_extra_available)
             rng_sub = np.random.default_rng(args.seed)
-            subset_idx = rng_sub.choice(n_total, size=max_lvl, replace=False)
-            score_tokens = train_tokens[subset_idx]
-            print(f"[Fine-tune] Subsampled {max_lvl}/{n_total} levels for SFL scoring")
+            if n_extra_available > max_extra:
+                extra_idx = rng_sub.choice(n_extra_available, size=max_extra, replace=False)
+                extra_tokens = extra_tokens_all[extra_idx]
+            else:
+                extra_tokens = extra_tokens_all
+            print(f"[Fine-tune] Scoring {len(extra_tokens)}/{n_extra_available} extra levels from {args.extra_train_data}")
+
+            extra_scores = score_levels_sfl(
+                agent_params=agent_params,
+                tokens=extra_tokens,
+                agent_checkpoint_path=args.agent_checkpoint,
+                num_rollouts=args.sfl_rollouts,
+                batch_size=args.sfl_batch_size,
+                seed=args.seed,
+            )
+
+            # Merge: buffer levels (with existing scores) + scored extra levels
+            merged_tokens = np.concatenate([train_tokens, extra_tokens], axis=0)
+            if buffer_scores is None:
+                buffer_scores = np.zeros(n_buffer, dtype=np.float32)
+            merged_scores = np.concatenate([buffer_scores, extra_scores])
+
+            train_data["tokens"] = merged_tokens
+            train_data["scores"] = merged_scores
+            # Clear recency metadata (doesn't apply to extra levels)
+            for key in ["last_replayed", "last_inserted", "first_inserted", "replay_count"]:
+                train_data.pop(key, None)
+
+            train_tokens = merged_tokens
+            n_scored_extra = int((extra_scores > 0).sum())
+            print(f"[Fine-tune] Merged: {n_buffer} buffer + {len(extra_tokens)} extra "
+                  f"= {len(merged_tokens)} total levels "
+                  f"({n_scored_extra} extra with nonzero SFL score)")
         else:
-            subset_idx = None
-            score_tokens = train_tokens
+            # No extra data — just re-score the buffer levels if no existing scores
+            if buffer_scores is None:
+                print(f"[Fine-tune] No existing scores — scoring {n_buffer} buffer levels")
+                sfl_scores = score_levels_sfl(
+                    agent_params=agent_params,
+                    tokens=train_tokens,
+                    agent_checkpoint_path=args.agent_checkpoint,
+                    num_rollouts=args.sfl_rollouts,
+                    batch_size=args.sfl_batch_size,
+                    seed=args.seed,
+                )
+                train_data["scores"] = sfl_scores
 
-        sfl_scores = score_levels_sfl(
-            agent_params=agent_params,
-            tokens=score_tokens,
-            agent_checkpoint_path=args.agent_checkpoint,
-            num_rollouts=args.sfl_rollouts,
-            batch_size=args.sfl_batch_size,
-            seed=args.seed,
-        )
-
-        # If subsampled, assign scores back (unscored levels get 0)
-        if subset_idx is not None:
-            full_scores = np.zeros(n_total, dtype=np.float32)
-            full_scores[subset_idx] = sfl_scores
-            train_data["scores"] = full_scores
-            # Only keep scored levels for training
-            scored_mask = full_scores > 0
-            n_scored = int(scored_mask.sum())
-            if n_scored > 0:
-                print(f"[Fine-tune] {n_scored}/{n_total} levels have nonzero SFL score")
-        else:
-            train_data["scores"] = sfl_scores
-
-        # Override weighting to use fresh scores
+        # Use score-based weighting
         if args.sample_weighting == "uniform":
-            print("[Fine-tune] Switching sample_weighting to 'score' (agent scores available)")
+            print("[Fine-tune] Switching sample_weighting to 'score' (SFL scores available)")
             args.sample_weighting = "score"
 
     # Compute sampling weights
