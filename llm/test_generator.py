@@ -129,6 +129,126 @@ def select_references(
     return refs
 
 
+def select_references_diverse(
+    tokens: np.ndarray,
+    scores: np.ndarray,
+    size: int,
+    evaluator,
+    n: int = 3,
+    pool_size: int = 20,
+    metric: str = "td_error_emd",
+) -> list:
+    """Select maximally diverse references using pairwise trajectory metrics.
+
+    Picks a candidate pool (top by regret), runs agent rollouts, computes
+    pairwise diversity, and greedily selects N references that maximize
+    the minimum pairwise distance.
+
+    Args:
+        tokens: (capacity, 52) token array
+        scores: (capacity,) score array
+        size: number of active levels
+        evaluator: AgentEvaluator instance (already loaded)
+        n: number of references to select
+        pool_size: candidate pool size (top by regret)
+        metric: pairwise metric to maximize. One of:
+            "td_error_emd" — Earth Mover's Distance between TD error distributions
+            "experience_divergence" — KL divergence between mode transition matrices
+            "position_dtw" — spatial path DTW distance
+
+    Returns:
+        List of (index, tokens, score) tuples
+    """
+    from metrics.pairwise.td_error_distribution import td_error_divergence
+    from metrics.pairwise.mode_transition import (
+        mode_transition_divergence,
+        compute_baseline_stats,
+    )
+    from metrics.pairwise.pos_dtw import position_trace_dtw
+
+    active_scores = scores[:size]
+    pool_k = min(pool_size, size)
+
+    # Candidate pool: top by regret
+    pool_indices = np.argsort(active_scores)[::-1][:pool_k]
+    logger.info(f"Diverse selection: pool of {pool_k} candidates, metric={metric}")
+
+    # Roll out agent on candidate pool
+    pool_levels = [tokens_to_level_obj(tokens[i]) for i in pool_indices]
+    logger.info(f"Rolling out agent on {pool_k} candidate levels...")
+    pool_trajectories = evaluator.evaluate_levels(pool_levels)
+
+    # Compute baseline stats for mode transition if needed
+    baseline_stats = None
+    if metric == "experience_divergence":
+        baseline_stats = compute_baseline_stats(pool_trajectories)
+        logger.info(
+            f"Mode baseline: error_threshold={baseline_stats['error_threshold']:.3f}, "
+            f"entropy_threshold={baseline_stats['entropy_threshold']:.3f}"
+        )
+
+    # Compute pairwise distance matrix
+    dist = np.zeros((pool_k, pool_k))
+    for i in range(pool_k):
+        for j in range(i + 1, pool_k):
+            ti, tj = pool_trajectories[i], pool_trajectories[j]
+            if metric == "td_error_emd":
+                result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
+                d = result["emd"]
+            elif metric == "experience_divergence":
+                result = mode_transition_divergence(
+                    ti, ti["dones"], tj, tj["dones"],
+                    entropy_a=ti.get("entropy"), entropy_b=tj.get("entropy"),
+                    baseline_stats=baseline_stats,
+                )
+                d = result["kl_divergence"]
+            elif metric == "position_dtw":
+                result = position_trace_dtw(
+                    ti["positions"], ti["dones"],
+                    tj["positions"], tj["dones"],
+                )
+                d = result["distance"]
+            else:
+                raise ValueError(f"Unknown diverse metric: {metric}")
+            dist[i, j] = d
+            dist[j, i] = d
+
+    # Greedy selection: maximize minimum pairwise distance
+    # Start with the pair that has the highest distance
+    best_pair = np.unravel_index(np.argmax(dist), dist.shape)
+    selected = [best_pair[0], best_pair[1]]
+
+    while len(selected) < n and len(selected) < pool_k:
+        best_next = -1
+        best_min_dist = -1
+        for candidate in range(pool_k):
+            if candidate in selected:
+                continue
+            # Min distance from candidate to any already-selected
+            min_d = min(dist[candidate, s] for s in selected)
+            if min_d > best_min_dist:
+                best_min_dist = min_d
+                best_next = candidate
+        if best_next < 0:
+            break
+        selected.append(best_next)
+
+    # Log selection
+    for i, s in enumerate(selected):
+        idx = int(pool_indices[s])
+        logger.info(
+            f"  Diverse ref {i+1}: buffer idx={idx}, "
+            f"regret={float(active_scores[idx]):.4f}, "
+            f"min_dist={min(dist[s, o] for o in selected if o != s):.4f}"
+        )
+
+    refs = []
+    for s in selected:
+        idx = int(pool_indices[s])
+        refs.append((idx, tokens[idx], float(active_scores[idx])))
+    return refs
+
+
 def build_references_with_metrics(
     ref_data: list,
     trajectories: list = None,
@@ -255,6 +375,22 @@ def build_references_with_metrics(
                     ),
                     higher_is="more overconfident (agent expects more than reality)",
                     metric_key="value_error",
+                ))
+
+            # Position vector
+            if _enabled(pm, "position_vector"):
+                from metrics.utils import truncate_at_done
+                ep_pos = truncate_at_done(traj["positions"], traj["dones"])
+                ds_pos = downsample(ep_pos, downsample_points)
+                pos_str = "[" + ", ".join(f"({int(p[0])},{int(p[1])})" for p in ds_pos) + "]"
+                metrics.append(MetricEntry(
+                    name="Position Trace",
+                    value=pos_str,
+                    description=(
+                        f"Agent (x,y) at each step "
+                        f"(ep_len={len(ep_pos)}, downsampled to {len(ds_pos)} points)"
+                    ),
+                    metric_key="position_vector",
                 ))
 
             # Path overlay
@@ -742,17 +878,28 @@ def run_test(args):
     tokens = buf["tokens"]
     scores = buf["scores"]
 
-    # Select reference mazes
-    logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
-    ref_data = select_references(tokens, scores, size, n=args.num_refs, strategy=args.strategy)
-
-    # Load agent and roll out on reference levels to get trajectory data
-    ref_trajectories = None
-    if args.inject_metrics:
+    # Load agent early if needed for diverse selection or metrics
+    evaluator = None
+    if args.inject_metrics or args.strategy == "diverse":
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
         evaluator = AgentEvaluator(args.agent_dir, num_steps=args.num_steps)
 
+    # Select reference mazes
+    logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
+    if args.strategy == "diverse" and evaluator is not None:
+        ref_data = select_references_diverse(
+            tokens, scores, size, evaluator,
+            n=args.num_refs,
+            pool_size=args.diverse_pool_size,
+            metric=args.diverse_metric,
+        )
+    else:
+        ref_data = select_references(tokens, scores, size, n=args.num_refs, strategy=args.strategy)
+
+    # Roll out agent on selected reference levels to get trajectory data
+    ref_trajectories = None
+    if args.inject_metrics and evaluator is not None:
         ref_levels = []
         for idx, tok, score in ref_data:
             ref_levels.append(tokens_to_level_obj(tok))
@@ -1026,6 +1173,13 @@ def main():
     parser.add_argument("--strategy", choices=["top_regret", "random", "diverse"],
                         default=cfg.get("strategy"),
                         help="Reference selection strategy")
+    parser.add_argument("--diverse-metric",
+                        choices=["td_error_emd", "experience_divergence", "position_dtw"],
+                        default=cfg.get("diverse_metric", "td_error_emd"),
+                        help="Pairwise metric for diverse strategy")
+    parser.add_argument("--diverse-pool-size", type=int,
+                        default=cfg.get("diverse_pool_size", 20),
+                        help="Candidate pool size for diverse strategy")
 
     # Metric injection flags
     parser.add_argument("--inject-metrics", action="store_true",

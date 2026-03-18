@@ -218,6 +218,22 @@ METRIC_DEFINITIONS: Dict[str, tuple] = {
         "To force different actions, change wall placement to block the current route "
         "and open alternative corridors.",
     ),
+    "position_vector": (
+        "Position Trace",
+        "Position Trace records the agent's (x, y) grid coordinates at each timestep. "
+        "Use this to link other metrics (regret, entropy, actions) to specific grid "
+        "locations. Repeated positions mean the agent is stuck or looping. Compare "
+        "position traces with the per-step regret or entropy vectors to identify exactly "
+        "where on the grid the agent struggles.",
+    ),
+    "value_error": (
+        "Value Error",
+        "Value Error is the signed difference V(s_t) - G_t at each timestep, where G_t "
+        "is the actual return from step t. Positive = agent overestimates (overconfident, "
+        "walks into traps). Negative = agent underestimates (underconfident, doesn't "
+        "recognize good positions). The sign reveals the nature of the error, not just "
+        "its magnitude.",
+    ),
     "position_dtw": (
         "Position DTW",
         "Position DTW (Dynamic Time Warping) measures how similar the agent's spatial "
@@ -227,6 +243,22 @@ METRIC_DEFINITIONS: Dict[str, tuple] = {
         "Low DTW (<0.3) = agent walks nearly the same route on both mazes. High DTW (>0.5) "
         "= spatially distinct paths. To increase DTW vs a reference, rearrange walls so "
         "the agent must traverse completely different regions of the 13x13 grid.",
+    ),
+    "mode_transition": (
+        "Experience Divergence",
+        "Experience Divergence measures how differently the agent experiences two mazes "
+        "using KL divergence between mode transition matrices. Each timestep is classified "
+        "into one of 5 modes (confident_correct, confident_wrong, uncertain, recovering, "
+        "degrading) based on value error and policy entropy. Higher divergence = the agent "
+        "goes through fundamentally different learning processes on the two mazes.",
+    ),
+    "td_error": (
+        "TD Error EMD",
+        "TD Error EMD is the Earth Mover's Distance between the distributions of temporal "
+        "difference errors (δ_t = r_t + γV(s_{t+1}) - V(s_t)) on two mazes. TD error is "
+        "the raw learning signal — different distributions mean the agent receives different "
+        "gradient updates. Higher EMD = more different learning signals. This is the most "
+        "task-agnostic diversity metric.",
     ),
 }
 

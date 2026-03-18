@@ -40,17 +40,18 @@ inject_buffer_stats: true   # Include buffer-wide statistics
 # Set to true/false to include/exclude each metric.
 prompt_metrics:
   per_step_entropy: true    # Policy uncertainty at each timestep
-  per_step_regret: true     # (max_return - V(s_t)) time series
+  per_step_regret: false     # (max_return - V(s_t)) time series
   scalar_regret: true       # Mean per-step regret (single number, MaxMC)
   action_sequence: true     # Agent's discrete actions per step (behavioral fingerprint)
   path_overlay: true        # ASCII visualization of agent trajectory on the grid
-  value_error: false        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
+  position_vector: true    # Agent (x,y) per step — lets LLM link regret/entropy spikes to grid locations
+  value_error: true        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
 
 # Pairwise metrics injected into the LLM prompt (between all reference pairs).
 pairwise_metrics:
-  position_dtw: true        # Spatial path similarity between two trajectories
-  mode_transition: false    # Experience mode transition divergence (experiential diversity)
-  td_error: false           # TD error distribution EMD (task-agnostic learning signal diversity)
+  position_dtw: false        # Spatial path similarity between two trajectories
+  mode_transition: true    # Experience mode transition divergence (experiential diversity)
+  td_error: true           # TD error distribution EMD (task-agnostic learning signal diversity)
 
 # --- Agent & Feedback Loop ---
 agent_dir: gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198
@@ -63,7 +64,7 @@ max_diversity_retries: 3
 # Thresholds for accepting a generated maze. Set to null to disable a gate.
 # A maze must pass ALL enabled gates. On failure, LLM gets metric feedback and retries.
 gate:
-  min_regret: 1             # Rejects too-easy mazes (regret < 1.0) and unsolvable (negative regret)
+  min_regret: 1             # Rejects too-easy mazes (regret < 1.0) and unsolvable (negative regret) -> we need to dynamically change this during training depending on the buffer
   min_pos_dtw: null         # Min position DTW vs references (null = disabled; needs investigation)
 
 # --- Metric Display ---
