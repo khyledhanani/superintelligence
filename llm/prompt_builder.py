@@ -29,6 +29,7 @@ class MetricEntry:
     value: Any
     description: str = ""
     higher_is: str = ""
+    metric_key: str = ""
 
     def format(self) -> str:
         parts = [f"  - {self.name}: {self._fmt_value()}"]
@@ -78,6 +79,7 @@ class PairwiseMetricEntry:
     name: str
     value: Any
     description: str = ""
+    metric_key: str = ""
 
     def format(self) -> str:
         val = f"{self.value:.4f}" if isinstance(self.value, float) else str(self.value)
@@ -115,20 +117,122 @@ Do not wrap in code blocks or add any explanation.
 Each row must be exactly 13 characters. There must be exactly 13 rows.
 The output will be saved directly to a .txt file, so it must be a clean grid only.
 
-Example of a valid output (do NOT copy this maze, create a new one):
+Example of valid output format (this is deliberately trivial — generate something much more interesting):
 #############
 #>..........#
-#.#########.#
-#.#.......#.#
-#.#.#####.#.#
-#.#.#...#.#.#
-#.#.#.#.#.#.#
-#.#...#...#.#
-#.#########.#
 #...........#
-###########.#
-#G..........#
+#...........#
+#...........#
+#...........#
+#.####.####.#
+#...........#
+#...........#
+#...........#
+#...........#
+#..........G#
 #############"""
+
+
+# ---------------------------------------------------------------------------
+# Metric definitions — injected into prompts when a metric is active
+# ---------------------------------------------------------------------------
+
+METRIC_DEFINITIONS: Dict[str, tuple] = {
+    "per_step_entropy": (
+        "Per-Step Entropy",
+        "Per-Step Entropy measures the RL agent's policy uncertainty at each timestep. "
+        "High entropy (>0.5) means the agent is unsure which action to take — these are "
+        "decision points or confusing junctions. Low entropy (<0.2) means the agent is "
+        "confident about its path. To create higher entropy, design ambiguous branch points "
+        "where multiple corridors look equally viable, or add deceptive openings near walls.",
+    ),
+    "per_step_regret": (
+        "Per-Step Regret",
+        "Per-Step Regret is (max_return - V(s_t)) at each timestep — how much the agent "
+        "underestimates its potential from each state. This matches the ACCEL MaxMC formula "
+        "but kept as a time series instead of averaged to a scalar. High regret at a step "
+        "means the agent is confused about the maze's value at that point. To create high "
+        "regret, add deceptive dead ends or long detours that mislead the agent's value "
+        "estimate.",
+    ),
+    "scalar_regret": (
+        "Scalar Regret (MaxMC)",
+        "Scalar Regret (MaxMC) is the mean per-step regret across the full episode: "
+        "mean_t[max_return - V(s_t)]. It summarizes overall maze difficulty for the agent. "
+        "Higher regret = more learning potential (the agent's value estimates are far from "
+        "reality). Regret near zero means the maze is too easy or already mastered. "
+        "Mazes in the buffer typically have regret between 0.1 and 1.5.",
+    ),
+    "action_sequence": (
+        "Action Sequence",
+        "Action Sequence records the agent's discrete action at each timestep "
+        "(0=up, 1=right, 2=down, 3=left, 4=stay). It is the behavioral fingerprint of "
+        "the level — two mazes that produce the same action sequence are functionally "
+        "identical from the agent's perspective, regardless of visual differences. "
+        "To force different actions, change wall placement to block the current route "
+        "and open alternative corridors.",
+    ),
+    "position_dtw": (
+        "Position DTW",
+        "Position DTW (Dynamic Time Warping) measures how similar the agent's spatial "
+        "path is between two mazes. It compares the (x, y) trajectory on each maze after "
+        "normalizing to start position (translation invariant). The distance is normalized "
+        "by warping path length, so it is comparable across different episode lengths. "
+        "Low DTW (<0.3) = agent walks nearly the same route on both mazes. High DTW (>0.5) "
+        "= spatially distinct paths. To increase DTW vs a reference, rearrange walls so "
+        "the agent must traverse completely different regions of the 13x13 grid.",
+    ),
+}
+
+
+def _collect_metric_keys(
+    references: Optional[List[ReferenceMaze]] = None,
+    pairwise_metrics: Optional[List[PairwiseMetricEntry]] = None,
+    global_metrics: Optional[List[MetricEntry]] = None,
+    target_metrics: Optional[List[MetricEntry]] = None,
+    extra_keys: Optional[List[str]] = None,
+) -> List[str]:
+    """Collect unique metric_keys from all metric objects, preserving insertion order."""
+    seen = {}
+    for source in [global_metrics, target_metrics]:
+        if source:
+            for m in source:
+                if m.metric_key and m.metric_key not in seen:
+                    seen[m.metric_key] = True
+    if references:
+        for ref in references:
+            for m in ref.metrics:
+                if m.metric_key and m.metric_key not in seen:
+                    seen[m.metric_key] = True
+    if pairwise_metrics:
+        for pm in pairwise_metrics:
+            if pm.metric_key and pm.metric_key not in seen:
+                seen[pm.metric_key] = True
+    if extra_keys:
+        for k in extra_keys:
+            if k and k not in seen:
+                seen[k] = True
+    return list(seen.keys())
+
+
+def _render_definitions_section(keys: List[str]) -> str:
+    """Render a METRIC DEFINITIONS section for the given keys.
+
+    Returns empty string if no keys have definitions.
+    """
+    definitions = []
+    for key in keys:
+        if key in METRIC_DEFINITIONS:
+            title, body = METRIC_DEFINITIONS[key]
+            definitions.append(f"{title}: {body}")
+    if not definitions:
+        return ""
+    header = (
+        "=== METRIC DEFINITIONS ===\n"
+        "The following metrics describe how the RL agent behaves on each maze. "
+        "Use these to understand the data below and to guide your maze design.\n"
+    )
+    return header + "\n\n".join(definitions)
 
 
 def overlay_path_on_grid(grid_str: str, positions: np.ndarray) -> str:
@@ -181,6 +285,13 @@ def build_generation_prompt(
         User prompt string (system prompt is returned separately)
     """
     sections = []
+
+    # Section 0: Metric definitions (only for metrics actually used)
+    keys = _collect_metric_keys(references, pairwise_metrics, global_metrics, target_metrics)
+    defs = _render_definitions_section(keys)
+    if defs:
+        sections.append(defs)
+        sections.append("")
 
     # Section 1: Reference mazes
     if references:
@@ -274,6 +385,7 @@ def build_diversity_feedback_prompt(
     similarity_issues: List[str],
     analysis_sections: Optional[List] = None,
     reference_overlays: Optional[Dict[str, str]] = None,
+    metric_keys: Optional[List[str]] = None,
 ) -> str:
     """Build feedback when a candidate passes validation but fails the diversity gate.
 
@@ -288,14 +400,24 @@ def build_diversity_feedback_prompt(
         reference_overlays: Optional dict of {label: path_overlay} for reference
             mazes that the candidate is most similar to, so the LLM can visually
             compare agent paths.
+        metric_keys: List of metric keys used in the gate evaluation. Definitions
+            for these metrics are injected at the top of the feedback prompt.
 
     Returns:
         Follow-up user prompt
     """
     sections = [
         "Your maze is valid but too similar to existing buffer mazes:\n",
-        candidate_grid,
     ]
+
+    # Inject metric definitions so the LLM understands the feedback
+    if metric_keys:
+        defs = _render_definitions_section(metric_keys)
+        if defs:
+            sections.append(defs)
+            sections.append("")
+
+    sections.append(candidate_grid)
 
     if candidate_overlay:
         sections.append("\nAgent path on your maze:")

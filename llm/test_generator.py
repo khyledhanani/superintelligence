@@ -177,6 +177,7 @@ def build_references_with_metrics(
                     f"at step {ent_info['max_step']}, ep_len={ent_info['episode_length']})"
                 ),
                 higher_is="more uncertain (harder decision points)",
+                metric_key="per_step_entropy",
             ))
 
             # 3. Per-step regret
@@ -193,6 +194,7 @@ def build_references_with_metrics(
                     f"ep_len={reg_info['episode_length']}"
                 ),
                 higher_is="harder (agent expects lower return)",
+                metric_key="per_step_regret",
             ))
 
             # 4. Scalar regret
@@ -205,6 +207,7 @@ def build_references_with_metrics(
                     f"solved={regret_info.solved}, ep_len={regret_info.episode_length}"
                 ),
                 higher_is="more learning potential",
+                metric_key="scalar_regret",
             ))
 
             # 5. Per-step action
@@ -219,6 +222,7 @@ def build_references_with_metrics(
                     f"dominant=action {act_info['dominant_action']} "
                     f"at {act_info['dominant_fraction']:.0%})"
                 ),
+                metric_key="action_sequence",
             ))
 
             # Path overlay
@@ -243,6 +247,7 @@ def build_references_with_metrics(
                     value=score,
                     description="Agent's learning potential on this maze",
                     higher_is="more to learn",
+                    metric_key="scalar_regret",
                 ))
             references.append(ReferenceMaze(
                 grid=grid,
@@ -265,6 +270,7 @@ def build_references_with_metrics(
                     name="Position DTW",
                     value=dtw_result["distance"],
                     description="Spatial path similarity (lower = more similar routes)",
+                    metric_key="position_dtw",
                 ))
 
     return references, pairwise_metrics
@@ -437,7 +443,10 @@ def save_results(
             "latency_ms": result.latency_ms,
             "errors": result.errors,
             "raw_responses": result.raw_responses,
+            "thinking_logs": [t for t in result.thinking_logs if t is not None] or None,
         }
+        if entry["thinking_logs"] is None:
+            del entry["thinking_logs"]
         if result.feedback_prompts:
             entry["feedback_prompts"] = result.feedback_prompts
         if result.gate_metrics:
@@ -468,8 +477,11 @@ def save_results(
                 "latency_ms": r.latency_ms,
                 "errors": r.errors,
                 "raw_responses": r.raw_responses,
+                "thinking_logs": [t for t in r.thinking_logs if t is not None] or None,
                 "feedback_prompts": r.feedback_prompts,
             })
+            if metadata["failed_mazes"][-1]["thinking_logs"] is None:
+                del metadata["failed_mazes"][-1]["thinking_logs"]
 
     meta_path = os.path.join(run_dir, "metadata.json")
     with open(meta_path, 'w') as f:
@@ -520,11 +532,15 @@ def save_results(
             if i < cols:
                 ax = axes[0, i]
                 rt = ref_trajectories[i] if ref_trajectories and i < len(ref_trajectories) else None
+                ref_title = label
+                if rt:
+                    ri = compute_regret(rt)
+                    ref_title += f"\nregret={ri.regret:.3f} solved={ri.solved}"
                 plot_maze_with_path(
                     ax, grid,
                     positions=rt["positions"] if rt else None,
                     dones=rt["dones"] if rt else None,
-                    color='blue', title=label,
+                    color='blue', title=ref_title,
                 )
 
         # Rows 1+: each generated maze with DTW profiles
@@ -537,8 +553,10 @@ def save_results(
             ax_maze = axes[row, 0]
             gt = gen_trajectories[gen_idx] if gen_trajectories and gen_idx < len(gen_trajectories) else None
             summary_str = ""
-            if gt and "solve_rate" in gt:
-                summary_str += f"\nsolve={gt['solve_rate']:.0%} best_ret={gt['best_return']:.3f}"
+            if gt:
+                gi = compute_regret(gt)
+                solve_str = f"solve={gt['solve_rate']:.0%}" if "solve_rate" in gt else ""
+                summary_str += f"\n{solve_str} regret={gi.regret:.3f}"
             if result.gate_metrics:
                 summary_str += (
                     f"\npos_dtw_min={result.gate_metrics.get('min_pos_dtw', 0):.2f}"
@@ -600,11 +618,15 @@ def save_results(
         for i, (label, grid) in enumerate(ref_grids):
             if i < cols:
                 rt = ref_trajectories[i] if ref_trajectories and i < len(ref_trajectories) else None
+                ref_title = label
+                if rt:
+                    ri = compute_regret(rt)
+                    ref_title += f"\nregret={ri.regret:.3f} solved={ri.solved}"
                 plot_maze_with_path(
                     axes[0, i], grid,
                     positions=rt["positions"] if rt else None,
                     dones=rt["dones"] if rt else None,
-                    color='blue', title=label,
+                    color='blue', title=ref_title,
                 )
 
         if n_gens > 0:
@@ -612,8 +634,10 @@ def save_results(
                 if i < cols:
                     gt = gen_trajectories[i] if gen_trajectories and i < len(gen_trajectories) else None
                     subtitle = label
-                    if gt and "solve_rate" in gt:
-                        subtitle += f"\nsolve={gt['solve_rate']:.0%} best_ret={gt['best_return']:.3f}"
+                    if gt:
+                        gi = compute_regret(gt)
+                        solve_str = f"solve={gt['solve_rate']:.0%}" if "solve_rate" in gt else ""
+                        subtitle += f"\n{solve_str} regret={gi.regret:.3f}"
                     plot_maze_with_path(
                         axes[1, i], grid,
                         positions=gt["positions"] if gt else None,
@@ -867,23 +891,25 @@ def run_test(args):
 def load_config(config_path: str) -> dict:
     """Load YAML config file and return as dict.
 
-    Flattens provider-specific settings into top-level keys
-    (base_url, api_key_env) based on the active provider.
+    Keeps provider sub-dicts so that CLI --provider can override
+    which block gets flattened.
     """
     with open(config_path) as f:
         cfg = yaml.safe_load(f) or {}
+    return cfg
 
-    # Flatten provider-specific block
-    provider = cfg.get("provider", "ollama")
+
+def flatten_provider_config(cfg: dict, provider: str) -> None:
+    """Flatten provider-specific settings (base_url, api_key_env) into cfg.
+
+    Called after CLI arg parsing so --provider overrides work correctly.
+    """
     provider_cfg = cfg.get(provider, {})
-    cfg.setdefault("base_url", provider_cfg.get("base_url", ""))
-    cfg.setdefault("api_key_env", provider_cfg.get("api_key_env", ""))
-
+    cfg["base_url"] = provider_cfg.get("base_url", "")
+    cfg["api_key_env"] = provider_cfg.get("api_key_env", "")
     # Remove provider sub-dicts (not needed downstream)
     cfg.pop("ollama", None)
     cfg.pop("openrouter", None)
-
-    return cfg
 
 
 def main():
@@ -903,12 +929,6 @@ def main():
     if config_path:
         logger.info(f"Loading config from {config_path}")
         cfg = load_config(config_path)
-
-    # Resolve API key: config api_key_env -> env var -> empty
-    api_key_default = ""
-    api_key_env = cfg.get("api_key_env", "")
-    if api_key_env:
-        api_key_default = os.environ.get(api_key_env, "")
 
     parser = argparse.ArgumentParser(description="Test LLM maze generator with saved buffer")
     parser.add_argument("--config", default=None, help="Path to YAML config file")
@@ -944,11 +964,11 @@ def main():
     parser.add_argument("--provider", choices=["ollama", "openrouter"],
                         default=cfg.get("provider"),
                         help="API provider")
-    parser.add_argument("--base-url", default=cfg.get("base_url"),
-                        help="API base URL")
+    parser.add_argument("--base-url", default=None,
+                        help="API base URL (auto-resolved from provider if not set)")
     parser.add_argument("--model", default=cfg.get("model"),
                         help="Model name")
-    parser.add_argument("--api-key", default=api_key_default or None,
+    parser.add_argument("--api-key", default=None,
                         help="API key (auto-loaded from env var specified in config)")
     parser.add_argument("--temperature", type=float,
                         default=cfg.get("temperature"))
@@ -1000,6 +1020,17 @@ def main():
                         help="Only build prompts, skip LLM calls")
 
     args = parser.parse_args()
+
+    # Flatten provider config using the final --provider value (CLI overrides config)
+    provider = args.provider or cfg.get("provider", "ollama")
+    flatten_provider_config(cfg, provider)
+    if args.base_url is None:
+        args.base_url = cfg.get("base_url", "")
+    if args.api_key is None:
+        api_key_env = cfg.get("api_key_env", "")
+        if api_key_env:
+            args.api_key = os.environ.get(api_key_env, "")
+
     run_test(args)
 
 

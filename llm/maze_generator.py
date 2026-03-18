@@ -122,6 +122,7 @@ class GenerationResult:
     attempts: int = 0
     errors: List[str] = field(default_factory=list)
     raw_responses: List[str] = field(default_factory=list)
+    thinking_logs: List[Optional[str]] = field(default_factory=list)  # reasoning traces (None for non-thinking models)
     latency_ms: float = 0.0
     gate_metrics: Optional[Dict] = None
     gate_pair_metrics: Optional[List] = None  # List[PairGateMetrics] with local_costs vectors
@@ -179,11 +180,13 @@ class MazeGenerator:
             result.attempts = attempt
 
             # Call LLM
-            raw_response = self._call_llm(messages)
+            raw_response, thinking = self._call_llm(messages)
             if raw_response is None:
                 result.errors.append(f"Attempt {attempt}: LLM API call failed")
+                result.thinking_logs.append(None)
                 continue
             result.raw_responses.append(raw_response)
+            result.thinking_logs.append(thinking)
 
             # Parse grid from response
             grid, parse_error = self._parse_grid(raw_response)
@@ -270,14 +273,23 @@ class MazeGenerator:
         result.latency_ms = (time.time() - start) * 1000
         return result
 
-    def _call_llm(self, messages: List[Dict]) -> Optional[str]:
-        """Call the LLM API. Dispatches to Ollama or OpenAI-compatible format."""
+    def _call_llm(self, messages: List[Dict]) -> tuple:
+        """Call the LLM API. Dispatches to Ollama or OpenAI-compatible format.
+
+        Returns:
+            (content, thinking) tuple. content is None on failure.
+            thinking is None for non-reasoning models or on failure.
+        """
         if self.config.provider == "openrouter":
             return self._call_openai_compatible(messages)
         return self._call_ollama(messages)
 
-    def _call_ollama(self, messages: List[Dict]) -> Optional[str]:
-        """Call the Ollama cloud API (/api/chat endpoint)."""
+    def _call_ollama(self, messages: List[Dict]) -> tuple:
+        """Call the Ollama cloud API (/api/chat endpoint).
+
+        Returns:
+            (content, thinking) tuple. thinking is None for non-reasoning models.
+        """
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
@@ -300,27 +312,35 @@ class MazeGenerator:
             resp.raise_for_status()
             data = resp.json()
             # Ollama native format: response is in data["message"]["content"]
+            msg = data["message"]
+            logger.debug(f"Ollama response keys: {list(msg.keys())}")
+            content = msg.get("content", "")
+            thinking = msg.get("thinking") or None  # normalize "" to None
             # Some thinking models put output in "thinking" field with empty "content"
-            content = data["message"].get("content", "")
-            if not content.strip():
-                thinking = data["message"].get("thinking", "")
-                if thinking.strip():
-                    logger.info("Content was empty, using thinking field as fallback")
-                    content = thinking
-            return content
+            if not content.strip() and thinking:
+                logger.info("Content was empty, using thinking field as fallback")
+                content = thinking
+                thinking = None  # Already used as content
+            if thinking:
+                logger.info(f"Model reasoning ({len(thinking)} chars)")
+            return content, thinking
         except requests.exceptions.RequestException as e:
             logger.error(f"LLM API error: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 logger.error(f"Response status: {e.response.status_code}")
                 logger.error(f"Response body: {e.response.text[:500]}")
-            return None
+            return None, None
         except (KeyError, IndexError) as e:
             logger.error(f"Unexpected API response format: {e}")
             logger.error(f"Response data: {data}")
-            return None
+            return None, None
 
-    def _call_openai_compatible(self, messages: List[Dict]) -> Optional[str]:
-        """Call an OpenAI-compatible API (OpenRouter, etc.)."""
+    def _call_openai_compatible(self, messages: List[Dict]) -> tuple:
+        """Call an OpenAI-compatible API (OpenRouter, etc.).
+
+        Returns:
+            (content, thinking) tuple. thinking is None for non-reasoning models.
+        """
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
@@ -340,17 +360,23 @@ class MazeGenerator:
             )
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
+            content = message.get("content", "")
+            # OpenAI-compatible reasoning: check "reasoning" or "reasoning_content"
+            thinking = message.get("reasoning", None) or message.get("reasoning_content", None)
+            if thinking:
+                logger.info(f"Model reasoning ({len(thinking)} chars)")
+            return content, thinking
         except requests.exceptions.RequestException as e:
             logger.error(f"LLM API error: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 logger.error(f"Response status: {e.response.status_code}")
                 logger.error(f"Response body: {e.response.text[:500]}")
-            return None
+            return None, None
         except (KeyError, IndexError) as e:
             logger.error(f"Unexpected API response format: {e}")
             logger.error(f"Response data: {data}")
-            return None
+            return None, None
 
     def _parse_grid(self, raw_response: str) -> tuple:
         """Extract a 13x13 grid from the LLM response.
@@ -776,12 +802,29 @@ class MazeGenerator:
             except Exception as e:
                 logger.warning(f"Per-step regret analysis failed: {e}")
 
+            # Collect metric keys for definition injection
+            active_metric_keys = []
+            if thresholds.min_pos_dtw is not None:
+                active_metric_keys.append("position_dtw")
+            if thresholds.min_regret is not None:
+                active_metric_keys.append("scalar_regret")
+            _analyzer_key_map = {
+                "PositionDTWAnalyzer": "position_dtw",
+                "PolicyEntropyAnalyzer": "per_step_entropy",
+                "PerStepRegretAnalyzer": "per_step_regret",
+            }
+            for section in analysis_sections:
+                key = _analyzer_key_map.get(section.source_metric, "")
+                if key and key not in active_metric_keys:
+                    active_metric_keys.append(key)
+
             feedback_prompt = build_diversity_feedback_prompt(
                 result.grid,
                 candidate_overlay,
                 gate_result.issues,
                 analysis_sections=analysis_sections,
                 reference_overlays=reference_overlays,
+                metric_keys=active_metric_keys,
             )
 
             # Save the feedback prompt and the previous raw responses for debugging
