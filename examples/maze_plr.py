@@ -45,18 +45,23 @@ class UpdateState(IntEnum):
     REPLAY = 1
 
 
-def fit_pca(latent_means, n_components, fitness_scores=None):
+def fit_pca(latent_means, n_components, fitness_scores=None, pca_mode="gradient"):
     """Fit PCA on latent means and return (pca_mean, pca_components).
 
-    If fitness_scores is provided, uses fitness-aware PCA:
-      - PC1 = direction of maximum fitness change (linear regression)
-      - PC2...k = max-variance directions orthogonal to fitness direction
-    Otherwise, standard PCA (max-variance directions).
+    Three modes when fitness_scores is provided:
+      - "gradient" (default): PC1 = direction of max fitness change (linear regression),
+        PC2..k = max-variance directions orthogonal to fitness direction.
+      - "weighted": Regret-weighted covariance PCA. Computes
+        Σ_weighted = Σᵢ wᵢ (zᵢ - μ_w)(zᵢ - μ_w)ᵀ where wᵢ = softmax(fitness/τ).
+        Eigenvectors = directions where high-fitness levels have max structural spread.
+        CMA-ES searching this subspace explores diverse high-regret structures.
+      - None/no scores: standard PCA (max-variance directions).
 
     Args:
         latent_means: (N, D) array of encoded latent means.
         n_components: number of principal components to keep.
         fitness_scores: optional (N,) array of fitness/score values.
+        pca_mode: "gradient" or "weighted". Only used when fitness_scores is provided.
 
     Returns:
         pca_mean: (D,) mean of the latent vectors.
@@ -65,7 +70,44 @@ def fit_pca(latent_means, n_components, fitness_scores=None):
     pca_mean = jnp.mean(latent_means, axis=0)
     centered = latent_means - pca_mean
 
-    if fitness_scores is not None and n_components >= 1:
+    if fitness_scores is not None and n_components >= 1 and pca_mode == "weighted":
+        # Regret-weighted PCA: find directions where high-regret levels vary most.
+        # Use softmax weighting to convert scores to a probability distribution,
+        # emphasizing high-scoring levels without letting outliers dominate.
+        scores_clean = jnp.where(jnp.isfinite(fitness_scores), fitness_scores, 0.0)
+        score_std = jnp.maximum(jnp.std(scores_clean), 1e-8)
+        tau = score_std  # temperature = score std → weights span ~exp(-1) to exp(1)
+        log_weights = scores_clean / tau
+        log_weights = log_weights - jnp.max(log_weights)  # numerical stability
+        weights = jnp.exp(log_weights)
+        weights = weights / jnp.sum(weights)  # (N,) sums to 1
+
+        # Weighted mean and centered data
+        weighted_mean = jnp.sum(weights[:, None] * latent_means, axis=0)  # (D,)
+        w_centered = latent_means - weighted_mean  # (N, D)
+
+        # Weighted covariance: Σ = Σᵢ wᵢ (zᵢ - μ_w)(zᵢ - μ_w)ᵀ
+        # Efficient: sqrt(w) * centered, then SVD
+        sqrt_w = jnp.sqrt(weights)  # (N,)
+        scaled = sqrt_w[:, None] * w_centered  # (N, D)
+        _, S, Vt = jnp.linalg.svd(scaled, full_matrices=False)
+        components = Vt[:n_components]
+
+        # Diagnostics
+        explained = S[:n_components] ** 2
+        total = jnp.sum(S ** 2)
+        explained_ratio = jnp.sum(explained) / total
+        eff_n = float(1.0 / jnp.sum(weights ** 2))  # effective sample size
+        top_weight = float(jnp.max(weights))
+        print(f"[PCA-weighted] Top {n_components} components explain "
+              f"{float(explained_ratio) * 100:.1f}% of weighted variance")
+        print(f"[PCA-weighted] Effective N={eff_n:.0f}/{len(fitness_scores)}, "
+              f"max weight={top_weight:.4f}, score range=[{float(scores_clean.min()):.3f}, {float(scores_clean.max()):.3f}]")
+
+        # Use weighted mean as the PCA center (CMA-ES will search around high-regret region)
+        pca_mean = weighted_mean
+
+    elif fitness_scores is not None and n_components >= 1:
         # Fitness-aware: PC1 = fitness gradient direction
         fitness_centered = fitness_scores - jnp.mean(fitness_scores)
         # Direction of max fitness change: w = Z^T @ f (unnormalized gradient)
@@ -1273,13 +1315,40 @@ def main(config=None, project="JAXUED_TEST"):
                 # CMA-ES minimizes; negate scores so high-regret = low fitness
                 rng, rng_tell = jax.random.split(rng)
 
+                def _compute_smart_reset_mean(sampler_ref):
+                    """Compute CMA-ES reset mean from the best-scoring level in the buffer."""
+                    buf_size = jnp.maximum(sampler_ref["size"], 1)
+                    # Pick the best-scoring level
+                    buf_scores = sampler_ref["scores"]
+                    best_idx = jnp.argmax(jnp.where(
+                        jnp.arange(buf_scores.shape[0]) < buf_size, buf_scores, -jnp.inf
+                    ))
+                    best_level = jax.tree_util.tree_map(lambda x: x[best_idx:best_idx+1], sampler_ref["levels"])
+                    best_tokens = jax.vmap(level_to_tokens)(best_level)  # (1, seq_len)
+                    best_mean, _ = vae_encode_fn(best_tokens)  # (1, full_latent_dim)
+                    z_seed = best_mean[0]  # (full_latent_dim,)
+
+                    # Project into CMA-ES search space
+                    if active_dims is not None and not use_pca:
+                        # KL filtering: select active dims
+                        z_seed = z_seed[active_dims]
+                    elif use_pca:
+                        # PCA: project to PCA space
+                        # z_pca = (z_full - pca_mean) @ pca_components.T
+                        z_seed = (z_seed - train_state.pca_mean) @ train_state.pca_components.T
+
+                    return z_seed
+
+                # Resolve per-phase reset interval
+                _pca_reset_int = config.get("cmaes_pca_reset_interval", 0) or config["cmaes_reset_interval"]
+
                 def _cmaes_tell(args):
-                    rng_tell, z_pop, scores_neg, es, num_dr = args
+                    rng_tell, z_pop, scores_neg, es, num_dr, reset_interval = args
                     es = cmaes_mgr.tell(rng_tell, z_pop, scores_neg, es)
 
                     # Reset on sigma collapse (adaptive) or fixed interval (fallback)
                     sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es.std < config["cmaes_sigma_min"])
-                    periodic_reset = (num_dr % config["cmaes_reset_interval"]) == 0
+                    periodic_reset = (num_dr % reset_interval) == 0
                     should_reset = sigma_collapsed | periodic_reset
 
                     # Archive population before reset for latent visualization
@@ -1291,7 +1360,13 @@ def main(config=None, project="JAXUED_TEST"):
                         )
 
                     rng_reset_es = jax.random.fold_in(rng_tell, 999)
-                    fresh_es = cmaes_mgr.initialize(rng_reset_es)
+                    if config.get("cmaes_smart_reset"):
+                        reset_mean = _compute_smart_reset_mean(sampler)
+                        # Fall back to zero if buffer is empty
+                        reset_mean = jnp.where(sampler["size"] > 0, reset_mean, jnp.zeros_like(reset_mean))
+                        fresh_es = cmaes_mgr.initialize(rng_reset_es, mean=reset_mean)
+                    else:
+                        fresh_es = cmaes_mgr.initialize(rng_reset_es)
                     es = jax.tree_util.tree_map(
                         lambda fresh, old: jnp.where(should_reset, fresh, old),
                         fresh_es, es
@@ -1305,16 +1380,16 @@ def main(config=None, project="JAXUED_TEST"):
                     pca_active = train_state.num_dr_updates >= config["cmaes_pca_start_after"]
 
                     def _cmaes_full_tell(args):
-                        rng_t, z_pop_full, scores_neg, es_full, num_dr = args
+                        rng_t, z_pop_full, scores_neg, es_full, num_dr, _ri = args
                         # z_pop_full is dummy (pca-dim) — we need the actual full-dim z
                         # But we can't access it here. Instead, skip tell for pca es_state
                         # and tell the full es_state separately
                         return es_full  # unchanged — full tell handled below
 
-                    # Phase 2: tell PCA CMA-ES
+                    # Phase 2: tell PCA CMA-ES (uses PCA reset interval)
                     es_state = jax.lax.cond(
                         pca_active, _cmaes_tell, _skip_tell,
-                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates))
+                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates, _pca_reset_int))
 
                     # Phase 1: tell full CMA-ES (need full-dim z_population from _cmaes_full_generate)
                     # We re-ask to get the z_population used (deterministic given same rng)
@@ -1326,10 +1401,26 @@ def main(config=None, project="JAXUED_TEST"):
                         z_pop, _ = cmaes_mgr_full.ask(rng_ask, train_state.es_state_full)
                         es_full = cmaes_mgr_full.tell(rng_t, z_pop, scores_neg, es_full)
                         sigma_collapsed = (config["cmaes_sigma_min"] > 0) & (es_full.std < config["cmaes_sigma_min"])
+                        # Phase 1 uses the base reset interval
                         periodic_reset = (num_dr % config["cmaes_reset_interval"]) == 0
                         should_reset = sigma_collapsed | periodic_reset
                         rng_reset_es = jax.random.fold_in(rng_t, 999)
-                        fresh_es = cmaes_mgr_full.initialize(rng_reset_es)
+                        if config.get("cmaes_smart_reset"):
+                            # For full-dim CMA-ES: encode best buffer level, apply KL filter if active
+                            buf_size = jnp.maximum(sampler["size"], 1)
+                            best_idx = jnp.argmax(jnp.where(
+                                jnp.arange(sampler["scores"].shape[0]) < buf_size, sampler["scores"], -jnp.inf
+                            ))
+                            best_level = jax.tree_util.tree_map(lambda x: x[best_idx:best_idx+1], sampler["levels"])
+                            best_tokens = jax.vmap(level_to_tokens)(best_level)
+                            best_mean, _ = vae_encode_fn(best_tokens)
+                            z_seed = best_mean[0]
+                            if active_dims is not None:
+                                z_seed = z_seed[active_dims]
+                            z_seed = jnp.where(sampler["size"] > 0, z_seed, jnp.zeros_like(z_seed))
+                            fresh_es = cmaes_mgr_full.initialize(rng_reset_es, mean=z_seed)
+                        else:
+                            fresh_es = cmaes_mgr_full.initialize(rng_reset_es)
                         es_full = jax.tree_util.tree_map(
                             lambda fresh, old: jnp.where(should_reset, fresh, old),
                             fresh_es, es_full)
@@ -1346,17 +1437,23 @@ def main(config=None, project="JAXUED_TEST"):
                     cmaes_ready = sampler["size"] >= config["level_buffer_capacity"]
                     es_state = jax.lax.cond(
                         cmaes_ready, _cmaes_tell, _skip_tell,
-                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates))
+                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates, config["cmaes_reset_interval"]))
                 else:
                     es_state = _cmaes_tell(
-                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates))
+                        (rng_tell, z_population, -scores, es_state, train_state.num_dr_updates, config["cmaes_reset_interval"]))
 
             # DRED: only insert solvable levels (agent got positive reward at least once)
             if config.get("use_dred"):
                 is_solvable = max_returns > 0
                 scores = jnp.where(is_solvable, scores, -jnp.inf)
 
-            sampler, _ = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+            sampler, insertion_indices = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+
+            # Archive: capture newly inserted levels via callback
+            if config.get("save_level_archive"):
+                new_tokens = jax.vmap(level_to_tokens)(new_levels)
+                update_counter = train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
+                jax.debug.callback(_archive_insert_callback, new_tokens, scores, insertion_indices, update_counter)
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -1468,7 +1565,13 @@ def main(config=None, project="JAXUED_TEST"):
             scores = compute_level_scores(rng_score, train_state, levels, obs, actions,
                                           dones, values, max_returns, advantages)
             sampler = level_sampler.update_batch(sampler, level_inds, scores, {"max_return": max_returns})
-            
+
+            # Archive: update replay info for these levels
+            if config.get("save_level_archive"):
+                replay_tokens = jax.vmap(level_to_tokens)(levels)
+                update_counter = train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
+                jax.debug.callback(_archive_replay_callback, replay_tokens, scores, update_counter)
+
             # Update the policy using trajectories collected from replay levels
             (rng, train_state), losses = update_actor_critic_rnn(
                 rng,
@@ -1552,7 +1655,13 @@ def main(config=None, project="JAXUED_TEST"):
             rng, rng_score = jax.random.split(rng)
             scores = compute_level_scores(rng_score, train_state, child_levels, obs, actions,
                                           dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+            sampler, insertion_indices_mut = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+
+            # Archive: capture newly inserted mutated levels via callback
+            if config.get("save_level_archive"):
+                mut_tokens = jax.vmap(level_to_tokens)(child_levels)
+                update_counter = train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
+                jax.debug.callback(_archive_insert_callback, mut_tokens, scores, insertion_indices_mut, update_counter)
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -1773,7 +1882,7 @@ def main(config=None, project="JAXUED_TEST"):
                 print(f"[Warmstart PCA] Restricting to {len(active_dims)} KL-active dims")
                 ws_means = ws_means[:, active_dims]
             ws_fitness = jnp.array(ws_scores) if config.get("cmaes_pca_fitness_aware") else None
-            ws_pca_mean, ws_pca_components = fit_pca(ws_means, config["cmaes_pca_dims"], fitness_scores=ws_fitness)
+            ws_pca_mean, ws_pca_components = fit_pca(ws_means, config["cmaes_pca_dims"], fitness_scores=ws_fitness, pca_mode=config.get("cmaes_pca_mode", "gradient"))
 
             # Diagnostic: verify PCA projection
             print(f"[PCA debug] pca_mean shape: {ws_pca_mean.shape}, norm: {float(jnp.linalg.norm(ws_pca_mean)):.4f}")
@@ -1850,6 +1959,95 @@ def main(config=None, project="JAXUED_TEST"):
             gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
             _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens{tag}.npy")
             _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump{tag}.npz")
+
+    # === Level Archive: tracks ALL levels that ever enter the buffer ===
+    # Keys: token bytes -> {tokens, score, peak_score, first_seen, last_seen}
+    _level_archive = {}  # token_bytes -> dict
+    _archive_log_interval = 1000  # print summary every N new insertions
+    _archive_new_since_log = [0]  # mutable counter for callback
+
+    def _archive_insert_callback(tokens_batch, scores_batch, insertion_indices, update_counter):
+        """jax.debug.callback target: archive levels that were actually inserted (idx != -1)."""
+        tokens_np = np.asarray(tokens_batch)
+        scores_np = np.asarray(scores_batch)
+        indices_np = np.asarray(insertion_indices)
+        update_num = int(update_counter)
+
+        for i in range(len(indices_np)):
+            if indices_np[i] < 0:
+                continue  # not inserted
+            key = tokens_np[i].tobytes()
+            score_i = float(scores_np[i])
+            if key in _level_archive:
+                entry = _level_archive[key]
+                entry["score"] = score_i
+                entry["peak_score"] = max(entry["peak_score"], score_i)
+                entry["last_inserted"] = update_num
+            else:
+                _level_archive[key] = {
+                    "tokens": tokens_np[i].copy(),
+                    "score": score_i,
+                    "peak_score": score_i,
+                    "first_inserted": update_num,
+                    "last_inserted": update_num,
+                    "last_replayed": -1,
+                    "replay_count": 0,
+                }
+                _archive_new_since_log[0] += 1
+        if _archive_new_since_log[0] >= _archive_log_interval:
+            print(f"[Archive] +{_archive_new_since_log[0]} new levels (total: {len(_level_archive)}, update ~{update_num})")
+            _archive_new_since_log[0] = 0
+
+    def _archive_replay_callback(tokens_batch, scores_batch, update_counter):
+        """jax.debug.callback target: update archive entries when levels are replayed for training."""
+        tokens_np = np.asarray(tokens_batch)
+        scores_np = np.asarray(scores_batch)
+        update_num = int(update_counter)
+
+        for i in range(len(tokens_np)):
+            key = tokens_np[i].tobytes()
+            if key in _level_archive:
+                entry = _level_archive[key]
+                entry["score"] = float(scores_np[i])
+                entry["peak_score"] = max(entry["peak_score"], float(scores_np[i]))
+                entry["last_replayed"] = update_num
+                entry["replay_count"] += 1
+
+    def save_level_archive(update_num, tag=None):
+        """Save the cumulative level archive to disk and GCS."""
+        if not _level_archive:
+            return
+        n = len(_level_archive)
+        entries = list(_level_archive.values())
+        all_tokens = np.stack([e["tokens"] for e in entries])
+        all_scores = np.array([e["score"] for e in entries], dtype=np.float32)
+        all_peak_scores = np.array([e["peak_score"] for e in entries], dtype=np.float32)
+        all_first_inserted = np.array([e["first_inserted"] for e in entries], dtype=np.int32)
+        all_last_inserted = np.array([e["last_inserted"] for e in entries], dtype=np.int32)
+        all_last_replayed = np.array([e["last_replayed"] for e in entries], dtype=np.int32)
+        all_replay_counts = np.array([e["replay_count"] for e in entries], dtype=np.int32)
+
+        dump_dir = os.path.join(
+            os.environ.get("BUFFER_DUMP_DIR", "/tmp/buffer_dumps"),
+            f"{config['run_name']}", str(config["seed"]))
+        os.makedirs(dump_dir, exist_ok=True)
+        if tag is None:
+            tag = f"_{update_num // 1000}k" if update_num > 0 else "_final"
+        path = os.path.join(dump_dir, f"level_archive{tag}.npz")
+        np.savez_compressed(path,
+            tokens=all_tokens,
+            scores=all_scores,
+            peak_scores=all_peak_scores,
+            first_inserted=all_first_inserted,
+            last_inserted=all_last_inserted,
+            last_replayed=all_last_replayed,
+            replay_count=all_replay_counts,
+            update_num=update_num,
+        )
+        print(f"[Archive save] {n} levels -> {path}")
+        if config.get("gcs_bucket"):
+            gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
+            _upload_to_gcs(path, config["gcs_bucket"], f"{gcs_base}/level_archive{tag}.npz")
 
     # Track whether delayed-start KL+PCA has been initialized
     _delayed_start_initialized = False
@@ -1939,7 +2137,7 @@ def main(config=None, project="JAXUED_TEST"):
                 if config.get("cmaes_pca_fitness_aware"):
                     pca_fitness = jnp.array(np.asarray(ts_cur.sampler["scores"][:buf_size]))
 
-                new_pca_mean_sub, new_pca_components_sub = fit_pca(pca_input, config["cmaes_pca_dims"], fitness_scores=pca_fitness)
+                new_pca_mean_sub, new_pca_components_sub = fit_pca(pca_input, config["cmaes_pca_dims"], fitness_scores=pca_fitness, pca_mode=config.get("cmaes_pca_mode", "gradient"))
 
                 # Embed back into full 64-dim space
                 if delayed_active_dims is not None:
@@ -2007,7 +2205,7 @@ def main(config=None, project="JAXUED_TEST"):
                                 jnp.array(buf_scores),
                                 jnp.zeros(len(refit_means) - buf_size)
                             ])
-                    new_pca_mean, new_pca_components = fit_pca(refit_means, config["cmaes_pca_dims"], fitness_scores=refit_fitness)
+                    new_pca_mean, new_pca_components = fit_pca(refit_means, config["cmaes_pca_dims"], fitness_scores=refit_fitness, pca_mode=config.get("cmaes_pca_mode", "gradient"))
 
                     # For delayed-start or pca_start_after mode, embed PCA back into full 64-dim space
                     if (config.get("cmaes_delayed_start") or config.get("cmaes_pca_start_after", 0) > 0) and _refit_active is not None:
@@ -2030,6 +2228,15 @@ def main(config=None, project="JAXUED_TEST"):
         updates_so_far = (eval_step + 1) * config["eval_freq"]
         if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
             dump_buffer(runner_state[1], updates_so_far // 1000)
+
+        # Level archive: save at configured interval (levels added via jax.debug.callback)
+        if config.get("save_level_archive"):
+            if config["level_archive_interval"] > 0 and updates_so_far % config["level_archive_interval"] == 0:
+                save_level_archive(updates_so_far)
+
+    # === Final archive save ===
+    if config.get("save_level_archive") and _level_archive:
+        save_level_archive(config["num_updates"], tag="_final")
 
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]
@@ -2326,6 +2533,8 @@ if __name__=="__main__":
                        help="CMA-ES population size. Overrides num_train_envs when set (they must be equal).")
     group.add_argument("--cmaes_reset_interval", type=int, default=500,
                        help="Reset CMA-ES every N DR updates to prevent stagnation")
+    group.add_argument("--cmaes_pca_reset_interval", type=int, default=0,
+                       help="Reset interval after PCA activates (0 = use --cmaes_reset_interval for both phases)")
     group.add_argument("--cmaes_sigma_min", type=float, default=0.0,
                        help="Reset CMA-ES when sigma drops below this threshold (0 = disabled)")
     group.add_argument("--cmaes_kl_threshold", type=float, default=0.0,
@@ -2344,6 +2553,11 @@ if __name__=="__main__":
                        help="Refit PCA on buffer levels only (no random levels mixed in)")
     group.add_argument("--cmaes_pca_fitness_aware", action=argparse.BooleanOptionalAction, default=False,
                        help="Fitness-aware PCA: PC1 = direction of max fitness change, rest = max variance orthogonal to it")
+    group.add_argument("--cmaes_pca_mode", type=str, default="gradient", choices=["gradient", "weighted"],
+                       help="PCA mode when --cmaes_pca_fitness_aware is set. "
+                            "'gradient': PC1 = fitness gradient, rest = max variance orthogonal. "
+                            "'weighted': regret-weighted covariance — finds directions where high-regret "
+                            "levels have max structural spread, with PCA center at the weighted mean.")
     group.add_argument("--cmaes_delayed_start", action=argparse.BooleanOptionalAction, default=False,
                        help="Start with standard ACCEL (random levels), switch to CMA-ES+PCA once buffer is full. "
                             "KL filtering and PCA are computed from buffer levels at that point.")
@@ -2358,6 +2572,9 @@ if __name__=="__main__":
                             "If PCA is enabled, PCA is fit on these buffer levels.")
     group.add_argument("--warmstart_updates", type=int, default=0,
                        help="Offset for update counter so wandb logs continue from this step")
+    group.add_argument("--cmaes_smart_reset", action=argparse.BooleanOptionalAction, default=False,
+                       help="On reset, seed CMA-ES mean from the best-scoring level in the buffer "
+                            "instead of zero. Explores neighborhoods of known high-regret levels.")
     group.add_argument("--save_cmaes_populations", action=argparse.BooleanOptionalAction, default=True,
                        help="Save CMA-ES population archive before each reset for latent visualization")
     # === ADAPTER CONFIG ===
@@ -2370,6 +2587,11 @@ if __name__=="__main__":
                        help="Prefix path within GCS bucket")
     group.add_argument("--buffer_dump_interval", type=int, default=10000,
                        help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
+    group.add_argument("--save_level_archive", action=argparse.BooleanOptionalAction, default=False,
+                       help="Track ALL levels that ever enter the PLR buffer (cumulative archive). "
+                            "Saves tokens, scores, timestamps, first/last seen update. For VAE fine-tuning.")
+    group.add_argument("--level_archive_interval", type=int, default=5000,
+                       help="Save level archive every N updates (only when --save_level_archive is enabled).")
     group.add_argument("--skip_post_eval", action="store_true", default=False,
                        help="Skip post-training buffer evaluation, rendering, and PCA (run evaluate_buffer.py separately)")
 
