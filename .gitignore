@@ -166,8 +166,8 @@ results
 # macOS
 .DS_Store
 
-# Test logs and generated plots
-test_log/
+# Generated plots
+metrics/plots/
 
 # VAE model checkpoints (large binary files)
 vae/model/*.pkl

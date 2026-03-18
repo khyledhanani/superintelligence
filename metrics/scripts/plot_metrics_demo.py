@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, 'examples'))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'vae'))
 sys.path.insert(0, PROJECT_ROOT)
 
-PLOT_DIR = os.path.join(PROJECT_ROOT, 'test_log', 'phase_1')
+PLOT_DIR = os.path.join(PROJECT_ROOT, 'metrics', 'plots')
 
 import numpy as np
 import jax
@@ -33,9 +33,11 @@ from jaxued.environments.maze import Level
 from metrics.pairwise.pos_dtw import position_trace_dtw
 from metrics.pairwise.regret_dtw import regret_curve_dtw
 from metrics.pairwise.action_dtw_binary import action_sequence_distance
+from metrics.pairwise.mode_transition import classify_modes, mode_transition_divergence, MODE_NAMES, NUM_MODES
 from metrics.standalone.per_step_entropy import compute_per_step_entropy
 from metrics.standalone.per_step_regret import compute_per_step_regret
 from metrics.standalone.per_step_action import compute_per_step_action
+from metrics.standalone.value_error import compute_value_error
 from metrics.standalone.regret import compute_regret
 
 from cross_evaluate import load_agent, tokens_to_levels_batch
@@ -174,6 +176,108 @@ def plot_deepdive(axes_row, pair, pair_label, trajectories, ent_infos, reg_infos
     ax.set_xlabel("Step"); ax.set_ylabel("Entropy"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
 
+def plot_deepdive_experience(axes_row, pair, pair_label, trajectories, ve_infos, mode_infos, wall_maps):
+    """Deep-dive row for value error + mode transition metrics.
+
+    Cols: grid A, grid B, value error curves, mode sequences, mode fractions bar, transition heatmaps.
+    """
+    li, lj = pair
+    ti, tj = trajectories[li], trajectories[lj]
+
+    # Col 0-1: maze grids with paths (same as original)
+    for col, (env_idx, traj_data, color) in enumerate([(li, ti, 'blue'), (lj, tj, 'red')]):
+        ax = axes_row[col]
+        img = wall_map_to_grid(wall_maps[env_idx])
+        ax.imshow(img, origin='upper')
+        pos = traj_data["positions"]
+        dones = traj_data["dones"]
+        done_idx = np.where(dones)[0]
+        end = done_idx[0] + 1 if len(done_idx) > 0 else len(pos)
+        pos_trunc = pos[:end]
+        for t in range(len(pos_trunc) - 1):
+            alpha = 0.3 + 0.7 * (t / max(len(pos_trunc) - 1, 1))
+            ax.plot([pos_trunc[t, 0], pos_trunc[t+1, 0]],
+                    [pos_trunc[t, 1], pos_trunc[t+1, 1]],
+                    color=color, alpha=alpha, linewidth=2)
+        ax.plot(pos_trunc[0, 0], pos_trunc[0, 1], 'o', color=color, markersize=8, label='start')
+        if end > 1:
+            ax.plot(pos_trunc[-1, 0], pos_trunc[-1, 1], 's', color=color, markersize=8, label='end')
+        ax.set_title(f"{pair_label} — L{env_idx} ({len(pos_trunc)} steps)", fontsize=10)
+        ax.legend(fontsize=8); ax.set_xlim(-0.5, 12.5); ax.set_ylim(12.5, -0.5)
+
+    # Col 2: Signed value error curves (both overlaid)
+    ax = axes_row[2]
+    vi, vj = ve_infos[li], ve_infos[lj]
+    if vi["episode_length"] > 0:
+        ax.plot(vi["error_curve"], color='steelblue', linewidth=1.2, alpha=0.8,
+                label=f'L{li} (mean={vi["mean_error"]:.3f})')
+    if vj["episode_length"] > 0:
+        ax.plot(vj["error_curve"], color='firebrick', linewidth=1.2, alpha=0.8,
+                label=f'L{lj} (mean={vj["mean_error"]:.3f})')
+    ax.axhline(0, color='gray', linewidth=0.8, linestyle='--', alpha=0.5)
+    ax.set_title(f"{pair_label} — Signed Value Error", fontsize=10)
+    ax.set_xlabel("Step"); ax.set_ylabel("V(s_t) - G_t")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # Col 3: Mode sequences as colored bars
+    ax = axes_row[3]
+    mode_colors = ['#2ecc71', '#e74c3c', '#f39c12', '#3498db', '#9b59b6']
+    mi, mj = mode_infos[li], mode_infos[lj]
+    if mi["episode_length"] > 0:
+        for t in range(mi["episode_length"]):
+            ax.barh(1, 1, left=t, height=0.4, color=mode_colors[mi["modes"][t]])
+    if mj["episode_length"] > 0:
+        for t in range(mj["episode_length"]):
+            ax.barh(0, 1, left=t, height=0.4, color=mode_colors[mj["modes"][t]])
+    ax.set_yticks([0, 1]); ax.set_yticklabels([f'L{lj}', f'L{li}'], fontsize=9)
+    ax.set_title(f"{pair_label} — Mode Sequence", fontsize=10)
+    ax.set_xlabel("Step")
+    # Legend
+    from matplotlib.patches import Patch
+    legend_patches = [Patch(color=mode_colors[m], label=MODE_NAMES[m]) for m in range(NUM_MODES)]
+    ax.legend(handles=legend_patches, fontsize=6, loc='upper right', ncol=2)
+
+    # Col 4: Mode fractions bar chart (side by side)
+    ax = axes_row[4]
+    x = np.arange(NUM_MODES)
+    w = 0.35
+    ax.bar(x - w/2, mi["mode_fractions"], w, color='steelblue', alpha=0.8, label=f'L{li}')
+    ax.bar(x + w/2, mj["mode_fractions"], w, color='firebrick', alpha=0.8, label=f'L{lj}')
+    ax.set_xticks(x)
+    ax.set_xticklabels([n.replace('_', '\n') for n in MODE_NAMES], fontsize=7)
+    ax.set_title(f"{pair_label} — Mode Fractions", fontsize=10)
+    ax.set_ylabel("Fraction"); ax.legend(fontsize=8); ax.grid(alpha=0.3, axis='y')
+
+    # Col 5: Transition heatmap for level i
+    ax = axes_row[5]
+    im = ax.imshow(mi["transition_probs"], vmin=0, vmax=1, cmap='YlOrRd', aspect='equal')
+    ax.set_xticks(range(NUM_MODES)); ax.set_yticks(range(NUM_MODES))
+    short_names = ['CC', 'CW', 'Unc', 'Rec', 'Deg']
+    ax.set_xticklabels(short_names, fontsize=8); ax.set_yticklabels(short_names, fontsize=8)
+    ax.set_title(f"L{li} Transitions", fontsize=10)
+    ax.set_xlabel("To"); ax.set_ylabel("From")
+    for r in range(NUM_MODES):
+        for c in range(NUM_MODES):
+            v = mi["transition_probs"][r, c]
+            if v > 0.01:
+                ax.text(c, r, f'{v:.2f}', ha='center', va='center', fontsize=7,
+                        color='white' if v > 0.5 else 'black')
+
+    # Col 6: Transition heatmap for level j
+    ax = axes_row[6]
+    im = ax.imshow(mj["transition_probs"], vmin=0, vmax=1, cmap='YlOrRd', aspect='equal')
+    ax.set_xticks(range(NUM_MODES)); ax.set_yticks(range(NUM_MODES))
+    ax.set_xticklabels(short_names, fontsize=8); ax.set_yticklabels(short_names, fontsize=8)
+    ax.set_title(f"L{lj} Transitions", fontsize=10)
+    ax.set_xlabel("To"); ax.set_ylabel("From")
+    for r in range(NUM_MODES):
+        for c in range(NUM_MODES):
+            v = mj["transition_probs"][r, c]
+            if v > 0.01:
+                ax.text(c, r, f'{v:.2f}', ha='center', va='center', fontsize=7,
+                        color='white' if v > 0.5 else 'black')
+
+
 def main():
     os.makedirs(PLOT_DIR, exist_ok=True)
 
@@ -303,15 +407,95 @@ def main():
     print(f"Saved: {PLOT_DIR}/plots_deepdive_regret.png")
     plt.close(fig3)
 
+    # ============================================================
+    # Compute new metrics: value error + mode transitions
+    # ============================================================
+    print("Computing value error profiles...")
+    ve_infos = [compute_value_error(t["values"], t["rewards"], t["dones"]) for t in trajectories]
+
+    print("Computing mode classifications...")
+    mode_infos = [classify_modes(t["values"], t["rewards"], t["dones"],
+                                 entropy=t.get("entropy")) for t in trajectories]
+
+    print("Computing pairwise mode transition divergence...")
+    mode_div_dists = []
+    for i in range(NUM_LEVELS):
+        for j in range(i + 1, NUM_LEVELS):
+            ti, tj = trajectories[i], trajectories[j]
+            div = mode_transition_divergence(
+                ti, ti["dones"], tj, tj["dones"],
+                entropy_a=ti.get("entropy"), entropy_b=tj.get("entropy"),
+            )
+            mode_div_dists.append(div["kl_divergence"])
+    mode_div_dists = np.array(mode_div_dists)
+
+    # Value error pairwise: L1 distance of error curves (truncated to min length)
+    print("Computing pairwise value error distances...")
+    ve_dists = []
+    for i in range(NUM_LEVELS):
+        for j in range(i + 1, NUM_LEVELS):
+            ei, ej = ve_infos[i]["error_curve"], ve_infos[j]["error_curve"]
+            min_len = min(len(ei), len(ej))
+            if min_len > 0:
+                ve_dists.append(float(np.mean(np.abs(ei[:min_len] - ej[:min_len]))))
+            else:
+                ve_dists.append(0.0)
+    ve_dists = np.array(ve_dists)
+
+    # ============================================================
+    # FIGURE 4: Deep-dive by value error distance
+    # ============================================================
+    pair_sim_ve = pair_indices[np.argmin(ve_dists)]
+    pair_diff_ve = pair_indices[np.argmax(ve_dists)]
+
+    fig4, axes4 = plt.subplots(2, 7, figsize=(35, 10))
+    fig4.suptitle("Deep-Dive: Most Similar vs Most Different by Value Error Profile",
+                  fontsize=14, fontweight='bold')
+    plot_deepdive_experience(axes4[0], pair_sim_ve, "Most Similar (value error)",
+                             trajectories, ve_infos, mode_infos, wall_maps)
+    plot_deepdive_experience(axes4[1], pair_diff_ve, "Most Different (value error)",
+                             trajectories, ve_infos, mode_infos, wall_maps)
+    plt.tight_layout()
+    fig4.savefig(f"{PLOT_DIR}/plots_deepdive_value_error.png", dpi=150, bbox_inches='tight')
+    print(f"Saved: {PLOT_DIR}/plots_deepdive_value_error.png")
+    plt.close(fig4)
+
+    # ============================================================
+    # FIGURE 5: Deep-dive by mode transition divergence
+    # ============================================================
+    pair_sim_mode = pair_indices[np.argmin(mode_div_dists)]
+    pair_diff_mode = pair_indices[np.argmax(mode_div_dists)]
+
+    fig5, axes5 = plt.subplots(2, 7, figsize=(35, 10))
+    fig5.suptitle("Deep-Dive: Most Similar vs Most Different by Experience Mode Divergence",
+                  fontsize=14, fontweight='bold')
+    plot_deepdive_experience(axes5[0], pair_sim_mode, "Most Similar (experience)",
+                             trajectories, ve_infos, mode_infos, wall_maps)
+    plot_deepdive_experience(axes5[1], pair_diff_mode, "Most Different (experience)",
+                             trajectories, ve_infos, mode_infos, wall_maps)
+    plt.tight_layout()
+    fig5.savefig(f"{PLOT_DIR}/plots_deepdive_mode_transition.png", dpi=150, bbox_inches='tight')
+    print(f"Saved: {PLOT_DIR}/plots_deepdive_mode_transition.png")
+    plt.close(fig5)
+
     print(f"\nDone! All figures saved to {PLOT_DIR}/")
     corr_pa = np.corrcoef(pos_dtw_dists, act_dtw_dists)[0, 1]
     corr_pr = np.corrcoef(pos_dtw_dists, reg_dtw_dists)[0, 1]
     corr_ar = np.corrcoef(act_dtw_dists, reg_dtw_dists)[0, 1]
+    corr_pm = np.corrcoef(pos_dtw_dists, mode_div_dists)[0, 1]
+    corr_am = np.corrcoef(act_dtw_dists, mode_div_dists)[0, 1]
+    corr_rm = np.corrcoef(reg_dtw_dists, mode_div_dists)[0, 1]
+    corr_ve_m = np.corrcoef(ve_dists, mode_div_dists)[0, 1]
     print(f"\nStats:")
-    print(f"  Pos DTW:    mean={pos_dtw_dists.mean():.3f}, std={pos_dtw_dists.std():.3f}")
-    print(f"  Action DTW: mean={act_dtw_dists.mean():.3f}, std={act_dtw_dists.std():.3f}")
-    print(f"  Regret DTW: mean={reg_dtw_dists.mean():.3f}, std={reg_dtw_dists.std():.3f}")
-    print(f"  Correlations: pos-action r={corr_pa:.3f}, pos-regret r={corr_pr:.3f}, action-regret r={corr_ar:.3f}")
+    print(f"  Pos DTW:         mean={pos_dtw_dists.mean():.3f}, std={pos_dtw_dists.std():.3f}")
+    print(f"  Action DTW:      mean={act_dtw_dists.mean():.3f}, std={act_dtw_dists.std():.3f}")
+    print(f"  Regret DTW:      mean={reg_dtw_dists.mean():.3f}, std={reg_dtw_dists.std():.3f}")
+    print(f"  Value Error L1:  mean={ve_dists.mean():.3f}, std={ve_dists.std():.3f}")
+    print(f"  Mode Div (KL):   mean={mode_div_dists.mean():.3f}, std={mode_div_dists.std():.3f}")
+    print(f"\n  Correlations:")
+    print(f"    pos-action r={corr_pa:.3f}, pos-regret r={corr_pr:.3f}, action-regret r={corr_ar:.3f}")
+    print(f"    pos-mode r={corr_pm:.3f}, action-mode r={corr_am:.3f}, regret-mode r={corr_rm:.3f}")
+    print(f"    value_error-mode r={corr_ve_m:.3f}")
 
 
 if __name__ == "__main__":

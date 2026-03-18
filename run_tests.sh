@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run tests for a specific phase and save results to test_log/phase_N/
+# Run tests for a specific phase and save results to metrics/plots/
 #
 # Usage:
 #   ./run_tests.sh 1        # Run Phase 1 tests
@@ -36,7 +36,7 @@ run_suite() {
 
 run_phase() {
     local phase_num="$1"
-    local phase_dir="$SCRIPT_DIR/test_log/phase_${phase_num}"
+    local phase_dir="$SCRIPT_DIR/metrics/plots"
     local timestamp=$(date '+%Y%m%d_%H%M%S')
     local log_file="$phase_dir/${timestamp}.log"
 
@@ -68,8 +68,8 @@ run_phase() {
                 "cd $SCRIPT_DIR && WANDB_MODE=disabled $VENV_PYTHON -m pytest tests/test_examples_kinda.py -v --tb=short 2>&1" \
                 "$log_file"
 
-            run_suite "Metrics Visualization Plots (4 figures)" \
-                "cd $SCRIPT_DIR && $VENV_PYTHON metrics/plot_metrics_demo.py 2>&1" \
+            run_suite "Metrics Visualization Plots (5 figures)" \
+                "cd $SCRIPT_DIR && $VENV_PYTHON metrics/scripts/plot_metrics_demo.py 2>&1" \
                 "$log_file"
             ;;
         2)

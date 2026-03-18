@@ -50,7 +50,9 @@ from metrics.standalone.per_step_entropy import compute_per_step_entropy
 from metrics.standalone.per_step_regret import compute_per_step_regret
 from metrics.standalone.per_step_action import compute_per_step_action
 from metrics.standalone.regret import compute_regret
+from metrics.standalone.value_error import compute_value_error
 from metrics.pairwise.pos_dtw import position_trace_dtw
+from metrics.pairwise.mode_transition import mode_transition_divergence
 from metrics.utils import downsample, format_vector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -237,6 +239,23 @@ def build_references_with_metrics(
                     metric_key="action_sequence",
                 ))
 
+            # Value error profile
+            if _enabled(pm, "value_error"):
+                ve_info = compute_value_error(traj["values"], traj["rewards"], traj["dones"])
+                ds_error = downsample(ve_info["error_curve"], downsample_points)
+                metrics.append(MetricEntry(
+                    name="Value Error",
+                    value=format_vector(ds_error),
+                    description=(
+                        f"Signed V(s_t)-G_t: positive=overconfident, negative=underconfident "
+                        f"(mean={ve_info['mean_error']:.3f}, "
+                        f"overconfident {ve_info['overconfident_frac']:.0%} of steps, "
+                        f"ep_len={ve_info['episode_length']})"
+                    ),
+                    higher_is="more overconfident (agent expects more than reality)",
+                    metric_key="value_error",
+                ))
+
             # Path overlay
             path_overlay = None
             if _enabled(pm, "path_overlay"):
@@ -285,6 +304,26 @@ def build_references_with_metrics(
                     value=dtw_result["distance"],
                     description="Spatial path similarity (lower = more similar routes)",
                     metric_key="position_dtw",
+                ))
+
+    # Pairwise mode transition divergence between all reference pairs
+    if _enabled(pw, "mode_transition") and trajectories is not None and len(trajectories) >= 2:
+        for i in range(len(trajectories)):
+            for j in range(i + 1, len(trajectories)):
+                ti, tj = trajectories[i], trajectories[j]
+                div_result = mode_transition_divergence(
+                    ti, ti["dones"],
+                    tj, tj["dones"],
+                    entropy_a=ti.get("entropy"),
+                    entropy_b=tj.get("entropy"),
+                )
+                pairwise_metrics.append(PairwiseMetricEntry(
+                    maze_a_label=references[i].label,
+                    maze_b_label=references[j].label,
+                    name="Experience Divergence",
+                    value=div_result["kl_divergence"],
+                    description="Mode transition KL divergence (higher = more different agent experiences)",
+                    metric_key="mode_transition",
                 ))
 
     return references, pairwise_metrics

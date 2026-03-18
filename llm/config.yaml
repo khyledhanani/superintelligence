@@ -44,10 +44,12 @@ prompt_metrics:
   scalar_regret: true       # Mean per-step regret (single number, MaxMC)
   action_sequence: true     # Agent's discrete actions per step (behavioral fingerprint)
   path_overlay: true        # ASCII visualization of agent trajectory on the grid
+  value_error: false        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
 
 # Pairwise metrics injected into the LLM prompt (between all reference pairs).
 pairwise_metrics:
   position_dtw: true        # Spatial path similarity between two trajectories
+  mode_transition: false    # Experience mode transition divergence (experiential diversity)
 
 # --- Agent & Feedback Loop ---
 agent_dir: gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198
