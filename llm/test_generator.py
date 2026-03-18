@@ -769,6 +769,7 @@ def run_test(args):
         max_tokens=args.max_tokens,
         thinking=args.thinking,
         thinking_budget=args.thinking_budget,
+        thinking_in_output=args.thinking_in_output,
         max_retries=args.max_retries,
         timeout=args.timeout,
         min_walls=args.min_walls,
@@ -964,7 +965,7 @@ def main():
     parser.add_argument("--no-inject-buffer-stats", action="store_false", dest="inject_buffer_stats")
 
     # LLM settings
-    parser.add_argument("--provider", choices=["ollama", "openrouter"],
+    parser.add_argument("--provider", choices=["ollama", "openrouter", "claude-code"],
                         default=cfg.get("provider"),
                         help="API provider")
     parser.add_argument("--base-url", default=None,
@@ -981,6 +982,9 @@ def main():
     parser.add_argument("--thinking", action="store_true",
                         default=cfg.get("thinking", False),
                         help="Enable extended thinking (reasoning models like Opus)")
+    parser.add_argument("--thinking-in-output", action="store_true",
+                        default=cfg.get("thinking_in_output", False),
+                        help="Prompt the LLM to include reasoning before the grid")
     parser.add_argument("--thinking-budget", type=int,
                         default=cfg.get("thinking_budget", 10000),
                         help="Token budget for extended thinking")

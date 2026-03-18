@@ -89,7 +89,7 @@ class PairwiseMetricEntry:
         return line
 
 
-SYSTEM_PROMPT = """You are a maze designer for a reinforcement learning environment.
+_SYSTEM_PROMPT_BASE = """You are a maze designer for a reinforcement learning environment.
 
 MAZE FORMAT:
 - Grid: exactly 13 rows x 13 columns
@@ -109,8 +109,9 @@ DESIGN PRINCIPLES:
 - Interesting mazes force the agent to navigate around obstacles
 - Variety in path structure: corridors, open rooms, chokepoints, dead ends
 - The agent start and goal should be separated by meaningful navigation
-- Avoid trivial mazes (no walls) or impossible mazes (goal unreachable)
+- Avoid trivial mazes (no walls) or impossible mazes (goal unreachable)"""
 
+_OUTPUT_FORMAT_GRID_ONLY = """
 OUTPUT FORMAT:
 Return ONLY the 13x13 grid, one row per line, with no extra text before or after.
 Do not wrap in code blocks or add any explanation.
@@ -131,6 +132,51 @@ Example of valid output format (this is deliberately trivial — generate someth
 #...........#
 #..........G#
 #############"""
+
+_OUTPUT_FORMAT_WITH_REASONING = """
+OUTPUT FORMAT:
+First, write a brief reasoning section (3-5 sentences max), then output the grid.
+
+REASONING (keep it short):
+- What makes your maze different from the references
+- Where you placed agent/goal and why
+- How you verified solvability (trace the path mentally)
+
+GRID:
+Then output EXACTLY 13 rows of 13 characters each using only: # . > v < ^ G
+One agent start (>v<^) and one goal (G). Must be solvable.
+
+Example:
+
+REASONING:
+Agent bottom-left, goal top-right. Winding corridor with two dead ends.
+Path: right along bottom, up through center gap, right to goal.
+
+GRID:
+#############
+#>..........#
+#...........#
+#...........#
+#...........#
+#...........#
+#.####.####.#
+#...........#
+#...........#
+#...........#
+#...........#
+#..........G#
+#############"""
+
+
+def get_system_prompt(thinking_in_output: bool = False) -> str:
+    """Build the system prompt with appropriate output format section."""
+    if thinking_in_output:
+        return _SYSTEM_PROMPT_BASE + _OUTPUT_FORMAT_WITH_REASONING
+    return _SYSTEM_PROMPT_BASE + _OUTPUT_FORMAT_GRID_ONLY
+
+
+# Keep backward compat
+SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE + _OUTPUT_FORMAT_GRID_ONLY
 
 
 # ---------------------------------------------------------------------------

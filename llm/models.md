@@ -9,7 +9,10 @@ All tests use the same prompt structure: 3 reference mazes from the replay buffe
 
 | Model            | Provider     | Success | Time/Maze | Regret  | Solve Rate | $/Maze | Cost (in/out) |
 |------------------|-------------|---------|-----------|---------|------------|--------|---------------|
+| **sonnet (CLI)** | claude-code | **100%**| **7-24s** | 1.0     | 67-99%     | **$0** | Subscription  |
+| **opus (CLI)**   | claude-code | **100%**| **43s**   | 1.0     | 100%       | **$0** | Subscription  |
 | claude-sonnet-4  | OpenRouter  | 100%    | 6-16s     | 1.0-1.1 | 5-100%     | ~$0.02 | $3/$15 per M  |
+| sonnet-4+thinking| OpenRouter  | 100%    | 50-117s   | 1.1     | 14-93%     | ~$0.08 | $3/$15 per M  |
 | claude-opus-4    | OpenRouter  | 100%    | 22-163s   | 1.0-1.2 | 11-92%     | ~$0.23 | $15/$75 per M |
 | gpt-5.4          | OpenRouter  | 67%     | 11s       | 1.0-1.1 | 97-100%    | ~$0.01 | $2.50/$10 per M |
 | kimi-k2.5        | OpenRouter  | 67%     | 150-560s  | 1.0-1.04| 100%       | ~$0.02 | $0.60/$2 per M |
@@ -35,6 +38,36 @@ All tests use the same prompt structure: 3 reference mazes from the replay buffe
 Thinking traces available for: claude-opus-4 (`--thinking`), kimi-k2.5, qwen3.5, deepseek-v3.2 (via fallback).
 
 ## Detailed Notes
+
+### claude-code CLI — Sonnet (Subscription)
+- Uses `claude -p` subprocess — no API key, no per-token cost
+- **100% success rate** (3/3 sonnet, 1/1 opus)
+- Sonnet: ~7-24s per maze, Opus: ~43s per maze
+- Regret consistently hits 1.0+ threshold (sonnet: 1.003, 1.028, 1.002; opus: 1.036)
+- Solve rates 67-100% — challenging but solvable
+- Good structural diversity: labyrinths, open-border, spiral patterns
+- Usage: `--provider claude-code --model sonnet` (or `opus`)
+- Limitation: subscription rate limits may throttle heavy batch generation
+
+#### Reasoning traces (inline, not separate)
+The CLI doesn't expose thinking in a separate field, but both models include reasoning
+inline in the `result` field. The `_parse_grid()` function strips it and extracts the grid.
+
+**Opus reasoning** (~1K chars per response): strategic and analytical
+- Analyzes reference maze patterns: "agents starting near bottom, dominant vertical action sequences (~60% action 2)"
+- Makes explicit design decisions: "force lateral navigation... serpentine horizontal path"
+- Self-diagnoses after feedback: "previous maze had a symmetric pattern; I need asymmetric, organic layout"
+- Verifies solvability: "Wait — let me verify solvability and ensure proper difficulty"
+
+**Sonnet reasoning**: terse, only appears when recovering from errors
+- Most responses are just the grid (181 chars, no reasoning)
+- When it does reason (after format/solvability failure), it traces paths with coordinates:
+  "from (12,6) go up through col 6 to row 8, then right to col 9..."
+- Path-first design: plans the solution path, then builds walls around it
+
+Both approaches produce valid mazes. Opus's strategic reasoning may explain the slightly
+higher regret (1.036 vs 1.003) — it explicitly targets deceptive dead ends and ambiguous
+junctions. Sonnet's path-first approach guarantees solvability but may produce simpler structures.
 
 ### kimi-k2.5:cloud (Ollama)
 - **Thinking model** that puts output in `thinking` field (content is empty)

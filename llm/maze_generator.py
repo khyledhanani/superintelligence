@@ -15,7 +15,9 @@ Usage:
 
 import os
 import re
+import json
 import logging
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Callable
@@ -25,6 +27,7 @@ import numpy as np
 
 from llm.prompt_builder import (
     SYSTEM_PROMPT,
+    get_system_prompt,
     ReferenceMaze,
     MetricEntry,
     PairwiseMetricEntry,
@@ -70,6 +73,7 @@ class GenerationConfig:
     max_tokens: int = 4096
     thinking: bool = False
     thinking_budget: int = 10000
+    thinking_in_output: bool = False
     min_walls: int = 0
     min_path_distance: int = 0
     validate_solvable: bool = True
@@ -84,6 +88,7 @@ class GenerationConfig:
             "base_url": "https://openrouter.ai/api/v1",
             "api_key_env": "OPENROUTER_API_KEY",
         },
+        "claude-code": {},  # no API key needed, uses CLI subscription
     }
 
     def __post_init__(self):
@@ -96,7 +101,7 @@ class GenerationConfig:
             env_var = defaults.get("api_key_env", "")
             if env_var:
                 self.api_key = _load_api_key(env_var)
-        if not self.api_key:
+        if not self.api_key and self.provider not in ("claude-code",):
             logger.warning(
                 f"No API key found for provider '{self.provider}'. "
                 f"Set {defaults.get('api_key_env', 'API_KEY')} via environment variable or .env file."
@@ -174,8 +179,9 @@ class MazeGenerator:
             target_metrics=target_metrics,
         )
 
+        system_prompt = get_system_prompt(self.config.thinking_in_output)
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -189,6 +195,11 @@ class MazeGenerator:
                 result.thinking_logs.append(None)
                 continue
             result.raw_responses.append(raw_response)
+
+            # Extract inline reasoning (text before the grid) when no
+            # separate thinking trace was returned by the API
+            if thinking is None and self.config.thinking_in_output:
+                thinking = self._extract_inline_reasoning(raw_response)
             result.thinking_logs.append(thinking)
 
             # Parse grid from response
@@ -277,12 +288,14 @@ class MazeGenerator:
         return result
 
     def _call_llm(self, messages: List[Dict]) -> tuple:
-        """Call the LLM API. Dispatches to Ollama or OpenAI-compatible format.
+        """Call the LLM API. Dispatches by provider.
 
         Returns:
             (content, thinking) tuple. content is None on failure.
             thinking is None for non-reasoning models or on failure.
         """
+        if self.config.provider == "claude-code":
+            return self._call_claude_code(messages)
         if self.config.provider == "openrouter":
             return self._call_openai_compatible(messages)
         return self._call_ollama(messages)
@@ -336,6 +349,84 @@ class MazeGenerator:
         except (KeyError, IndexError) as e:
             logger.error(f"Unexpected API response format: {e}")
             logger.error(f"Response data: {data}")
+            return None, None
+
+    def _call_claude_code(self, messages: List[Dict]) -> tuple:
+        """Call Claude Code CLI in non-interactive mode (claude -p).
+
+        Uses the local CLI subscription — no API key needed.
+        Each call is a fresh session; multi-turn context is flattened.
+        User prompt is piped via stdin to handle long prompts.
+
+        Returns:
+            (content, thinking) tuple. thinking is always None (CLI doesn't
+            expose reasoning traces separately).
+        """
+        # Extract system prompt and flatten conversation
+        system = ""
+        parts = []
+        for m in messages:
+            if m["role"] == "system":
+                system = m["content"]
+            elif m["role"] == "user":
+                parts.append(m["content"])
+            elif m["role"] == "assistant":
+                parts.append(f"[Your previous response]\n{m['content']}")
+        user_prompt = "\n\n".join(parts)
+
+        cmd = [
+            "claude", "-p", "-",  # read prompt from stdin
+            "--output-format", "json",
+            "--max-turns", "1",
+        ]
+        if system:
+            cmd.extend(["--system-prompt", system])
+        if self.config.model:
+            cmd.extend(["--model", self.config.model])
+
+        try:
+            logger.debug(f"Calling claude CLI with model={self.config.model}")
+            # Set env var so user hooks can skip notifications for subprocess calls
+            env = os.environ.copy()
+            env["CLAUDE_CODE_SUBPROCESS"] = "1"
+            proc = subprocess.run(
+                cmd,
+                env=env,
+                input=user_prompt,
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout,
+            )
+            if proc.returncode != 0:
+                logger.error(f"claude CLI exited with code {proc.returncode}")
+                if proc.stderr:
+                    logger.error(f"stderr: {proc.stderr[:500]}")
+                return None, None
+
+            data = json.loads(proc.stdout)
+            content = data.get("result", "")
+            if not content:
+                logger.error("claude CLI returned empty result")
+                return None, None
+
+            # Log token usage if available
+            usage = data.get("usage", {})
+            if usage:
+                logger.info(
+                    f"Claude CLI tokens: {usage.get('input_tokens', '?')} in, "
+                    f"{usage.get('output_tokens', '?')} out"
+                )
+
+            return content, None
+        except subprocess.TimeoutExpired:
+            logger.error(f"claude CLI timed out after {self.config.timeout}s")
+            return None, None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse claude CLI output: {e}")
+            logger.error(f"stdout: {proc.stdout[:500]}")
+            return None, None
+        except FileNotFoundError:
+            logger.error("claude CLI not found — is Claude Code installed?")
             return None, None
 
     def _call_openai_compatible(self, messages: List[Dict]) -> tuple:
@@ -406,6 +497,39 @@ class MazeGenerator:
             logger.error(f"Unexpected API response format: {e}")
             logger.error(f"Response data: {data}")
             return None, None
+
+    def _extract_inline_reasoning(self, raw_response: str) -> Optional[str]:
+        """Extract reasoning text that appears before the maze grid.
+
+        When thinking_in_output is enabled, the model is encouraged to write
+        reasoning before the grid. This method splits the response at the
+        first maze row and returns everything before it as the thinking trace.
+
+        Returns:
+            Reasoning text, or None if no reasoning found.
+        """
+        valid_chars = set('#.>v<^G')
+        lines = raw_response.strip().split('\n')
+        first_grid_line = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if all(c in valid_chars for c in stripped) and 10 <= len(stripped) <= 16:
+                first_grid_line = i
+                break
+
+        if first_grid_line is None or first_grid_line == 0:
+            return None
+
+        reasoning = '\n'.join(lines[:first_grid_line]).strip()
+        # Strip markdown headers like "REASONING:" or "GRID:" artifacts
+        reasoning = re.sub(r'^(REASONING|GRID)\s*:\s*', '', reasoning, flags=re.MULTILINE).strip()
+        if not reasoning:
+            return None
+
+        logger.info(f"Extracted inline reasoning ({len(reasoning)} chars)")
+        return reasoning
 
     def _parse_grid(self, raw_response: str) -> tuple:
         """Extract a 13x13 grid from the LLM response.
