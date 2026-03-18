@@ -766,6 +766,9 @@ def run_test(args):
         model=args.model,
         api_key=args.api_key,
         temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        thinking=args.thinking,
+        thinking_budget=args.thinking_budget,
         max_retries=args.max_retries,
         timeout=args.timeout,
         min_walls=args.min_walls,
@@ -972,6 +975,15 @@ def main():
                         help="API key (auto-loaded from env var specified in config)")
     parser.add_argument("--temperature", type=float,
                         default=cfg.get("temperature"))
+    parser.add_argument("--max-tokens", type=int,
+                        default=cfg.get("max_tokens", 4096),
+                        help="Max output tokens for LLM response")
+    parser.add_argument("--thinking", action="store_true",
+                        default=cfg.get("thinking", False),
+                        help="Enable extended thinking (reasoning models like Opus)")
+    parser.add_argument("--thinking-budget", type=int,
+                        default=cfg.get("thinking_budget", 10000),
+                        help="Token budget for extended thinking")
     parser.add_argument("--max-retries", type=int,
                         default=cfg.get("max_retries"))
     parser.add_argument("--timeout", type=int, default=cfg.get("timeout"),

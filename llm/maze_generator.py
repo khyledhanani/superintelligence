@@ -67,6 +67,9 @@ class GenerationConfig:
     temperature: float = 0.0
     max_retries: int = 0
     timeout: int = 0
+    max_tokens: int = 4096
+    thinking: bool = False
+    thinking_budget: int = 10000
     min_walls: int = 0
     min_path_distance: int = 0
     validate_solvable: bool = True
@@ -350,7 +353,22 @@ class MazeGenerator:
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
         }
+
+        # Enable extended thinking for reasoning models (Opus, etc.)
+        if self.config.thinking:
+            # OpenRouter uses a top-level "reasoning" field
+            payload["reasoning"] = {
+                "max_tokens": self.config.thinking_budget,
+            }
+            # max_tokens must exceed reasoning budget to leave room for the answer
+            payload["max_tokens"] = max(
+                self.config.max_tokens,
+                self.config.thinking_budget + 1000,
+            )
+            # Anthropic thinking requires temperature=1 (or unset)
+            payload["temperature"] = 1.0
 
         url = f"{self.config.base_url}/chat/completions"
         try:
@@ -362,8 +380,14 @@ class MazeGenerator:
             data = resp.json()
             message = data["choices"][0]["message"]
             content = message.get("content", "")
-            # OpenAI-compatible reasoning: check "reasoning" or "reasoning_content"
+            # OpenRouter reasoning: check "reasoning" field or "reasoning_details" array
             thinking = message.get("reasoning", None) or message.get("reasoning_content", None)
+            if not thinking and "reasoning_details" in message:
+                # Extract text from reasoning_details array
+                details = message["reasoning_details"]
+                if isinstance(details, list):
+                    parts = [d.get("text", "") for d in details if isinstance(d, dict)]
+                    thinking = "\n".join(parts) if parts else None
             if thinking:
                 logger.info(f"Model reasoning ({len(thinking)} chars)")
             return content, thinking
