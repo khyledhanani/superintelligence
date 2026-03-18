@@ -19,7 +19,7 @@ openrouter:
   api_key_env: OPENROUTER_API_KEY
 
 # --- Generation ---
-n: 3                        # Number of mazes to generate
+n: 1                        # Number of mazes to generate
 max_retries: 3              # Max LLM retries on invalid output
 min_walls: 10               # Minimum wall cells for valid maze
 min_path_distance: 4        # Minimum Manhattan distance agent-to-goal
@@ -27,7 +27,7 @@ validate_solvable: true     # BFS solvability check on generated mazes
 
 # --- Reference Mazes ---
 buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
-num_refs: 3                 # Number of reference mazes from buffer
+num_refs: 6                 # Number of reference mazes from buffer
 strategy: top_regret        # "top_regret", "random", or "diverse"
 
 # --- Metric Injection ---
@@ -64,8 +64,9 @@ max_diversity_retries: 3
 # Thresholds for accepting a generated maze. Set to null to disable a gate.
 # A maze must pass ALL enabled gates. On failure, LLM gets metric feedback and retries.
 gate:
-  min_regret: 1             # Rejects too-easy mazes (regret < 1.0) and unsolvable (negative regret) -> we need to dynamically change this during training depending on the buffer
-  min_pos_dtw: null         # Min position DTW vs references (null = disabled; needs investigation)
+  min_regret: 0.6             # Rejects too-easy mazes and unsolvable (negative regret). Should be tuned to buffer (buffer max is 0.475 for this buffer).
+  min_diversity: 0.02         # Min mean pairwise diversity vs references (calibrated: buffer median=0.02, 90th pctile=0.04)
+  diversity_metric: td_error_emd  # "td_error_emd", "experience_divergence", or "position_dtw"
 
 # --- Metric Display ---
 downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt

@@ -514,7 +514,7 @@ def print_result(result: GenerationResult, idx: int):
     if result.gate_metrics:
         print(f"  Gate metrics:")
         for k, v in result.gate_metrics.items():
-            print(f"    {k}: {v:.4f}")
+            print(f"    {k}: {v:.4f}" if isinstance(v, (int, float)) else f"    {k}: {v}")
     if result.diversity_issues:
         print(f"  Unresolved diversity issues:")
         for issue in result.diversity_issues:
@@ -662,7 +662,8 @@ def save_results(
             entry["feedback_prompts"] = result.feedback_prompts
         if result.gate_metrics:
             entry["gate_metrics"] = {
-                k: round(v, 6) for k, v in result.gate_metrics.items()
+                k: (round(v, 6) if isinstance(v, (int, float)) else v)
+                for k, v in result.gate_metrics.items()
             }
             entry["diversity_attempts"] = result.diversity_attempts
         if result.diversity_issues:
@@ -700,9 +701,10 @@ def save_results(
     logger.info(f"Saved {meta_path}")
 
     # --- Render visualization PNG ---
+    max_cols = 3  # max mazes per row
+
     ref_grids = [(ref.label, ref.grid) for ref in references]
     gen_grids = [(f"Generated {orig_idx + 1}", r.grid) for orig_idx, r in successful]
-    has_gate_metrics = any(r.gate_pair_metrics for _, r in successful)
 
     n_refs = len(ref_grids)
     n_gens = len(gen_grids)
@@ -711,151 +713,84 @@ def save_results(
         logger.warning("No mazes to visualize")
         return run_dir
 
-    if has_gate_metrics:
-        # Layout with DTW profiles:
-        # Row 0: reference mazes
-        # For each generated maze: maze + pos DTW profiles + val DTW profiles
-        cols = max(n_refs, 2)  # maze, pos_dtw plot
-        rows = 1 + n_gens
-        fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 3.5 * rows))
-        fig.suptitle(
-            f"LLM Maze Generation — {model}\n"
-            f"{n_gens}/{len(results)} successful, "
-            f"{sum(r.latency_ms for r in results) / 1000:.0f}s total",
-            fontsize=13, fontweight='bold',
+    # Layout: refs fill rows of max_cols, then generated fill rows of max_cols
+    import math
+    ref_rows = math.ceil(n_refs / max_cols) if n_refs > 0 else 0
+    gen_rows = math.ceil(n_gens / max_cols) if n_gens > 0 else 0
+    cols = min(max(n_refs, n_gens, 1), max_cols)
+    rows = ref_rows + gen_rows
+    if rows == 0:
+        rows = 1
+
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4.5 * rows))
+    fig.suptitle(
+        f"LLM Maze Generation — {model}\n"
+        f"{n_gens}/{len(results)} successful, "
+        f"{sum(r.latency_ms for r in results) / 1000:.0f}s total",
+        fontsize=12, fontweight='bold',
+    )
+
+    # Ensure axes is always 2D
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes[np.newaxis, :]
+    elif cols == 1:
+        axes = axes[:, np.newaxis]
+
+    for ax_row in axes:
+        for ax in ax_row:
+            ax.axis('off')
+
+    # Reference mazes (blue paths), filling rows of max_cols
+    for i, (label, grid) in enumerate(ref_grids):
+        row = i // cols
+        col = i % cols
+        if row >= ref_rows:
+            break
+        ax = axes[row, col]
+        rt = ref_trajectories[i] if ref_trajectories and i < len(ref_trajectories) else None
+        ref_title = label
+        if rt:
+            ri = compute_regret(rt)
+            ref_title += f"\nregret={ri.regret:.3f} solved={ri.solved}"
+            if "solve_rate" in rt:
+                ref_title += f" solve={rt['solve_rate']:.0%}"
+        plot_maze_with_path(
+            ax, grid,
+            positions=rt["positions"] if rt else None,
+            dones=rt["dones"] if rt else None,
+            color='blue', title=ref_title,
         )
 
-        # Ensure axes is always 2D
-        if rows == 1 and cols == 1:
-            axes = np.array([[axes]])
-        elif rows == 1:
-            axes = axes[np.newaxis, :]
-        elif cols == 1:
-            axes = axes[:, np.newaxis]
+    # Generated mazes (red paths), filling rows of max_cols after references
+    for i, (orig_idx, result) in enumerate(successful):
+        row = ref_rows + (i // cols)
+        col = i % cols
+        if row >= rows:
+            break
 
-        # Turn off all axes
-        for ax_row in axes:
-            for ax in ax_row:
-                ax.axis('off')
+        ax = axes[row, col]
+        gt = gen_trajectories[i] if gen_trajectories and i < len(gen_trajectories) else None
 
-        # Row 0: Reference mazes
-        for i, (label, grid) in enumerate(ref_grids):
-            if i < cols:
-                ax = axes[0, i]
-                rt = ref_trajectories[i] if ref_trajectories and i < len(ref_trajectories) else None
-                ref_title = label
-                if rt:
-                    ri = compute_regret(rt)
-                    ref_title += f"\nregret={ri.regret:.3f} solved={ri.solved}"
-                plot_maze_with_path(
-                    ax, grid,
-                    positions=rt["positions"] if rt else None,
-                    dones=rt["dones"] if rt else None,
-                    color='blue', title=ref_title,
-                )
+        # Build title with regret + diversity + solve rate
+        title = f"Generated {i + 1}"
+        if gt:
+            gi = compute_regret(gt)
+            solve_str = f"solve={gt['solve_rate']:.0%}" if "solve_rate" in gt else ""
+            title += f"\n{solve_str} regret={gi.regret:.3f}"
+        if result.gate_metrics:
+            diversity_val = result.gate_metrics.get('mean_diversity')
+            if diversity_val is not None:
+                title += f" div={diversity_val:.4f}"
 
-        # Rows 1+: each generated maze with DTW profiles
-        colors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12']
-        for gen_idx, (orig_idx, result) in enumerate(successful):
-            row = 1 + gen_idx
-            label = f"Generated {gen_idx + 1}"
-
-            # Col 0: maze grid
-            ax_maze = axes[row, 0]
-            gt = gen_trajectories[gen_idx] if gen_trajectories and gen_idx < len(gen_trajectories) else None
-            summary_str = ""
-            if gt:
-                gi = compute_regret(gt)
-                solve_str = f"solve={gt['solve_rate']:.0%}" if "solve_rate" in gt else ""
-                summary_str += f"\n{solve_str} regret={gi.regret:.3f}"
-            if result.gate_metrics:
-                summary_str += (
-                    f"\npos_dtw_min={result.gate_metrics.get('min_pos_dtw', 0):.2f}"
-                    f" pos_dtw_mean={result.gate_metrics.get('mean_pos_dtw', 0):.2f}"
-                )
-            plot_maze_with_path(
-                ax_maze, result.grid,
-                positions=gt["positions"] if gt else None,
-                dones=gt["dones"] if gt else None,
-                color='red', title=label + summary_str,
-                title_color='darkgreen', title_bold=True,
-            )
-
-            if not result.gate_pair_metrics:
-                continue
-
-            # Col 1: Position DTW local_costs profiles (one line per reference)
-            ax_pos = axes[row, 1]
-            ax_pos.axis('on')
-            for pi, pair in enumerate(result.gate_pair_metrics):
-                if pair.pos_dtw_local_costs is not None:
-                    c = colors[pi % len(colors)]
-                    ax_pos.plot(pair.pos_dtw_local_costs, color=c, linewidth=1.2,
-                                label=f"vs {pair.ref_label} (d={pair.pos_dtw_distance:.2f})",
-                                alpha=0.8)
-                    ax_pos.fill_between(range(len(pair.pos_dtw_local_costs)),
-                                         pair.pos_dtw_local_costs, alpha=0.15, color=c)
-            ax_pos.set_title("Position DTW Profile", fontsize=9)
-            ax_pos.set_xlabel("Warping path step", fontsize=8)
-            ax_pos.set_ylabel("Local cost (L2)", fontsize=8)
-            ax_pos.legend(fontsize=7, loc='upper right')
-            ax_pos.grid(alpha=0.3)
-            ax_pos.tick_params(labelsize=7)
-
-    else:
-        # Simple layout without DTW profiles
-        cols = max(n_refs, n_gens, 1)
-        rows = 2 if n_gens > 0 else 1
-
-        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
-        fig.suptitle(
-            f"LLM Maze Generation — {model}\n"
-            f"{n_gens}/{len(results)} successful, "
-            f"{sum(r.latency_ms for r in results) / 1000:.0f}s total",
-            fontsize=12, fontweight='bold',
+        plot_maze_with_path(
+            ax, result.grid,
+            positions=gt["positions"] if gt else None,
+            dones=gt["dones"] if gt else None,
+            color='red', title=title,
+            title_color='darkgreen', title_bold=True,
         )
-
-        if rows == 1 and cols == 1:
-            axes = np.array([[axes]])
-        elif rows == 1:
-            axes = axes[np.newaxis, :]
-        elif cols == 1:
-            axes = axes[:, np.newaxis]
-
-        for ax_row in axes:
-            for ax in ax_row:
-                ax.axis('off')
-
-        for i, (label, grid) in enumerate(ref_grids):
-            if i < cols:
-                rt = ref_trajectories[i] if ref_trajectories and i < len(ref_trajectories) else None
-                ref_title = label
-                if rt:
-                    ri = compute_regret(rt)
-                    ref_title += f"\nregret={ri.regret:.3f} solved={ri.solved}"
-                plot_maze_with_path(
-                    axes[0, i], grid,
-                    positions=rt["positions"] if rt else None,
-                    dones=rt["dones"] if rt else None,
-                    color='blue', title=ref_title,
-                )
-
-        if n_gens > 0:
-            for i, (label, grid) in enumerate(gen_grids):
-                if i < cols:
-                    gt = gen_trajectories[i] if gen_trajectories and i < len(gen_trajectories) else None
-                    subtitle = label
-                    if gt:
-                        gi = compute_regret(gt)
-                        solve_str = f"solve={gt['solve_rate']:.0%}" if "solve_rate" in gt else ""
-                        subtitle += f"\n{solve_str} regret={gi.regret:.3f}"
-                    plot_maze_with_path(
-                        axes[1, i], grid,
-                        positions=gt["positions"] if gt else None,
-                        dones=gt["dones"] if gt else None,
-                        color='red', title=subtitle,
-                        title_color='darkgreen', title_bold=True,
-                    )
 
     plt.tight_layout()
     viz_path = os.path.join(run_dir, "visualization.png")
@@ -1020,8 +955,9 @@ def run_test(args):
         ref_labels = [ref.label for ref in references]
 
         thresholds = DiversityThresholds(
-            min_pos_dtw=args.min_pos_dtw,
             min_regret=args.min_regret,
+            min_diversity=args.min_diversity,
+            diversity_metric=args.diversity_metric,
         )
 
         results = generator.generate_batch_with_feedback(
@@ -1256,12 +1192,16 @@ def main():
                         help="Max diversity gate retries per maze")
     # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
     gate_cfg = cfg.get("gate", {})
-    parser.add_argument("--min-pos-dtw", type=float,
-                        default=gate_cfg.get("min_pos_dtw", cfg.get("min_pos_dtw")),
-                        help="Min position trace DTW for diversity gate")
     parser.add_argument("--min-regret", type=float,
                         default=gate_cfg.get("min_regret", cfg.get("min_regret")),
                         help="Min regret to accept (null = disabled)")
+    parser.add_argument("--min-diversity", type=float,
+                        default=gate_cfg.get("min_diversity", cfg.get("min_diversity")),
+                        help="Min mean pairwise diversity vs references (null = disabled)")
+    parser.add_argument("--diversity-metric",
+                        choices=["td_error_emd", "experience_divergence", "position_dtw"],
+                        default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "td_error_emd")),
+                        help="Pairwise metric for diversity gate")
 
     # Mode
     parser.add_argument("--dry-run", action="store_true",

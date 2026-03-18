@@ -1,6 +1,6 @@
 """Decision gate: evaluate whether a candidate maze is diverse enough.
 
-Modular design: each metric (position DTW, regret, or any future
+Modular design: each metric (diversity, regret, or any future
 metric) is an independent check. Metrics are only computed when their threshold
 is set (not None). Each metric produces its own issue string for LLM feedback.
 
@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 import numpy as np
 
-from metrics.pairwise.pos_dtw import position_trace_dtw
 from metrics.standalone.regret import (
     RegretInfo,
     compute_regret,
@@ -34,8 +33,9 @@ class DiversityThresholds:
     Set any threshold to None to disable that metric entirely
     (skips computation and feedback).
     """
-    min_pos_dtw: Optional[float] = 0.5   # position trace DTW (spatial diversity)
-    min_regret: Optional[float] = None    # MaxMC regret (rejects trivial mazes)
+    min_regret: Optional[float] = None       # MaxMC regret (rejects trivial mazes)
+    min_diversity: Optional[float] = 0.04    # pairwise diversity vs references
+    diversity_metric: str = "td_error_emd"   # "td_error_emd", "experience_divergence", "position_dtw"
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +49,9 @@ class PairGateMetrics:
     Only populated fields are those for enabled metrics.
     """
     ref_label: str = ""
+    diversity_distance: float = 0.0
+    diversity_metric: str = ""
+    # Legacy pos_dtw fields kept for visualization compatibility
     pos_dtw_distance: float = 0.0
     pos_dtw_local_costs: Optional[np.ndarray] = None
     pos_dtw_path: Optional[np.ndarray] = None
@@ -75,23 +78,53 @@ class GateResult:
 
 
 # ---------------------------------------------------------------------------
-# Per-metric issue generation
+# Per-metric diversity computation
 # ---------------------------------------------------------------------------
 
-def _check_pos_dtw(min_pair: PairGateMetrics, thresholds: DiversityThresholds, issues: List[str]):
-    """Check position DTW threshold."""
-    if thresholds.min_pos_dtw is None:
-        return
+def _compute_pairwise_diversity(
+    candidate_trajectory: dict,
+    reference_trajectory: dict,
+    metric: str,
+    baseline_stats: Optional[dict] = None,
+) -> float:
+    """Compute a single pairwise diversity distance.
 
-    if min_pair.pos_dtw_distance < thresholds.min_pos_dtw:
-        profile_str = _format_profile(min_pair.pos_dtw_local_costs)
-        issues.append(
-            f"Navigation path too similar to {min_pair.ref_label} "
-            f"(position DTW = {min_pair.pos_dtw_distance:.3f}, "
-            f"need > {thresholds.min_pos_dtw:.3f}).\n"
-            f"  Similarity profile (per-step cost): {profile_str}\n"
-            f"  Change wall layout to force a completely different route."
+    Args:
+        candidate_trajectory: Candidate trajectory dict
+        reference_trajectory: Reference trajectory dict
+        metric: One of "td_error_emd", "experience_divergence", "position_dtw"
+        baseline_stats: For experience_divergence, mode classification thresholds
+
+    Returns:
+        Scalar distance (higher = more diverse)
+    """
+    cand = candidate_trajectory
+    ref = reference_trajectory
+
+    if metric == "td_error_emd":
+        from metrics.pairwise.td_error_distribution import td_error_divergence
+        result = td_error_divergence(cand, cand["dones"], ref, ref["dones"])
+        return result["emd"]
+
+    elif metric == "experience_divergence":
+        from metrics.pairwise.mode_transition import mode_transition_divergence
+        result = mode_transition_divergence(
+            cand, cand["dones"], ref, ref["dones"],
+            entropy_a=cand.get("entropy"), entropy_b=ref.get("entropy"),
+            baseline_stats=baseline_stats,
         )
+        return result["kl_divergence"]
+
+    elif metric == "position_dtw":
+        from metrics.pairwise.pos_dtw import position_trace_dtw
+        result = position_trace_dtw(
+            cand["positions"], cand["dones"],
+            ref["positions"], ref["dones"],
+        )
+        return result["distance"]
+
+    else:
+        raise ValueError(f"Unknown diversity metric: {metric}")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +138,7 @@ def evaluate_candidate(
     thresholds: Optional[DiversityThresholds] = None,
     max_steps: int = 250,
     stored_max_return: Optional[float] = None,
+    baseline_stats: Optional[dict] = None,
 ) -> GateResult:
     """Evaluate a candidate maze's trajectory against reference mazes.
 
@@ -121,6 +155,7 @@ def evaluate_candidate(
         thresholds: Diversity thresholds (None fields = skip that metric)
         max_steps: Max steps per episode for regret calculation
         stored_max_return: Previously stored max_return for accumulated regret
+        baseline_stats: For experience_divergence mode classification
 
     Returns:
         GateResult with accept/reject decision, per-metric feedback, and metrics
@@ -143,30 +178,30 @@ def evaluate_candidate(
         result.accepted = len(issues) == 0
         return result
 
-    cand = candidate_trajectory
-    compute_pos = thresholds.min_pos_dtw is not None
+    compute_diversity = thresholds.min_diversity is not None
 
     # --- Pairwise metrics (only compute what's needed) ---
     for ref, label in zip(reference_trajectories, reference_labels):
         pair = PairGateMetrics(ref_label=label)
 
-        if compute_pos:
-            pos_result = position_trace_dtw(
-                cand["positions"], cand["dones"],
-                ref["positions"], ref["dones"],
+        if compute_diversity:
+            pair.diversity_distance = _compute_pairwise_diversity(
+                candidate_trajectory, ref,
+                thresholds.diversity_metric,
+                baseline_stats=baseline_stats,
             )
-            pair.pos_dtw_distance = pos_result["distance"]
-            pair.pos_dtw_local_costs = pos_result["local_costs"]
-            pair.pos_dtw_path = pos_result["path"]
+            pair.diversity_metric = thresholds.diversity_metric
 
         result.pair_metrics.append(pair)
 
     # --- Summary scalars (only for computed metrics) ---
-    if compute_pos:
-        min_pair = min(result.pair_metrics, key=lambda p: p.pos_dtw_distance)
+    if compute_diversity and result.pair_metrics:
+        min_pair = min(result.pair_metrics, key=lambda p: p.diversity_distance)
         result.most_similar_ref = min_pair.ref_label
-        result.summary["min_pos_dtw"] = min(p.pos_dtw_distance for p in result.pair_metrics)
-        result.summary["mean_pos_dtw"] = float(np.mean([p.pos_dtw_distance for p in result.pair_metrics]))
+        distances = [p.diversity_distance for p in result.pair_metrics]
+        result.summary["min_diversity"] = min(distances)
+        result.summary["mean_diversity"] = float(np.mean(distances))
+        result.summary["diversity_metric"] = thresholds.diversity_metric
 
     if result.regret_info is not None:
         result.summary["regret"] = result.regret_info.regret
@@ -179,29 +214,24 @@ def evaluate_candidate(
     if result.regret_info is not None and thresholds.min_regret is not None:
         check_regret(result.regret_info, thresholds.min_regret, issues)
 
-    if compute_pos:
-        min_pair = min(result.pair_metrics, key=lambda p: p.pos_dtw_distance)
-        _check_pos_dtw(min_pair, thresholds, issues)
+    if compute_diversity and result.pair_metrics:
+        mean_dist = float(np.mean([p.diversity_distance for p in result.pair_metrics]))
+        if mean_dist < thresholds.min_diversity:
+            metric_name = {
+                "td_error_emd": "TD Error EMD",
+                "experience_divergence": "Experience Divergence",
+                "position_dtw": "Position DTW",
+            }.get(thresholds.diversity_metric, thresholds.diversity_metric)
+            issues.append(
+                f"Maze is too similar to buffer references "
+                f"(mean {metric_name} = {mean_dist:.4f}, "
+                f"need > {thresholds.min_diversity:.4f}).\n"
+                f"  Per-reference distances: "
+                + ", ".join(f"{p.ref_label}={p.diversity_distance:.4f}" for p in result.pair_metrics)
+                + "\n  Design a maze that produces fundamentally different agent behavior."
+            )
 
     result.issues = issues
     result.accepted = len(issues) == 0
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _format_profile(local_costs: np.ndarray, max_points: int = 30) -> str:
-    """Format a local_costs vector as a compact string for the LLM."""
-    if local_costs is None or len(local_costs) == 0:
-        return "[]"
-
-    if len(local_costs) > max_points:
-        indices = np.linspace(0, len(local_costs) - 1, max_points, dtype=int)
-        sampled = local_costs[indices]
-    else:
-        sampled = local_costs
-
-    return "[" + ", ".join(f"{v:.2f}" for v in sampled) + "]"

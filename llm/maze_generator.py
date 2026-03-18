@@ -816,7 +816,7 @@ class MazeGenerator:
                 )
             logger.info(
                 f"Diversity gate: {'PASS' if gate_result.accepted else 'FAIL'} — "
-                f"min_pos_dtw={gate_result.summary.get('min_pos_dtw', 0):.3f}"
+                f"diversity={gate_result.summary.get('mean_diversity', 0):.4f}"
                 f"{regret_str}"
             )
 
@@ -957,8 +957,16 @@ class MazeGenerator:
 
             # Collect metric keys for definition injection
             active_metric_keys = []
-            if thresholds.min_pos_dtw is not None:
-                active_metric_keys.append("position_dtw")
+            if thresholds.min_diversity is not None:
+                # Map diversity metric to its definition key
+                _div_metric_map = {
+                    "td_error_emd": "td_error",
+                    "experience_divergence": "mode_transition",
+                    "position_dtw": "position_dtw",
+                }
+                div_key = _div_metric_map.get(thresholds.diversity_metric)
+                if div_key:
+                    active_metric_keys.append(div_key)
             if thresholds.min_regret is not None:
                 active_metric_keys.append("scalar_regret")
             _analyzer_key_map = {
