@@ -548,31 +548,82 @@ def main():
         try:
             ws_ckpt = ws_manager.restore(ws_step)
         except (ValueError, KeyError) as e:
-            if "Topology mismatch" in str(e) or "was not found" in str(e):
-                print(f"[Fine-tune] Topology mismatch (GPU→TPU) — loading arrays directly...")
-                import tensorstore as ts
-                import os
-                ckpt_dir = os.path.join(args.agent_checkpoint, str(ws_step), "default")
-                def _load_tree(path):
-                    """Recursively load zarr arrays from Orbax checkpoint as numpy."""
-                    meta_path = os.path.join(path, ".zarray")
-                    if os.path.exists(meta_path):
-                        spec = {"driver": "zarr", "kvstore": {"driver": "file", "path": path}}
-                        return np.array(ts.open(spec).result().read().result())
-                    result = {}
-                    for name in sorted(os.listdir(path)):
-                        sub = os.path.join(path, name)
-                        if os.path.isdir(sub):
-                            val = _load_tree(sub)
-                            if val is not None:
-                                result[name] = val
-                    return result if result else None
-                ws_ckpt = _load_tree(ckpt_dir)
-                if ws_ckpt is None:
-                    raise RuntimeError(f"Could not load checkpoint from {ckpt_dir}")
-                print(f"[Fine-tune] Loaded checkpoint as numpy arrays (keys: {list(ws_ckpt.keys()) if isinstance(ws_ckpt, dict) else type(ws_ckpt)})")
-            else:
+            if "Topology mismatch" not in str(e) and "was not found" not in str(e):
                 raise
+            print(f"[Fine-tune] Topology mismatch (GPU→TPU) — trying fallback restore...")
+            import os
+            ckpt_path = os.path.join(args.agent_checkpoint, str(ws_step), "default")
+            ws_ckpt = None
+
+            # Approach 1: PyTreeCheckpointHandler with metadata + ArrayRestoreArgs
+            try:
+                handler = ocp.PyTreeCheckpointHandler()
+                metadata = handler.metadata(ckpt_path)
+                restore_args = jax.tree_util.tree_map(
+                    lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray), metadata)
+                ws_ckpt = handler.restore(ckpt_path, args=ocp.args.PyTreeRestore(
+                    item=metadata, restore_args=restore_args))
+                print("[Fine-tune] Restored via PyTreeCheckpointHandler + ArrayRestoreArgs")
+            except Exception as e1:
+                print(f"[Fine-tune] Approach 1 failed: {e1}")
+
+            # Approach 2: msgpack-based restore
+            if ws_ckpt is None:
+                try:
+                    msgpack_path = os.path.join(ckpt_path, "msgpack")
+                    if os.path.exists(msgpack_path):
+                        import msgpack
+                        with open(msgpack_path, "rb") as f:
+                            ws_ckpt = msgpack.unpack(f, raw=False)
+                        print("[Fine-tune] Restored via raw msgpack")
+                except Exception as e2:
+                    print(f"[Fine-tune] Approach 2 failed: {e2}")
+
+            # Approach 3: tensorstore zarr or OCDBT
+            if ws_ckpt is None:
+                try:
+                    import tensorstore as ts
+
+                    def _load_tree(path):
+                        entries = sorted(os.listdir(path))
+                        # Check for zarr
+                        if ".zarray" in entries:
+                            spec = {"driver": "zarr", "kvstore": {"driver": "file", "path": path}}
+                            return np.array(ts.open(spec).result().read().result())
+                        # Check for OCDBT (manifest.ocdbt)
+                        if "manifest.ocdbt" in entries or "d" in entries:
+                            spec = {"driver": "zarr3", "kvstore": {
+                                "driver": "ocdbt", "base": f"file://{path}"}}
+                            try:
+                                return np.array(ts.open(spec).result().read().result())
+                            except Exception:
+                                pass
+                        result = {}
+                        for name in entries:
+                            if name.startswith(".") or name.startswith("_"):
+                                continue
+                            sub = os.path.join(path, name)
+                            if os.path.isdir(sub):
+                                val = _load_tree(sub)
+                                if val is not None:
+                                    result[name] = val
+                        return result if result else None
+
+                    ws_ckpt = _load_tree(ckpt_path)
+                    if ws_ckpt is not None:
+                        print("[Fine-tune] Restored via tensorstore direct load")
+                except Exception as e3:
+                    print(f"[Fine-tune] Approach 3 failed: {e3}")
+
+            if ws_ckpt is None:
+                # Print directory contents for debugging
+                for root, dirs, files in os.walk(ckpt_path):
+                    depth = root.replace(ckpt_path, "").count(os.sep)
+                    if depth < 3:
+                        print(f"  {root}: {files[:10]}")
+                raise RuntimeError(
+                    f"Could not load checkpoint from {ckpt_path}. "
+                    f"Try converting the checkpoint on the same device it was saved on.")
         agent_params = ws_ckpt["params"] if isinstance(ws_ckpt, dict) and "params" in ws_ckpt else ws_ckpt.params
         print(f"[Fine-tune] Agent loaded from step {ws_step}")
 
