@@ -33,7 +33,8 @@ from jaxued.environments.maze import Level
 from metrics.pairwise.pos_dtw import position_trace_dtw
 from metrics.pairwise.regret_dtw import regret_curve_dtw
 from metrics.pairwise.action_dtw_binary import action_sequence_distance
-from metrics.pairwise.mode_transition import classify_modes, mode_transition_divergence, MODE_NAMES, NUM_MODES
+from metrics.pairwise.mode_transition import classify_modes, mode_transition_divergence, compute_baseline_stats, MODE_NAMES, NUM_MODES
+from metrics.pairwise.td_error_distribution import compute_td_errors, td_error_divergence
 from metrics.standalone.per_step_entropy import compute_per_step_entropy
 from metrics.standalone.per_step_regret import compute_per_step_regret
 from metrics.standalone.per_step_action import compute_per_step_action
@@ -278,6 +279,108 @@ def plot_deepdive_experience(axes_row, pair, pair_label, trajectories, ve_infos,
                         color='white' if v > 0.5 else 'black')
 
 
+def plot_deepdive_td_error(axes_row, pair, pair_label, trajectories, wall_maps):
+    """Deep-dive row for TD error distribution comparison.
+
+    Cols: grid A, grid B, TD error time series, TD error histograms,
+          cumulative distributions, per-step regret overlay, per-step entropy overlay.
+    """
+    li, lj = pair
+    ti, tj = trajectories[li], trajectories[lj]
+
+    # Col 0-1: maze grids with paths
+    for col, (env_idx, traj_data, color) in enumerate([(li, ti, 'blue'), (lj, tj, 'red')]):
+        ax = axes_row[col]
+        img = wall_map_to_grid(wall_maps[env_idx])
+        ax.imshow(img, origin='upper')
+        pos = traj_data["positions"]
+        dones = traj_data["dones"]
+        done_idx = np.where(dones)[0]
+        end = done_idx[0] + 1 if len(done_idx) > 0 else len(pos)
+        pos_trunc = pos[:end]
+        for t in range(len(pos_trunc) - 1):
+            alpha = 0.3 + 0.7 * (t / max(len(pos_trunc) - 1, 1))
+            ax.plot([pos_trunc[t, 0], pos_trunc[t+1, 0]],
+                    [pos_trunc[t, 1], pos_trunc[t+1, 1]],
+                    color=color, alpha=alpha, linewidth=2)
+        ax.plot(pos_trunc[0, 0], pos_trunc[0, 1], 'o', color=color, markersize=8, label='start')
+        if end > 1:
+            ax.plot(pos_trunc[-1, 0], pos_trunc[-1, 1], 's', color=color, markersize=8, label='end')
+        ax.set_title(f"{pair_label} — L{env_idx} ({len(pos_trunc)} steps)", fontsize=10)
+        ax.legend(fontsize=8); ax.set_xlim(-0.5, 12.5); ax.set_ylim(12.5, -0.5)
+
+    # Compute TD errors and divergence
+    td_result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
+    td_a, td_b = td_result["td_errors_a"], td_result["td_errors_b"]
+
+    # Col 2: TD error time series (both overlaid)
+    ax = axes_row[2]
+    if len(td_a) > 0:
+        ax.plot(td_a, color='steelblue', linewidth=1.2, alpha=0.8,
+                label=f'L{li} (μ={td_result["mean_a"]:.3f})')
+    if len(td_b) > 0:
+        ax.plot(td_b, color='firebrick', linewidth=1.2, alpha=0.8,
+                label=f'L{lj} (μ={td_result["mean_b"]:.3f})')
+    ax.axhline(0, color='gray', linewidth=0.8, linestyle='--', alpha=0.5)
+    ax.set_title(f"{pair_label} — TD Errors (δ_t)", fontsize=10)
+    ax.set_xlabel("Step"); ax.set_ylabel("r + γV(s') - V(s)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # Col 3: TD error histograms (overlaid)
+    ax = axes_row[3]
+    bin_centers = (td_result["bin_edges"][:-1] + td_result["bin_edges"][1:]) / 2
+    ax.bar(bin_centers, td_result["histogram_a"], width=bin_centers[1]-bin_centers[0],
+           color='steelblue', alpha=0.5, label=f'L{li}')
+    ax.bar(bin_centers, td_result["histogram_b"], width=bin_centers[1]-bin_centers[0],
+           color='firebrick', alpha=0.5, label=f'L{lj}')
+    ax.set_title(f"{pair_label} — TD Error Distribution (EMD={td_result['emd']:.3f})", fontsize=10)
+    ax.set_xlabel("TD Error (δ)"); ax.set_ylabel("Density")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # Col 4: Cumulative distributions (ECDFs)
+    ax = axes_row[4]
+    if len(td_a) > 0:
+        sorted_a = np.sort(td_a)
+        ecdf_a = np.arange(1, len(sorted_a) + 1) / len(sorted_a)
+        ax.plot(sorted_a, ecdf_a, color='steelblue', linewidth=1.5, label=f'L{li}')
+    if len(td_b) > 0:
+        sorted_b = np.sort(td_b)
+        ecdf_b = np.arange(1, len(sorted_b) + 1) / len(sorted_b)
+        ax.plot(sorted_b, ecdf_b, color='firebrick', linewidth=1.5, label=f'L{lj}')
+    ax.set_title(f"{pair_label} — Cumulative Distribution", fontsize=10)
+    ax.set_xlabel("TD Error (δ)"); ax.set_ylabel("CDF")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # Col 5: Absolute TD error (learning magnitude) comparison
+    ax = axes_row[5]
+    if len(td_a) > 0:
+        ax.plot(np.abs(td_a), color='steelblue', linewidth=1.0, alpha=0.7,
+                label=f'L{li} (μ={np.mean(np.abs(td_a)):.3f})')
+    if len(td_b) > 0:
+        ax.plot(np.abs(td_b), color='firebrick', linewidth=1.0, alpha=0.7,
+                label=f'L{lj} (μ={np.mean(np.abs(td_b)):.3f})')
+    ax.set_title(f"{pair_label} — |TD Error| (Learning Magnitude)", fontsize=10)
+    ax.set_xlabel("Step"); ax.set_ylabel("|δ_t|")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # Col 6: Sign of TD error (overestimate vs underestimate)
+    ax = axes_row[6]
+    if len(td_a) > 0:
+        pos_frac_a = np.mean(td_a > 0)
+        ax.barh(1, pos_frac_a, height=0.4, color='#e74c3c', alpha=0.7, label='underestimate (δ>0)')
+        ax.barh(1, -(1 - pos_frac_a), height=0.4, color='#3498db', alpha=0.7, label='overestimate (δ<0)')
+    if len(td_b) > 0:
+        pos_frac_b = np.mean(td_b > 0)
+        ax.barh(0, pos_frac_b, height=0.4, color='#e74c3c', alpha=0.7)
+        ax.barh(0, -(1 - pos_frac_b), height=0.4, color='#3498db', alpha=0.7)
+    ax.set_yticks([0, 1]); ax.set_yticklabels([f'L{lj}', f'L{li}'], fontsize=9)
+    ax.set_xlim(-1.1, 1.1)
+    ax.axvline(0, color='gray', linewidth=0.8)
+    ax.set_title(f"{pair_label} — TD Error Sign Balance", fontsize=10)
+    ax.set_xlabel("← overestimate | underestimate →")
+    ax.legend(fontsize=7, loc='lower right'); ax.grid(alpha=0.3, axis='x')
+
+
 def main():
     os.makedirs(PLOT_DIR, exist_ok=True)
 
@@ -410,12 +513,29 @@ def main():
     # ============================================================
     # Compute new metrics: value error + mode transitions
     # ============================================================
+    print("Computing pairwise TD error divergence (EMD)...")
+    td_emd_dists = []
+    for i in range(NUM_LEVELS):
+        for j in range(i + 1, NUM_LEVELS):
+            ti, tj = trajectories[i], trajectories[j]
+            td_result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
+            td_emd_dists.append(td_result["emd"])
+    td_emd_dists = np.array(td_emd_dists)
+
     print("Computing value error profiles...")
     ve_infos = [compute_value_error(t["values"], t["rewards"], t["dones"]) for t in trajectories]
 
+    print("Computing baseline stats from all trajectories...")
+    baseline = compute_baseline_stats(trajectories)
+    print(f"  error: mean={baseline['error_mean']:.3f}, std={baseline['error_std']:.3f}, "
+          f"threshold={baseline['error_threshold']:.3f}")
+    print(f"  entropy: mean={baseline['entropy_mean']:.3f}, std={baseline['entropy_std']:.3f}, "
+          f"threshold={baseline['entropy_threshold']:.3f}")
+
     print("Computing mode classifications...")
     mode_infos = [classify_modes(t["values"], t["rewards"], t["dones"],
-                                 entropy=t.get("entropy")) for t in trajectories]
+                                 entropy=t.get("entropy"),
+                                 baseline_stats=baseline) for t in trajectories]
 
     print("Computing pairwise mode transition divergence...")
     mode_div_dists = []
@@ -425,6 +545,7 @@ def main():
             div = mode_transition_divergence(
                 ti, ti["dones"], tj, tj["dones"],
                 entropy_a=ti.get("entropy"), entropy_b=tj.get("entropy"),
+                baseline_stats=baseline,
             )
             mode_div_dists.append(div["kl_divergence"])
     mode_div_dists = np.array(mode_div_dists)
@@ -478,6 +599,24 @@ def main():
     print(f"Saved: {PLOT_DIR}/plots_deepdive_mode_transition.png")
     plt.close(fig5)
 
+    # ============================================================
+    # FIGURE 6: Deep-dive by TD error distribution EMD
+    # ============================================================
+    pair_sim_td = pair_indices[np.argmin(td_emd_dists)]
+    pair_diff_td = pair_indices[np.argmax(td_emd_dists)]
+
+    fig6, axes6 = plt.subplots(2, 7, figsize=(35, 10))
+    fig6.suptitle("Deep-Dive: Most Similar vs Most Different by TD Error Distribution (EMD)",
+                  fontsize=14, fontweight='bold')
+    plot_deepdive_td_error(axes6[0], pair_sim_td, "Most Similar (TD error)",
+                           trajectories, wall_maps)
+    plot_deepdive_td_error(axes6[1], pair_diff_td, "Most Different (TD error)",
+                           trajectories, wall_maps)
+    plt.tight_layout()
+    fig6.savefig(f"{PLOT_DIR}/plots_deepdive_td_error.png", dpi=150, bbox_inches='tight')
+    print(f"Saved: {PLOT_DIR}/plots_deepdive_td_error.png")
+    plt.close(fig6)
+
     print(f"\nDone! All figures saved to {PLOT_DIR}/")
     corr_pa = np.corrcoef(pos_dtw_dists, act_dtw_dists)[0, 1]
     corr_pr = np.corrcoef(pos_dtw_dists, reg_dtw_dists)[0, 1]
@@ -486,15 +625,23 @@ def main():
     corr_am = np.corrcoef(act_dtw_dists, mode_div_dists)[0, 1]
     corr_rm = np.corrcoef(reg_dtw_dists, mode_div_dists)[0, 1]
     corr_ve_m = np.corrcoef(ve_dists, mode_div_dists)[0, 1]
+    corr_pt = np.corrcoef(pos_dtw_dists, td_emd_dists)[0, 1]
+    corr_at = np.corrcoef(act_dtw_dists, td_emd_dists)[0, 1]
+    corr_rt = np.corrcoef(reg_dtw_dists, td_emd_dists)[0, 1]
+    corr_mt = np.corrcoef(mode_div_dists, td_emd_dists)[0, 1]
+    corr_vet = np.corrcoef(ve_dists, td_emd_dists)[0, 1]
     print(f"\nStats:")
     print(f"  Pos DTW:         mean={pos_dtw_dists.mean():.3f}, std={pos_dtw_dists.std():.3f}")
     print(f"  Action DTW:      mean={act_dtw_dists.mean():.3f}, std={act_dtw_dists.std():.3f}")
     print(f"  Regret DTW:      mean={reg_dtw_dists.mean():.3f}, std={reg_dtw_dists.std():.3f}")
     print(f"  Value Error L1:  mean={ve_dists.mean():.3f}, std={ve_dists.std():.3f}")
     print(f"  Mode Div (KL):   mean={mode_div_dists.mean():.3f}, std={mode_div_dists.std():.3f}")
+    print(f"  TD Error EMD:    mean={td_emd_dists.mean():.3f}, std={td_emd_dists.std():.3f}")
     print(f"\n  Correlations:")
     print(f"    pos-action r={corr_pa:.3f}, pos-regret r={corr_pr:.3f}, action-regret r={corr_ar:.3f}")
     print(f"    pos-mode r={corr_pm:.3f}, action-mode r={corr_am:.3f}, regret-mode r={corr_rm:.3f}")
+    print(f"    pos-td r={corr_pt:.3f}, action-td r={corr_at:.3f}, regret-td r={corr_rt:.3f}")
+    print(f"    mode-td r={corr_mt:.3f}, value_error-td r={corr_vet:.3f}")
     print(f"    value_error-mode r={corr_ve_m:.3f}")
 
 

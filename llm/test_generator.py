@@ -52,7 +52,8 @@ from metrics.standalone.per_step_action import compute_per_step_action
 from metrics.standalone.regret import compute_regret
 from metrics.standalone.value_error import compute_value_error
 from metrics.pairwise.pos_dtw import position_trace_dtw
-from metrics.pairwise.mode_transition import mode_transition_divergence
+from metrics.pairwise.mode_transition import mode_transition_divergence, compute_baseline_stats
+from metrics.pairwise.td_error_distribution import td_error_divergence
 from metrics.utils import downsample, format_vector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -308,6 +309,11 @@ def build_references_with_metrics(
 
     # Pairwise mode transition divergence between all reference pairs
     if _enabled(pw, "mode_transition") and trajectories is not None and len(trajectories) >= 2:
+        baseline = compute_baseline_stats(trajectories)
+        logger.info(
+            f"Mode baseline: error_threshold={baseline['error_threshold']:.3f}, "
+            f"entropy_threshold={baseline['entropy_threshold']:.3f}"
+        )
         for i in range(len(trajectories)):
             for j in range(i + 1, len(trajectories)):
                 ti, tj = trajectories[i], trajectories[j]
@@ -316,6 +322,7 @@ def build_references_with_metrics(
                     tj, tj["dones"],
                     entropy_a=ti.get("entropy"),
                     entropy_b=tj.get("entropy"),
+                    baseline_stats=baseline,
                 )
                 pairwise_metrics.append(PairwiseMetricEntry(
                     maze_a_label=references[i].label,
@@ -324,6 +331,21 @@ def build_references_with_metrics(
                     value=div_result["kl_divergence"],
                     description="Mode transition KL divergence (higher = more different agent experiences)",
                     metric_key="mode_transition",
+                ))
+
+    # Pairwise TD error distribution divergence
+    if _enabled(pw, "td_error") and trajectories is not None and len(trajectories) >= 2:
+        for i in range(len(trajectories)):
+            for j in range(i + 1, len(trajectories)):
+                ti, tj = trajectories[i], trajectories[j]
+                td_result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
+                pairwise_metrics.append(PairwiseMetricEntry(
+                    maze_a_label=references[i].label,
+                    maze_b_label=references[j].label,
+                    name="TD Error EMD",
+                    value=td_result["emd"],
+                    description="Earth Mover's Distance between TD error distributions (higher = more different learning signals)",
+                    metric_key="td_error",
                 ))
 
     return references, pairwise_metrics

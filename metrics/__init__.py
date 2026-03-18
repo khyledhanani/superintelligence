@@ -33,7 +33,11 @@ from metrics.pairwise.pos_dtw import PositionDTWAnalyzer, position_trace_dtw
 from metrics.pairwise.regret_dtw import regret_curve_dtw
 from metrics.pairwise.action_dtw_binary import action_sequence_distance
 from metrics.pairwise.mode_transition import (
-    classify_modes, mode_transition_divergence, MODE_NAMES, NUM_MODES,
+    classify_modes, mode_transition_divergence, compute_baseline_stats,
+    MODE_NAMES, NUM_MODES,
+)
+from metrics.pairwise.td_error_distribution import (
+    compute_td_errors, td_error_divergence,
 )
 
 __all__ = [
@@ -48,5 +52,7 @@ __all__ = [
     "PositionDTWAnalyzer", "position_trace_dtw",
     "regret_curve_dtw",
     "action_sequence_distance",
-    "classify_modes", "mode_transition_divergence", "MODE_NAMES", "NUM_MODES",
+    "classify_modes", "mode_transition_divergence", "compute_baseline_stats",
+    "MODE_NAMES", "NUM_MODES",
+    "compute_td_errors", "td_error_divergence",
 ]

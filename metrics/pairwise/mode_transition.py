@@ -6,12 +6,16 @@ and policy entropy, then compares the mode transition distributions.
 Modes capture multi-step agent experience patterns (traps, exploration,
 confident navigation) without requiring temporal alignment.
 
+Thresholds are adaptive: derived from the agent's own error/entropy
+distributions across reference trajectories (mean + 1 std), so they
+automatically scale with agent capability and training stage.
+
 KL divergence between transition matrices measures whether two mazes
 put the agent through fundamentally different learning processes.
 """
 
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from metrics.utils import truncate_at_done
 
@@ -33,16 +37,90 @@ MODE_NAMES = [
 ]
 
 
+def compute_baseline_stats(trajectories: List[Dict]) -> Dict:
+    """Compute error and entropy statistics from reference trajectories.
+
+    These stats define what's "normal" for this agent at this training stage.
+    Mode thresholds are set at mean + 1 std, so ~16% of steps are classified
+    as "wrong" or "uncertain" — the tail of the distribution.
+
+    Args:
+        trajectories: List of trajectory dicts, each with 'values', 'rewards',
+            'dones', and optionally 'entropy'.
+
+    Returns:
+        Dict with:
+            error_mean, error_std, error_threshold: mean + 1 std of |error|
+            entropy_mean, entropy_std, entropy_threshold: mean + 1 std of entropy
+            n_steps: total steps used for computation
+    """
+    all_abs_errors = []
+    all_entropies = []
+
+    for traj in trajectories:
+        ep_values = truncate_at_done(traj["values"], traj["dones"]).astype(np.float64)
+        ep_rewards = truncate_at_done(traj["rewards"], traj["dones"]).astype(np.float64)
+        ep_len = len(ep_values)
+
+        if ep_len == 0:
+            continue
+
+        # Compute actual returns G_t
+        returns = np.zeros(ep_len, dtype=np.float64)
+        g = 0.0
+        for t in range(ep_len - 1, -1, -1):
+            g = ep_rewards[t] + g  # gamma=1.0
+            returns[t] = g
+
+        abs_error = np.abs(ep_values - returns)
+        all_abs_errors.append(abs_error)
+
+        if "entropy" in traj:
+            ep_entropy = truncate_at_done(traj["entropy"], traj["dones"]).astype(np.float64)
+            all_entropies.append(ep_entropy)
+
+    if not all_abs_errors:
+        return {
+            "error_mean": 0.3, "error_std": 0.0, "error_threshold": 0.3,
+            "entropy_mean": 0.3, "entropy_std": 0.0, "entropy_threshold": 0.3,
+            "n_steps": 0,
+        }
+
+    all_abs_errors = np.concatenate(all_abs_errors)
+    error_mean = float(np.mean(all_abs_errors))
+    error_std = float(np.std(all_abs_errors))
+
+    if all_entropies:
+        all_entropies = np.concatenate(all_entropies)
+        entropy_mean = float(np.mean(all_entropies))
+        entropy_std = float(np.std(all_entropies))
+    else:
+        entropy_mean = 0.0
+        entropy_std = 0.0
+
+    return {
+        "error_mean": error_mean,
+        "error_std": error_std,
+        "error_threshold": error_mean + error_std,
+        "entropy_mean": entropy_mean,
+        "entropy_std": entropy_std,
+        "entropy_threshold": entropy_mean + entropy_std,
+        "n_steps": len(all_abs_errors),
+    }
+
+
 def classify_modes(
     values: np.ndarray,
     rewards: np.ndarray,
     dones: np.ndarray,
     entropy: Optional[np.ndarray] = None,
     gamma: float = 1.0,
-    error_threshold: float = 0.3,
-    entropy_threshold: float = 0.3,
+    baseline_stats: Optional[Dict] = None,
 ) -> dict:
     """Classify each timestep into an experiential mode.
+
+    Thresholds are adaptive when baseline_stats is provided (mean + 1 std
+    from reference trajectories). Falls back to fixed thresholds if not.
 
     Args:
         values: (T,) value estimates V(s_t)
@@ -50,8 +128,8 @@ def classify_modes(
         dones: (T,) done flags
         entropy: (T,) policy entropy (optional; if None, uncertain mode is disabled)
         gamma: discount factor
-        error_threshold: |error| above this = "wrong" (below = "correct")
-        entropy_threshold: entropy above this = "uncertain"
+        baseline_stats: Output of compute_baseline_stats(). If None, uses
+            fixed fallback thresholds (error=0.3, entropy=0.3).
 
     Returns:
         Dict with:
@@ -62,7 +140,16 @@ def classify_modes(
             transition_probs: (NUM_MODES, NUM_MODES) transition probabilities (row-normalized)
             episode_length: int
             error_curve: (ep_len,) signed value error used for classification
+            thresholds: dict with error_threshold and entropy_threshold used
     """
+    # Resolve thresholds
+    if baseline_stats is not None:
+        error_threshold = baseline_stats["error_threshold"]
+        entropy_threshold = baseline_stats["entropy_threshold"]
+    else:
+        error_threshold = 0.3
+        entropy_threshold = 0.3
+
     ep_values = truncate_at_done(values, dones).astype(np.float64)
     ep_rewards = truncate_at_done(rewards, dones).astype(np.float64)
     ep_len = len(ep_values)
@@ -80,6 +167,7 @@ def classify_modes(
         "transition_probs": np.zeros((NUM_MODES, NUM_MODES)),
         "episode_length": 0,
         "error_curve": np.array([]),
+        "thresholds": {"error": error_threshold, "entropy": entropy_threshold},
     }
 
     if ep_len == 0:
@@ -106,7 +194,6 @@ def classify_modes(
         elif t > 0:
             error_delta = abs_error[t] - abs_error[t - 1]
             if is_wrong:
-                # Wrong and getting worse vs recovering
                 if error_delta > 0:
                     modes[t] = MODE_DEGRADING
                 else:
@@ -114,7 +201,6 @@ def classify_modes(
             else:
                 modes[t] = MODE_CONFIDENT_CORRECT
         else:
-            # First step: just error magnitude
             modes[t] = MODE_CONFIDENT_WRONG if is_wrong else MODE_CONFIDENT_CORRECT
 
     # Mode fractions
@@ -127,14 +213,14 @@ def classify_modes(
     for t in range(ep_len - 1):
         transition_matrix[modes[t], modes[t + 1]] += 1
 
-    # Row-normalize to probabilities (with Laplace smoothing to avoid zeros for KL)
+    # Row-normalize to probabilities
     transition_probs = np.zeros((NUM_MODES, NUM_MODES))
     for i in range(NUM_MODES):
         row_sum = transition_matrix[i].sum()
         if row_sum > 0:
             transition_probs[i] = transition_matrix[i] / row_sum
         else:
-            transition_probs[i] = 1.0 / NUM_MODES  # uniform if never visited
+            transition_probs[i] = 1.0 / NUM_MODES
 
     return {
         "modes": modes,
@@ -144,6 +230,7 @@ def classify_modes(
         "transition_probs": transition_probs,
         "episode_length": ep_len,
         "error_curve": error_curve,
+        "thresholds": {"error": error_threshold, "entropy": entropy_threshold},
     }
 
 
@@ -154,8 +241,7 @@ def mode_transition_divergence(
     dones_b: np.ndarray,
     entropy_a: Optional[np.ndarray] = None,
     entropy_b: Optional[np.ndarray] = None,
-    error_threshold: float = 0.3,
-    entropy_threshold: float = 0.3,
+    baseline_stats: Optional[Dict] = None,
 ) -> Dict:
     """Compute experiential divergence between two trajectories.
 
@@ -166,8 +252,8 @@ def mode_transition_divergence(
         dones_b: Done flags for trajectory B
         entropy_a: Policy entropy for trajectory A (optional)
         entropy_b: Policy entropy for trajectory B (optional)
-        error_threshold: |error| threshold for mode classification
-        entropy_threshold: Entropy threshold for uncertain mode
+        baseline_stats: Output of compute_baseline_stats(). If None, uses
+            fixed fallback thresholds.
 
     Returns:
         Dict with:
@@ -177,26 +263,21 @@ def mode_transition_divergence(
             transition_probs_a: (NUM_MODES, NUM_MODES) transition probs for A
             transition_probs_b: (NUM_MODES, NUM_MODES) transition probs for B
             fraction_distance: float — L1 distance between mode fraction vectors
+            thresholds: dict with error_threshold and entropy_threshold used
     """
     modes_a = classify_modes(
         traj_a["values"], traj_a["rewards"], dones_a,
-        entropy=entropy_a,
-        error_threshold=error_threshold,
-        entropy_threshold=entropy_threshold,
+        entropy=entropy_a, baseline_stats=baseline_stats,
     )
     modes_b = classify_modes(
         traj_b["values"], traj_b["rewards"], dones_b,
-        entropy=entropy_b,
-        error_threshold=error_threshold,
-        entropy_threshold=entropy_threshold,
+        entropy=entropy_b, baseline_stats=baseline_stats,
     )
 
-    # Symmetric KL divergence between transition matrices
-    # KL(P||Q) + KL(Q||P) / 2, with Laplace smoothing
+    # Symmetric KL divergence with Laplace smoothing
     eps = 1e-8
     P = modes_a["transition_probs"] + eps
     Q = modes_b["transition_probs"] + eps
-    # Renormalize after smoothing
     P = P / P.sum(axis=1, keepdims=True)
     Q = Q / Q.sum(axis=1, keepdims=True)
 
@@ -204,7 +285,6 @@ def mode_transition_divergence(
     kl_qp = np.sum(Q * np.log(Q / P))
     sym_kl = (kl_pq + kl_qp) / 2.0
 
-    # L1 distance between mode fractions (simpler summary)
     frac_dist = float(np.sum(np.abs(
         modes_a["mode_fractions"] - modes_b["mode_fractions"]
     )))
@@ -216,4 +296,5 @@ def mode_transition_divergence(
         "transition_probs_a": modes_a["transition_probs"],
         "transition_probs_b": modes_b["transition_probs"],
         "fraction_distance": frac_dist,
+        "thresholds": modes_a["thresholds"],
     }
