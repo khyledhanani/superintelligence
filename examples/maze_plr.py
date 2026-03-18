@@ -1873,6 +1873,21 @@ def main(config=None, project="JAXUED_TEST"):
         train_state = train_state.replace(sampler=sampler)
         print(f"[Warmstart] Inserted {ws_size} levels into buffer")
 
+        # Seed CMA-ES mean from the best-scoring buffer level
+        if config["use_cmaes"] and vae_encode_fn is not None:
+            best_idx = int(np.argmax(ws_scores[:ws_size]))
+            best_tokens = jnp.array(ws_tokens[best_idx:best_idx+1])
+            best_z = vae_encode_fn(best_tokens)[0]  # (latent_dim,)
+            # If KL filtering is active, zero out dead dims
+            if active_dims is not None:
+                mask = jnp.zeros(best_z.shape[0])
+                mask = mask.at[active_dims].set(1.0)
+                best_z = best_z * mask
+            new_es = cmaes_mgr.initialize(jax.random.PRNGKey(42), mean=best_z)
+            train_state = train_state.replace(es_state=new_es)
+            print(f"[Warmstart] CMA-ES mean seeded from best buffer level "
+                  f"(idx={best_idx}, score={ws_scores[best_idx]:.4f}, ||z||={float(jnp.linalg.norm(best_z)):.2f})")
+
         # If PCA is enabled, refit PCA on the warm-start buffer
         if use_pca and vae_encode_fn is not None:
             print(f"[Warmstart] Refitting PCA on {ws_size} buffer levels...")
