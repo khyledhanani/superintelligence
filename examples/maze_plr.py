@@ -1841,7 +1841,17 @@ def main(config=None, project="JAXUED_TEST"):
             item_handlers=ocp.StandardCheckpointHandler(),
         )
         ws_step = ws_manager.latest_step()
-        ws_ckpt = ws_manager.restore(ws_step)
+        try:
+            ws_ckpt = ws_manager.restore(ws_step)
+        except ValueError as e:
+            if "Topology mismatch" in str(e) or "was not found" in str(e):
+                print(f"[Warmstart] Topology mismatch (GPU->TPU) — restoring as numpy arrays...")
+                abstract_state = jax.tree_util.tree_map(
+                    lambda x: ocp.args.ArrayRestoreArgs(restore_type=np.ndarray),
+                    train_state)
+                ws_ckpt = ws_manager.restore(ws_step, args=ocp.args.StandardRestore(abstract_state))
+            else:
+                raise
         ws_params = ws_ckpt["params"] if isinstance(ws_ckpt, dict) and "params" in ws_ckpt else ws_ckpt.params
         train_state = train_state.replace(params=ws_params)
         print(f"[Warmstart] Loaded agent params from step {ws_step}")
