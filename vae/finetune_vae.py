@@ -308,6 +308,8 @@ def main():
     parser.add_argument("--agent_goal_weight", type=float, default=5.0)
     parser.add_argument("--anchor_weight", type=float, default=0.1,
                         help="Anchor regularization weight (0 to disable)")
+    parser.add_argument("--freeze_decoder", action="store_true",
+                        help="Freeze decoder params (only fine-tune encoder)")
     parser.add_argument("--sample_weighting", type=str, default="uniform",
                         choices=["uniform", "score", "recency", "combined"],
                         help="How to weight level sampling: uniform, score (SFL), "
@@ -378,10 +380,13 @@ def main():
         )
 
     # ── Optimizer with differential LR ──
+    dec_lr = 0.0 if args.freeze_decoder else args.decoder_lr
+    if args.freeze_decoder:
+        print("[Fine-tune] Decoder FROZEN — only encoder will be updated")
     optimizer, param_labels = create_optimizer(
         pretrained_params,
         encoder_lr=args.encoder_lr,
-        decoder_lr=args.decoder_lr,
+        decoder_lr=dec_lr,
         warmup_steps=args.warmup_steps,
         total_steps=args.num_steps,
         max_grad_norm=args.max_grad_norm,
