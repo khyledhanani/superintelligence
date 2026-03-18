@@ -550,80 +550,65 @@ def main():
         except (ValueError, KeyError) as e:
             if "Topology mismatch" not in str(e) and "was not found" not in str(e):
                 raise
-            print(f"[Fine-tune] Topology mismatch (GPU→TPU) — trying fallback restore...")
-            import os
+            print(f"[Fine-tune] Topology mismatch (GPU→TPU) — reading OCDBT arrays via tensorstore...")
+            import os, json, tensorstore as ts
+
             ckpt_path = os.path.join(args.agent_checkpoint, str(ws_step), "default")
-            ws_ckpt = None
 
-            # Approach 1: PyTreeCheckpointHandler with metadata + ArrayRestoreArgs
-            try:
-                handler = ocp.PyTreeCheckpointHandler()
-                metadata = handler.metadata(ckpt_path)
-                restore_args = jax.tree_util.tree_map(
-                    lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray), metadata)
-                ws_ckpt = handler.restore(ckpt_path, args=ocp.args.PyTreeRestore(
-                    item=metadata, restore_args=restore_args))
-                print("[Fine-tune] Restored via PyTreeCheckpointHandler + ArrayRestoreArgs")
-            except Exception as e1:
-                print(f"[Fine-tune] Approach 1 failed: {e1}")
+            # Read _METADATA to get parameter names and shapes
+            metadata_path = os.path.join(ckpt_path, "_METADATA")
+            with open(metadata_path, "rb") as f:
+                raw_metadata = f.read()
 
-            # Approach 2: msgpack-based restore
-            if ws_ckpt is None:
+            # Parse param keys from the OCDBT store using tensorstore KvStore
+            ocdbt_base = os.path.join(ckpt_path, "ocdbt.process_0")
+            kvs = ts.KvStore.open({"driver": "ocdbt", "base": f"file://{ocdbt_base}"}).result()
+            key_list = kvs.list().result()
+            print(f"[Fine-tune] Found {len(key_list)} arrays in OCDBT store")
+
+            # Each key is like "params/network/Dense_0/kernel/c/0" etc.
+            # We need to read each array and reconstruct the nested dict
+            def _read_ocdbt_array(param_key):
+                """Read a single array from OCDBT checkpoint."""
+                spec = {
+                    "driver": "zarr",
+                    "kvstore": {
+                        "driver": "ocdbt",
+                        "base": f"file://{ocdbt_base}",
+                        "path": param_key,
+                    },
+                }
                 try:
-                    msgpack_path = os.path.join(ckpt_path, "msgpack")
-                    if os.path.exists(msgpack_path):
-                        import msgpack
-                        with open(msgpack_path, "rb") as f:
-                            ws_ckpt = msgpack.unpack(f, raw=False)
-                        print("[Fine-tune] Restored via raw msgpack")
-                except Exception as e2:
-                    print(f"[Fine-tune] Approach 2 failed: {e2}")
+                    t = ts.open(spec).result()
+                    return np.array(t.read().result())
+                except Exception:
+                    # Try zarr3 driver
+                    spec["driver"] = "zarr3"
+                    t = ts.open(spec).result()
+                    return np.array(t.read().result())
 
-            # Approach 3: tensorstore zarr or OCDBT
-            if ws_ckpt is None:
+            def _set_nested(d, key_parts, value):
+                """Set a value in a nested dict using a list of key parts."""
+                for part in key_parts[:-1]:
+                    if part not in d:
+                        d[part] = {}
+                    d = d[part]
+                d[key_parts[-1]] = value
+
+            ws_ckpt = {}
+            for key in sorted(key_list):
+                key_str = key if isinstance(key, str) else key.decode()
                 try:
-                    import tensorstore as ts
+                    arr = _read_ocdbt_array(key_str)
+                    parts = key_str.split("/")
+                    _set_nested(ws_ckpt, parts, arr)
+                    print(f"  Loaded: {key_str} {arr.shape} {arr.dtype}")
+                except Exception as e_arr:
+                    print(f"  Failed: {key_str}: {e_arr}")
 
-                    def _load_tree(path):
-                        entries = sorted(os.listdir(path))
-                        # Check for zarr
-                        if ".zarray" in entries:
-                            spec = {"driver": "zarr", "kvstore": {"driver": "file", "path": path}}
-                            return np.array(ts.open(spec).result().read().result())
-                        # Check for OCDBT (manifest.ocdbt)
-                        if "manifest.ocdbt" in entries or "d" in entries:
-                            spec = {"driver": "zarr3", "kvstore": {
-                                "driver": "ocdbt", "base": f"file://{path}"}}
-                            try:
-                                return np.array(ts.open(spec).result().read().result())
-                            except Exception:
-                                pass
-                        result = {}
-                        for name in entries:
-                            if name.startswith(".") or name.startswith("_"):
-                                continue
-                            sub = os.path.join(path, name)
-                            if os.path.isdir(sub):
-                                val = _load_tree(sub)
-                                if val is not None:
-                                    result[name] = val
-                        return result if result else None
-
-                    ws_ckpt = _load_tree(ckpt_path)
-                    if ws_ckpt is not None:
-                        print("[Fine-tune] Restored via tensorstore direct load")
-                except Exception as e3:
-                    print(f"[Fine-tune] Approach 3 failed: {e3}")
-
-            if ws_ckpt is None:
-                # Print directory contents for debugging
-                for root, dirs, files in os.walk(ckpt_path):
-                    depth = root.replace(ckpt_path, "").count(os.sep)
-                    if depth < 3:
-                        print(f"  {root}: {files[:10]}")
-                raise RuntimeError(
-                    f"Could not load checkpoint from {ckpt_path}. "
-                    f"Try converting the checkpoint on the same device it was saved on.")
+            if not ws_ckpt:
+                raise RuntimeError(f"Could not load any arrays from {ocdbt_base}")
+            print(f"[Fine-tune] Restored {len(key_list)} arrays as numpy from OCDBT")
         agent_params = ws_ckpt["params"] if isinstance(ws_ckpt, dict) and "params" in ws_ckpt else ws_ckpt.params
         print(f"[Fine-tune] Agent loaded from step {ws_step}")
 
