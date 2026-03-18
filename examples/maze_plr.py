@@ -1847,7 +1847,7 @@ def main(config=None, project="JAXUED_TEST"):
             if "Topology mismatch" in str(e) or "was not found" in str(e):
                 print(f"[Warmstart] Topology mismatch (GPU->TPU) — restoring as numpy arrays...")
                 abstract_state = jax.tree_util.tree_map(
-                    lambda x: ocp.args.ArrayRestoreArgs(restore_type=np.ndarray),
+                    lambda x: ocp.args.ArrayRestore(restore_type=np.ndarray),
                     train_state)
                 ws_ckpt = ws_manager.restore(ws_step, args=ocp.args.StandardRestore(abstract_state))
             else:
