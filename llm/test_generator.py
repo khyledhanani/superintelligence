@@ -798,6 +798,89 @@ def save_results(
     plt.close(fig)
     logger.info(f"Saved {viz_path}")
 
+    # --- Diversity embedding plot ---
+    # Compute pairwise TD Error EMD between all refs + generated, embed with t-SNE
+    all_trajs = []
+    all_labels = []
+    all_colors = []
+    if ref_trajectories:
+        for i, rt in enumerate(ref_trajectories):
+            if rt is not None:
+                all_trajs.append(rt)
+                all_labels.append(references[i].label if i < len(references) else f"Ref {i+1}")
+                all_colors.append('blue')
+    if gen_trajectories:
+        for i, gt in enumerate(gen_trajectories):
+            if gt is not None:
+                all_trajs.append(gt)
+                all_labels.append(f"Gen {i+1}")
+                all_colors.append('red')
+
+    if len(all_trajs) >= 3:
+        try:
+            from metrics.pairwise.td_error_distribution import td_error_divergence
+            from sklearn.manifold import TSNE
+
+            n = len(all_trajs)
+            dist_matrix = np.zeros((n, n))
+            for i in range(n):
+                for j in range(i + 1, n):
+                    result_ij = td_error_divergence(
+                        all_trajs[i], all_trajs[i]["dones"],
+                        all_trajs[j], all_trajs[j]["dones"],
+                    )
+                    dist_matrix[i, j] = result_ij["emd"]
+                    dist_matrix[j, i] = result_ij["emd"]
+
+            # t-SNE on precomputed distance matrix
+            perplexity = min(5, n - 1)
+            embedding = TSNE(
+                n_components=2, metric="precomputed",
+                perplexity=perplexity, random_state=42,
+                init="random",
+            ).fit_transform(dist_matrix)
+
+            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(6, 5))
+            for i in range(n):
+                ax_emb.scatter(
+                    embedding[i, 0], embedding[i, 1],
+                    c=all_colors[i], s=120, zorder=5,
+                    edgecolors='black', linewidths=0.5,
+                )
+                ax_emb.annotate(
+                    all_labels[i], (embedding[i, 0], embedding[i, 1]),
+                    textcoords="offset points", xytext=(6, 6),
+                    fontsize=8, color=all_colors[i], fontweight='bold',
+                )
+
+            # Draw edges with distance labels for nearest pairs
+            for i in range(n):
+                for j in range(i + 1, n):
+                    alpha = 0.15
+                    ax_emb.plot(
+                        [embedding[i, 0], embedding[j, 0]],
+                        [embedding[i, 1], embedding[j, 1]],
+                        'gray', alpha=alpha, linewidth=0.5,
+                    )
+
+            ax_emb.set_title(
+                f"Diversity Embedding (TD Error EMD)\n"
+                f"blue=reference, red=generated",
+                fontsize=10, fontweight='bold',
+            )
+            ax_emb.set_xlabel("t-SNE dim 1", fontsize=9)
+            ax_emb.set_ylabel("t-SNE dim 2", fontsize=9)
+            ax_emb.grid(alpha=0.2)
+
+            emb_path = os.path.join(run_dir, "diversity_embedding.png")
+            fig_emb.savefig(emb_path, dpi=150, bbox_inches='tight')
+            plt.close(fig_emb)
+            logger.info(f"Saved {emb_path}")
+        except ImportError:
+            logger.warning("sklearn not installed — skipping diversity embedding")
+        except Exception as e:
+            logger.warning(f"Diversity embedding failed: {e}")
+
     return run_dir
 
 
