@@ -38,6 +38,170 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from vae_model import CluttrVAE
 
 
+# ─── SFL scoring ─────────────────────────────────────────────────────────────
+
+def score_levels_sfl(agent_params, tokens, agent_checkpoint_path,
+                     num_rollouts=5, batch_size=32, max_episode_length=250,
+                     agent_view_size=5, seed=0):
+    """Score levels by SFL learnability using a trained agent.
+
+    Loads the agent, converts tokens to levels, runs rollouts, returns p*(1-p).
+
+    Args:
+        agent_params: Flax params dict for ActorCritic (already loaded).
+        tokens: (N, 52) int32 token array.
+        agent_checkpoint_path: unused if agent_params provided (kept for API compat).
+        num_rollouts: number of eval rollouts per level.
+        batch_size: levels per batch for rollouts.
+        max_episode_length: max steps per episode.
+        agent_view_size: observation window size.
+        seed: random seed.
+
+    Returns:
+        scores: (N,) float32 array of SFL scores in [0, 0.25].
+    """
+    import sys, os
+    # Add examples/ to path for ActorCritic, and parent for jaxued
+    examples_dir = os.path.join(os.path.dirname(__file__), "..", "examples")
+    sys.path.insert(0, examples_dir)
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+    import chex
+    import distrax
+    import flax.linen as nn
+    from flax.linen.initializers import orthogonal, constant
+    from jaxued.environments import Maze
+    from vae_level_utils import tokens_to_level
+
+    # Inline ActorCritic definition (avoids importing the huge maze_plr.py)
+    class ResetRNN(nn.Module):
+        cell: nn.Module
+        @nn.compact
+        def __call__(self, inputs, initial_carry):
+            embedding, dones = inputs
+            hidden = self.cell.initialize_carry(jax.random.PRNGKey(0), embedding.shape)
+            hidden = jax.tree_util.tree_map(
+                lambda new, old: jnp.where(dones[..., None], new, old),
+                initial_carry, hidden)
+            return self.cell(hidden, embedding)
+
+    class ActorCritic(nn.Module):
+        action_dim: int
+        @nn.compact
+        def __call__(self, inputs, hidden):
+            obs, dones = inputs
+            img_embed = nn.Conv(16, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(obs.image)
+            img_embed = img_embed.reshape(*img_embed.shape[:-3], -1)
+            img_embed = nn.relu(img_embed)
+            dir_embed = jax.nn.one_hot(obs.agent_dir, 4)
+            dir_embed = nn.Dense(5, kernel_init=orthogonal(np.sqrt(2)),
+                                 bias_init=constant(0.0), name="scalar_embed")(dir_embed)
+            embedding = jnp.append(img_embed, dir_embed, axis=-1)
+            hidden, embedding = ResetRNN(nn.OptimizedLSTMCell(features=256))(
+                (embedding, dones), initial_carry=hidden)
+            actor_mean = nn.Dense(32, kernel_init=orthogonal(2),
+                                  bias_init=constant(0.0), name="actor0")(embedding)
+            actor_mean = nn.relu(actor_mean)
+            actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01),
+                                  bias_init=constant(0.0), name="actor1")(actor_mean)
+            pi = distrax.Categorical(logits=actor_mean)
+            critic = nn.Dense(32, kernel_init=orthogonal(2),
+                              bias_init=constant(0.0), name="critic0")(embedding)
+            critic = nn.relu(critic)
+            critic = nn.Dense(1, kernel_init=orthogonal(1.0),
+                              bias_init=constant(0.0), name="critic1")(critic)
+            return hidden, pi, jnp.squeeze(critic, axis=-1)
+
+        @staticmethod
+        def initialize_carry(batch_dims):
+            return nn.OptimizedLSTMCell(features=256).initialize_carry(
+                jax.random.PRNGKey(0), (*batch_dims, 256))
+
+    # Setup
+    env = Maze(max_height=13, max_width=13, agent_view_size=agent_view_size, normalize_obs=True)
+    env_params = env.default_params
+
+    # Wrap agent params for apply
+    class FakeTrainState:
+        def __init__(self, params):
+            self.params = params
+            self.apply_fn = ActorCritic(action_dim=5).apply
+
+    fake_ts = FakeTrainState(agent_params)
+
+    def evaluate_rnn_batch(rng, levels_batch, n_levels):
+        """Run one rollout on a batch of levels, return success mask."""
+        rng_reset, rng_eval = jax.random.split(rng)
+        init_obs, init_env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
+            jax.random.split(rng_reset, n_levels), levels_batch, env_params)
+        init_hstate = ActorCritic.initialize_carry((n_levels,))
+
+        def step(carry, _):
+            rng, hstate, obs, state, done, mask = carry
+            rng, rng_action, rng_step = jax.random.split(rng, 3)
+            x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, done))
+            hstate, pi, _ = fake_ts.apply_fn(fake_ts.params, x, hstate)
+            action = pi.sample(seed=rng_action).squeeze(0)
+            obs, next_state, reward, done, _ = jax.vmap(
+                env.step, in_axes=(0, 0, 0, None)
+            )(jax.random.split(rng_step, n_levels), state, action, env_params)
+            next_mask = mask & ~done
+            return (rng, hstate, obs, next_state, done, next_mask), reward
+
+        (_, _, _, _, _, _), rewards = jax.lax.scan(
+            step,
+            (rng_eval, init_hstate, init_obs, init_env_state,
+             jnp.zeros(n_levels, dtype=bool), jnp.ones(n_levels, dtype=bool)),
+            None, length=max_episode_length)
+        return (rewards.sum(axis=0) > 0).astype(jnp.float32)
+
+    # Convert tokens to levels
+    N = len(tokens)
+    print(f"[SFL Scoring] Scoring {N} levels with {num_rollouts} rollouts each...")
+
+    # Process in batches
+    all_scores = []
+    rng = jax.random.PRNGKey(seed)
+
+    # JIT the rollout for a fixed batch size
+    eval_jit = jax.jit(evaluate_rnn_batch, static_argnums=(2,))
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        actual_bs = end - start
+        batch_tokens = jnp.array(tokens[start:end])
+
+        # Pad to batch_size if needed
+        if actual_bs < batch_size:
+            pad = batch_size - actual_bs
+            batch_tokens = jnp.concatenate([batch_tokens, jnp.zeros((pad, 52), dtype=jnp.int32)])
+
+        batch_levels = jax.vmap(tokens_to_level)(batch_tokens)
+
+        # Run num_rollouts
+        successes = []
+        for r in range(num_rollouts):
+            rng, rng_r = jax.random.split(rng)
+            success = eval_jit(rng_r, batch_levels, batch_size)
+            successes.append(success)
+
+        all_successes = jnp.stack(successes, axis=0)  # (num_rollouts, batch_size)
+        p = all_successes.mean(axis=0)
+        batch_scores = p * (1 - p)  # SFL score
+
+        # Trim padding
+        all_scores.append(np.array(batch_scores[:actual_bs]))
+
+        if (start // batch_size) % 50 == 0:
+            print(f"  [{start}/{N}] batch mean score: {float(batch_scores[:actual_bs].mean()):.4f}")
+
+    scores = np.concatenate(all_scores)
+    print(f"[SFL Scoring] Done. Score stats: mean={scores.mean():.4f}, "
+          f"std={scores.std():.4f}, max={scores.max():.4f}, "
+          f"nonzero={int((scores > 0).sum())}/{N}")
+    return scores
+
+
 # ─── Data loading ────────────────────────────────────────────────────────────
 
 def load_train_data(path):
@@ -317,6 +481,17 @@ def main():
     parser.add_argument("--recency_decay", type=float, default=0.9999,
                         help="Exponential decay rate for recency weighting per step gap")
 
+    # SFL scoring (optional — score levels with a trained agent before fine-tuning)
+    parser.add_argument("--agent_checkpoint", type=str, default=None,
+                        help="Path to Orbax agent checkpoint dir for SFL scoring. "
+                             "If provided, scores levels with agent rollouts before training.")
+    parser.add_argument("--sfl_rollouts", type=int, default=5,
+                        help="Number of rollouts per level for SFL scoring")
+    parser.add_argument("--sfl_batch_size", type=int, default=32,
+                        help="Batch size for SFL rollout scoring")
+    parser.add_argument("--sfl_max_levels", type=int, default=100000,
+                        help="Max levels to sample for SFL scoring (0 = use all)")
+
     # Saving
     parser.add_argument("--output_dir", type=str, default="vae/finetune_checkpoints",
                         help="Directory to save fine-tuned checkpoints")
@@ -357,6 +532,58 @@ def main():
     train_data = load_train_data(args.train_data)
     train_tokens = train_data["tokens"]
     print(f"[Fine-tune] Training set: {len(train_tokens)} levels")
+
+    # ── Optional: SFL scoring with agent rollouts ──
+    if args.agent_checkpoint:
+        import orbax.checkpoint as ocp
+        print(f"[Fine-tune] Loading agent from {args.agent_checkpoint} for SFL scoring...")
+        ws_manager = ocp.CheckpointManager(
+            args.agent_checkpoint,
+            item_handlers=ocp.StandardCheckpointHandler(),
+        )
+        ws_step = ws_manager.latest_step()
+        ws_ckpt = ws_manager.restore(ws_step)
+        agent_params = ws_ckpt["params"] if isinstance(ws_ckpt, dict) and "params" in ws_ckpt else ws_ckpt.params
+        print(f"[Fine-tune] Agent loaded from step {ws_step}")
+
+        # Subsample if needed
+        n_total = len(train_tokens)
+        max_lvl = args.sfl_max_levels if args.sfl_max_levels > 0 else n_total
+        if n_total > max_lvl:
+            rng_sub = np.random.default_rng(args.seed)
+            subset_idx = rng_sub.choice(n_total, size=max_lvl, replace=False)
+            score_tokens = train_tokens[subset_idx]
+            print(f"[Fine-tune] Subsampled {max_lvl}/{n_total} levels for SFL scoring")
+        else:
+            subset_idx = None
+            score_tokens = train_tokens
+
+        sfl_scores = score_levels_sfl(
+            agent_params=agent_params,
+            tokens=score_tokens,
+            agent_checkpoint_path=args.agent_checkpoint,
+            num_rollouts=args.sfl_rollouts,
+            batch_size=args.sfl_batch_size,
+            seed=args.seed,
+        )
+
+        # If subsampled, assign scores back (unscored levels get 0)
+        if subset_idx is not None:
+            full_scores = np.zeros(n_total, dtype=np.float32)
+            full_scores[subset_idx] = sfl_scores
+            train_data["scores"] = full_scores
+            # Only keep scored levels for training
+            scored_mask = full_scores > 0
+            n_scored = int(scored_mask.sum())
+            if n_scored > 0:
+                print(f"[Fine-tune] {n_scored}/{n_total} levels have nonzero SFL score")
+        else:
+            train_data["scores"] = sfl_scores
+
+        # Override weighting to use fresh scores
+        if args.sample_weighting == "uniform":
+            print("[Fine-tune] Switching sample_weighting to 'score' (agent scores available)")
+            args.sample_weighting = "score"
 
     # Compute sampling weights
     sample_probs = compute_sample_weights(train_data, mode=args.sample_weighting,
