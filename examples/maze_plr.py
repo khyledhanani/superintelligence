@@ -1888,11 +1888,9 @@ def main(config=None, project="JAXUED_TEST"):
             best_idx = int(np.argmax(ws_scores[:ws_size]))
             best_tokens = jnp.array(ws_tokens[best_idx:best_idx+1])
             best_z = vae_encode_fn(best_tokens)[0]  # (latent_dim,)
-            # If KL filtering is active, zero out dead dims
+            # If KL filtering is active, select only active dims to match CMA-ES search_dim
             if active_dims is not None:
-                mask = jnp.zeros(best_z.shape[0])
-                mask = mask.at[active_dims].set(1.0)
-                best_z = best_z * mask
+                best_z = best_z[active_dims]  # (n_active,)
             new_es = cmaes_mgr.initialize(jax.random.PRNGKey(42), mean=best_z)
             train_state = train_state.replace(es_state=new_es)
             print(f"[Warmstart] CMA-ES mean seeded from best buffer level "
