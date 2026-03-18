@@ -31,18 +31,37 @@ num_refs: 3                 # Number of reference mazes from buffer
 strategy: top_regret        # "top_regret", "random", or "diverse"
 
 # --- Metric Injection ---
-inject_metrics: true        # Compute metrics from agent rollouts
-inject_regret: true         # Include regret scores in prompt
+# Controls which metrics are computed from agent rollouts and shown to the LLM.
+inject_metrics: true        # Master switch: compute metrics from agent rollouts
+inject_regret: true         # Include regret scores in prompt (fallback when inject_metrics=false)
 inject_buffer_stats: true   # Include buffer-wide statistics
+
+# Per-maze metrics injected into the LLM prompt (standalone, computed per reference).
+# Set to true/false to include/exclude each metric.
+prompt_metrics:
+  per_step_entropy: true    # Policy uncertainty at each timestep
+  per_step_regret: true     # (max_return - V(s_t)) time series
+  scalar_regret: true       # Mean per-step regret (single number, MaxMC)
+  action_sequence: true     # Agent's discrete actions per step (behavioral fingerprint)
+  path_overlay: true        # ASCII visualization of agent trajectory on the grid
+
+# Pairwise metrics injected into the LLM prompt (between all reference pairs).
+pairwise_metrics:
+  position_dtw: true        # Spatial path similarity between two trajectories
 
 # --- Agent & Feedback Loop ---
 agent_dir: gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198
 num_steps: 250              # Max rollout steps per episode
 n_rollouts: 100             # Agent rollouts per maze for robust regret
-feedback: true             # Enable diversity feedback loop
+feedback: true              # Enable diversity feedback loop
 max_diversity_retries: 3
-min_pos_dtw: null            # Position trace DTW threshold
-min_regret: 1            # Regret threshold (null = disabled)
+
+# --- Diversity Gate ---
+# Thresholds for accepting a generated maze. Set to null to disable a gate.
+# A maze must pass ALL enabled gates. On failure, LLM gets metric feedback and retries.
+gate:
+  min_regret: 1             # Rejects too-easy mazes (regret < 1.0) and unsolvable (negative regret)
+  min_pos_dtw: null         # Min position DTW vs references (null = disabled; needs investigation)
 
 # --- Metric Display ---
 downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt

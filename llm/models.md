@@ -69,6 +69,28 @@ Both approaches produce valid mazes. Opus's strategic reasoning may explain the 
 higher regret (1.036 vs 1.003) — it explicitly targets deceptive dead ends and ambiguous
 junctions. Sonnet's path-first approach guarantees solvability but may produce simpler structures.
 
+#### `--thinking-in-output` flag results
+
+The flag modifies the system prompt to explicitly request reasoning before the grid.
+Reasoning is extracted automatically and saved to `thinking_logs` in metadata.
+
+**Sonnet + thinking-in-output**: Hurts performance. Sonnet overthinks and produces
+unsolvable mazes (0/1 in testing). The structured reasoning prompt makes it design
+overly complex layouts it can't verify. Not recommended for Sonnet on CLI.
+
+**Opus + thinking-in-output**: Valid grids on every attempt (4/4), but couldn't hit
+regret >= 1.0 threshold (best was 0.971). Reasoning is concise and strategic (~600-700
+chars), correctly identifies issues and plans fixes. But the structured prompt may
+constrain creativity — without the flag, Opus reasons freely and hits regret=1.036.
+
+| Mode | Opus regret | Opus valid grids | Sonnet regret | Sonnet valid grids |
+|------|-------------|-----------------|---------------|-------------------|
+| Default (no flag) | 1.036 | 1/1 | 1.003 | 3/3 |
+| `--thinking-in-output` | 0.971 | 4/4 | N/A | 0/1 |
+
+**Recommendation**: Use `--thinking-in-output` only for debugging/analysis, not production.
+The default mode produces better regret for both models.
+
 ### kimi-k2.5:cloud (Ollama)
 - **Thinking model** that puts output in `thinking` field (content is empty)
 - Consistently produces valid 13x13 grids after the thinking→content fallback

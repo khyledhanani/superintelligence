@@ -132,27 +132,35 @@ def build_references_with_metrics(
     inject_regret: bool = True,
     inject_dtw: bool = False,
     downsample_points: int = 20,
+    prompt_metrics: dict = None,
+    pairwise_metrics_cfg: dict = None,
 ) -> tuple:
-    """Build ReferenceMaze objects with top-5 metric injection from trajectories.
-
-    When trajectories are provided, computes the full top-5 metrics:
-      1. Per-step entropy (standalone)
-      2. Position DTW (pairwise — returned separately)
-      3. Per-step regret (standalone)
-      4. Scalar MaxMC regret (standalone)
-      5. Per-step action (standalone)
+    """Build ReferenceMaze objects with configurable metric injection.
 
     Args:
         ref_data: List of (index, tokens, score) tuples
         trajectories: List of trajectory dicts from AgentEvaluator (or None)
         inject_regret: Include regret score as a metric (fallback to buffer score)
         inject_dtw: Unused (kept for CLI compat)
+        downsample_points: Max points when downsampling vectors
+        prompt_metrics: Dict of metric_key -> bool controlling which per-maze
+            metrics to include. None = all enabled. Keys:
+            per_step_entropy, per_step_regret, scalar_regret, action_sequence, path_overlay
+        pairwise_metrics_cfg: Dict of metric_key -> bool controlling which
+            pairwise metrics to include. None = all enabled. Keys: position_dtw
 
     Returns:
         Tuple of (references, pairwise_metrics):
             references: List of ReferenceMaze objects with per-maze metrics
-            pairwise_metrics: List of PairwiseMetricEntry (position DTW between refs)
+            pairwise_metrics: List of PairwiseMetricEntry
     """
+    # Default: all metrics enabled
+    pm = prompt_metrics or {}
+    pw = pairwise_metrics_cfg or {}
+
+    def _enabled(cfg_dict, key):
+        return cfg_dict.get(key, True)
+
     references = []
     pairwise_metrics = []
 
@@ -165,73 +173,79 @@ def build_references_with_metrics(
         if trajectories is not None and i < len(trajectories):
             traj = trajectories[i]
 
-            # 1. Per-step entropy (top metric)
-            ent_info = compute_per_step_entropy(traj["entropy"], traj["dones"])
-            ds_entropy = downsample(ent_info["entropy"], downsample_points)
-            metrics.append(MetricEntry(
-                name="Per-Step Entropy",
-                value=format_vector(ds_entropy),
-                description=(
-                    f"Policy uncertainty at each step "
-                    f"(mean={ent_info['mean']:.3f}, max={ent_info['max']:.3f} "
-                    f"at step {ent_info['max_step']}, ep_len={ent_info['episode_length']})"
-                ),
-                higher_is="more uncertain (harder decision points)",
-                metric_key="per_step_entropy",
-            ))
+            # Per-step entropy
+            if _enabled(pm, "per_step_entropy"):
+                ent_info = compute_per_step_entropy(traj["entropy"], traj["dones"])
+                ds_entropy = downsample(ent_info["entropy"], downsample_points)
+                metrics.append(MetricEntry(
+                    name="Per-Step Entropy",
+                    value=format_vector(ds_entropy),
+                    description=(
+                        f"Policy uncertainty at each step "
+                        f"(mean={ent_info['mean']:.3f}, max={ent_info['max']:.3f} "
+                        f"at step {ent_info['max_step']}, ep_len={ent_info['episode_length']})"
+                    ),
+                    higher_is="more uncertain (harder decision points)",
+                    metric_key="per_step_entropy",
+                ))
 
-            # 3. Per-step regret
-            reg_info = compute_per_step_regret(
-                traj["values"], traj["rewards"], traj["dones"]
-            )
-            ds_regret = downsample(reg_info["regret_curve"], downsample_points)
-            metrics.append(MetricEntry(
-                name="Per-Step Regret",
-                value=format_vector(ds_regret),
-                description=(
-                    f"Difficulty at each step (max_return - V(s_t)), "
-                    f"mean={reg_info['mean_regret']:.3f}, "
-                    f"ep_len={reg_info['episode_length']}"
-                ),
-                higher_is="harder (agent expects lower return)",
-                metric_key="per_step_regret",
-            ))
+            # Per-step regret
+            if _enabled(pm, "per_step_regret"):
+                reg_info = compute_per_step_regret(
+                    traj["values"], traj["rewards"], traj["dones"]
+                )
+                ds_regret = downsample(reg_info["regret_curve"], downsample_points)
+                metrics.append(MetricEntry(
+                    name="Per-Step Regret",
+                    value=format_vector(ds_regret),
+                    description=(
+                        f"Difficulty at each step (max_return - V(s_t)), "
+                        f"mean={reg_info['mean_regret']:.3f}, "
+                        f"ep_len={reg_info['episode_length']}"
+                    ),
+                    higher_is="harder (agent expects lower return)",
+                    metric_key="per_step_regret",
+                ))
 
-            # 4. Scalar regret
-            regret_info = compute_regret(traj)
-            metrics.append(MetricEntry(
-                name="Scalar Regret",
-                value=regret_info.regret,
-                description=(
-                    f"MaxMC regret (mean gap between best return and value estimate), "
-                    f"solved={regret_info.solved}, ep_len={regret_info.episode_length}"
-                ),
-                higher_is="more learning potential",
-                metric_key="scalar_regret",
-            ))
+            # Scalar regret
+            if _enabled(pm, "scalar_regret"):
+                regret_info = compute_regret(traj)
+                metrics.append(MetricEntry(
+                    name="Scalar Regret",
+                    value=regret_info.regret,
+                    description=(
+                        f"MaxMC regret (mean gap between best return and value estimate), "
+                        f"solved={regret_info.solved}, ep_len={regret_info.episode_length}"
+                    ),
+                    higher_is="more learning potential",
+                    metric_key="scalar_regret",
+                ))
 
-            # 5. Per-step action
-            act_info = compute_per_step_action(traj["actions"], traj["dones"])
-            ds_actions = downsample(act_info["actions"].astype(np.float64), downsample_points)
-            metrics.append(MetricEntry(
-                name="Action Sequence",
-                value=format_vector(ds_actions, decimals=0),
-                description=(
-                    f"Agent's action at each step "
-                    f"({act_info['num_unique_actions']} unique, "
-                    f"dominant=action {act_info['dominant_action']} "
-                    f"at {act_info['dominant_fraction']:.0%})"
-                ),
-                metric_key="action_sequence",
-            ))
+            # Action sequence
+            if _enabled(pm, "action_sequence"):
+                act_info = compute_per_step_action(traj["actions"], traj["dones"])
+                ds_actions = downsample(act_info["actions"].astype(np.float64), downsample_points)
+                metrics.append(MetricEntry(
+                    name="Action Sequence",
+                    value=format_vector(ds_actions, decimals=0),
+                    description=(
+                        f"Agent's action at each step "
+                        f"({act_info['num_unique_actions']} unique, "
+                        f"dominant=action {act_info['dominant_action']} "
+                        f"at {act_info['dominant_fraction']:.0%})"
+                    ),
+                    metric_key="action_sequence",
+                ))
 
             # Path overlay
-            try:
-                from metrics.utils import truncate_at_done
-                ep_pos = truncate_at_done(traj["positions"], traj["dones"])
-                path_overlay = overlay_path_on_grid(grid, ep_pos)
-            except Exception:
-                path_overlay = None
+            path_overlay = None
+            if _enabled(pm, "path_overlay"):
+                try:
+                    from metrics.utils import truncate_at_done
+                    ep_pos = truncate_at_done(traj["positions"], traj["dones"])
+                    path_overlay = overlay_path_on_grid(grid, ep_pos)
+                except Exception:
+                    pass
 
             references.append(ReferenceMaze(
                 grid=grid,
@@ -255,8 +269,8 @@ def build_references_with_metrics(
                 metrics=metrics,
             ))
 
-    # 2. Pairwise position DTW between all reference pairs
-    if trajectories is not None and len(trajectories) >= 2:
+    # Pairwise position DTW between all reference pairs
+    if _enabled(pw, "position_dtw") and trajectories is not None and len(trajectories) >= 2:
         for i in range(len(trajectories)):
             for j in range(i + 1, len(trajectories)):
                 ti, tj = trajectories[i], trajectories[j]
@@ -686,12 +700,14 @@ def run_test(args):
         ref_trajectories = evaluator.evaluate_levels(ref_levels)
         logger.info("Reference trajectories collected")
 
-    # Build references with metrics (top-5 if trajectories available)
+    # Build references with metrics (configurable via prompt_metrics/pairwise_metrics)
     references, pairwise_metrics = build_references_with_metrics(
         ref_data,
         trajectories=ref_trajectories,
         inject_regret=args.inject_regret,
         downsample_points=args.downsample_points,
+        prompt_metrics=args.prompt_metrics,
+        pairwise_metrics_cfg=args.pairwise_metrics_cfg,
     )
 
     # Print reference mazes
@@ -1023,11 +1039,13 @@ def main():
     parser.add_argument("--max-diversity-retries", type=int,
                         default=cfg.get("max_diversity_retries"),
                         help="Max diversity gate retries per maze")
+    # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
+    gate_cfg = cfg.get("gate", {})
     parser.add_argument("--min-pos-dtw", type=float,
-                        default=cfg.get("min_pos_dtw"),
+                        default=gate_cfg.get("min_pos_dtw", cfg.get("min_pos_dtw")),
                         help="Min position trace DTW for diversity gate")
     parser.add_argument("--min-regret", type=float,
-                        default=cfg.get("min_regret"),
+                        default=gate_cfg.get("min_regret", cfg.get("min_regret")),
                         help="Min regret to accept (null = disabled)")
 
     # Mode
@@ -1046,6 +1064,10 @@ def main():
         api_key_env = cfg.get("api_key_env", "")
         if api_key_env:
             args.api_key = os.environ.get(api_key_env, "")
+
+    # Attach metric config dicts (not CLI-overridable, config-only)
+    args.prompt_metrics = cfg.get("prompt_metrics", None)
+    args.pairwise_metrics_cfg = cfg.get("pairwise_metrics", None)
 
     run_test(args)
 
