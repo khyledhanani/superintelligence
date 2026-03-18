@@ -39,10 +39,10 @@ inject_buffer_stats: true   # Include buffer-wide statistics
 agent_dir: gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198
 num_steps: 250              # Max rollout steps per episode
 n_rollouts: 100             # Agent rollouts per maze for robust regret
-feedback: false             # Enable diversity feedback loop
-max_diversity_retries: 2
-min_pos_dtw: 0.5            # Position trace DTW threshold
-min_regret: null            # Regret threshold (null = disabled)
+feedback: true             # Enable diversity feedback loop
+max_diversity_retries: 3
+min_pos_dtw: null            # Position trace DTW threshold
+min_regret: 1            # Regret threshold (null = disabled)
 
 # --- Metric Display ---
 downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt

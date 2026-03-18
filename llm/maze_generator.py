@@ -379,7 +379,7 @@ class MazeGenerator:
             resp.raise_for_status()
             data = resp.json()
             message = data["choices"][0]["message"]
-            content = message.get("content", "")
+            content = message.get("content") or ""  # Handle None content (thinking models)
             # OpenRouter reasoning: check "reasoning" field or "reasoning_details" array
             thinking = message.get("reasoning", None) or message.get("reasoning_content", None)
             if not thinking and "reasoning_details" in message:
@@ -388,6 +388,11 @@ class MazeGenerator:
                 if isinstance(details, list):
                     parts = [d.get("text", "") for d in details if isinstance(d, dict)]
                     thinking = "\n".join(parts) if parts else None
+            # Fallback: if content is empty but reasoning has the output
+            if not content.strip() and thinking:
+                logger.info("Content was empty, using reasoning field as fallback")
+                content = thinking
+                thinking = None
             if thinking:
                 logger.info(f"Model reasoning ({len(thinking)} chars)")
             return content, thinking
