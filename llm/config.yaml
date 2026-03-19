@@ -46,6 +46,7 @@ prompt_metrics:
   path_overlay: true        # ASCII visualization of agent trajectory on the grid
   position_vector: true    # Agent (x,y) per step — lets LLM link regret/entropy spikes to grid locations
   value_error: true        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
+  learnability: false       # SFL learnability p*(1-p) from multi-rollout solve rate (requires n_rollouts > 1)
 
 # Pairwise metrics injected into the LLM prompt (between all reference pairs).
 pairwise_metrics:
@@ -64,8 +65,11 @@ max_diversity_retries: 3
 # Thresholds for accepting a generated maze. Set to null to disable a gate.
 # A maze must pass ALL enabled gates. On failure, LLM gets metric feedback and retries.
 gate:
-  min_regret: 0.6             # Rejects too-easy mazes and unsolvable (negative regret). Should be tuned to buffer (buffer max is 0.475 for this buffer).
-  min_diversity: 0.02         # Min mean pairwise diversity vs references (calibrated: buffer median=0.02, 90th pctile=0.04)
+  difficulty_threshold: 0.6     # Min difficulty score to accept (null = disabled)
+  difficulty_metric: regret     # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
+                                #   regret: rejects too-easy mazes (threshold ~0.6, buffer max 0.475)
+                                #   sfl: rejects too-easy AND too-hard mazes (threshold ~0.1, max at p=0.5 is 0.25)
+  min_diversity: 0.02           # Min distance to closest reference (calibrated: buffer median=0.02, 90th pctile=0.04)
   diversity_metric: td_error_emd  # "td_error_emd", "experience_divergence", or "position_dtw"
 
 # --- Metric Display ---

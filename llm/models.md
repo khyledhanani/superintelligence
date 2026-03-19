@@ -193,6 +193,6 @@ The default mode produces better regret for both models.
    - **Premium**: Opus ($15/$75) with `--thinking` — best quality, reasoning traces, but 10x cost
    - **Free**: kimi-k2.5 on Ollama — works but very slow (~400s/maze)
 
-5. **Negative regret edge case** — when a maze is too hard for the agent (0% solve rate), max_return=0 but V(s_t)>0, producing negative regret. The `min_regret: 1` threshold filters these out.
+5. **Negative regret edge case** — when a maze is too hard for the agent (0% solve rate), max_return=0 but V(s_t)>0, producing negative regret. The `gate.difficulty_threshold` filters these out. Alternatively, `difficulty_metric: sfl` naturally rejects both too-hard (p≈0) and too-easy (p≈1) levels via learnability p×(1-p).
 
 6. **`content: None` bug (fixed)** — OpenRouter thinking models (Kimi K2.5, DeepSeek Speciale, GLM-5, Nemotron) return `content: null` with reasoning in `reasoning`/`reasoning_details` fields. Initial runs showed 0% success due to silent `NoneType` crashes. Fix: `message.get("content") or ""` + reasoning→content fallback (same as Ollama thinking path). Reruns after fix showed Kimi K2.5 at 67% and DeepSeek Speciale at 33%.

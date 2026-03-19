@@ -234,6 +234,14 @@ METRIC_DEFINITIONS: Dict[str, tuple] = {
         "recognize good positions). The sign reveals the nature of the error, not just "
         "its magnitude.",
     ),
+    "learnability": (
+        "SFL Learnability",
+        "SFL Learnability is p × (1-p) where p is the agent's solve rate across many "
+        "rollouts. Maximum learnability (0.25) occurs at p=0.5, meaning the agent solves "
+        "the maze half the time — it's right at its learning frontier. Learnability near "
+        "zero means the maze is either too easy (p≈1) or too hard (p≈0). Aim for mazes "
+        "with learnability > 0.1 (solve rate between ~13% and ~87%).",
+    ),
     "position_dtw": (
         "Position DTW",
         "Position DTW (Dynamic Time Warping) measures how similar the agent's spatial "

@@ -10,7 +10,8 @@ All metrics truncate trajectories at the first `done=True` flag to compare only 
 
 | Metric | Module | Input | Output | Measures | Status |
 |--------|--------|-------|--------|----------|--------|
-| Scalar Regret | `standalone/regret.py` | values, rewards, dones | `float` | Overall maze difficulty (MaxMC) | **Active gate** (min_regret: 1) |
+| Scalar Regret | `standalone/regret.py` | values, rewards, dones | `float` | Overall maze difficulty (MaxMC) | **Active gate** (difficulty_metric: regret) |
+| SFL Learnability | `standalone/learnability.py` | solve_rate (multi-rollout) | `float` | Learning frontier (p×(1-p)) | Gate option (difficulty_metric: sfl) |
 | Per-Step Regret | `standalone/per_step_regret.py` | values, rewards, dones | `(T,)` curve | Where difficulty spikes | Active (prompt) |
 | Value Error Profile | `standalone/value_error.py` | values, rewards, dones | `(T,)` signed | Where & how the agent is wrong | **New** (default: off) |
 | Per-Step Entropy | `standalone/per_step_entropy.py` | entropy, dones | `(T,)` curve | Policy uncertainty at each step | Active (prompt) |
@@ -31,9 +32,17 @@ All metrics truncate trajectories at the first `done=True` flag to compare only 
 ### Scalar Regret (MaxMC)
 `mean_t[max_return - V(s_t)]` — the ACCEL scoring function itself.
 
-- **Use:** Gate floor. Rejects trivially easy (regret < threshold) and unsolvable (negative regret) mazes.
-- **Limitation:** Says nothing about diversity. Two mazes with regret=1.0 can be experientially identical.
-- **Config:** `gate.min_regret: 1` (null to disable)
+- **Use:** Difficulty gate (default). Rejects trivially easy (regret < threshold) and unsolvable (negative regret) mazes.
+- **Limitation:** Says nothing about diversity. Two mazes with regret=1.0 can be experientially identical. Only filters too-easy levels, not too-hard.
+- **Config:** `gate.difficulty_threshold: 0.6`, `gate.difficulty_metric: regret`
+
+### SFL Learnability
+`p × (1-p)` where p = agent's solve rate across multiple rollouts.
+
+- **Use:** Alternative difficulty gate. Automatically filters both too-easy (p≈1) and too-hard (p≈0) levels. Maximum at p=0.5 (learnability=0.25).
+- **Intuition:** The variance of a Bernoulli(p). Greedily maximizing it is equivalent to maximizing expected improvement (Rutherford et al., 2024).
+- **Limitation:** Requires multi-rollout evaluation (solve_rate). Says nothing about diversity.
+- **Config:** `gate.difficulty_threshold: 0.1`, `gate.difficulty_metric: sfl`
 
 ### Per-Step Regret
 `max_return - V(s_t)` as a time series — unsigned.
@@ -132,7 +141,8 @@ TD EMD         0.301      0.687        0.290       0.614      0.310      1.000
 
 | Purpose | Metric | Why |
 |---------|--------|-----|
-| Gate: reject easy mazes | Scalar regret ≥ 1.0 | Direct, proven |
+| Gate: reject easy mazes | Scalar regret (difficulty_metric: regret) | Direct, proven |
+| Gate: reject easy AND hard mazes | SFL learnability (difficulty_metric: sfl) | Filters both extremes, targets learning frontier |
 | Gate: reject redundant mazes | TD error EMD | Task-agnostic, no thresholds/modes, captures learning signal diversity |
 | LLM prompt: agent behavior | Path overlay + entropy + action sequence | Rich context for maze design |
 | LLM prompt: difficulty | Value error profile or per-step regret | Shows where agent struggles |

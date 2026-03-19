@@ -50,6 +50,7 @@ from metrics.standalone.per_step_entropy import compute_per_step_entropy
 from metrics.standalone.per_step_regret import compute_per_step_regret
 from metrics.standalone.per_step_action import compute_per_step_action
 from metrics.standalone.regret import compute_regret
+from metrics.standalone.learnability import compute_learnability
 from metrics.standalone.value_error import compute_value_error
 from metrics.pairwise.pos_dtw import position_trace_dtw
 from metrics.pairwise.mode_transition import mode_transition_divergence, compute_baseline_stats
@@ -342,6 +343,21 @@ def build_references_with_metrics(
                     ),
                     higher_is="more learning potential",
                     metric_key="scalar_regret",
+                ))
+
+            # SFL Learnability (requires solve_rate from multi-rollout eval)
+            if _enabled(pm, "learnability") and "solve_rate" in traj:
+                learn_info = compute_learnability(traj)
+                metrics.append(MetricEntry(
+                    name="SFL Learnability",
+                    value=learn_info.learnability,
+                    description=(
+                        f"p×(1-p) where p=solve_rate={learn_info.solve_rate:.0%} "
+                        f"across {learn_info.n_rollouts} rollouts "
+                        f"(max 0.25 at p=0.5)"
+                    ),
+                    higher_is="more at learning frontier (peak at p=0.5)",
+                    metric_key="learnability",
                 ))
 
             # Action sequence
@@ -646,6 +662,11 @@ def save_results(
         ],
         "generated_mazes": [],
     }
+    # Save system prompt once (same for all generations)
+    first_result = results[0] if results else None
+    if first_result and first_result.system_prompt:
+        metadata["system_prompt"] = first_result.system_prompt
+
     for seq, (orig_idx, result) in enumerate(successful):
         entry = {
             "index": seq + 1,
@@ -653,6 +674,7 @@ def save_results(
             "attempts": result.attempts,
             "latency_ms": result.latency_ms,
             "errors": result.errors,
+            "user_prompt": result.user_prompt,
             "raw_responses": result.raw_responses,
             "thinking_logs": [t for t in result.thinking_logs if t is not None] or None,
         }
@@ -695,6 +717,32 @@ def save_results(
             if metadata["failed_mazes"][-1]["thinking_logs"] is None:
                 del metadata["failed_mazes"][-1]["thinking_logs"]
 
+    # Record rejected candidates (gate failures during feedback loop)
+    metadata["rejected_candidates"] = []
+    for i, r in enumerate(results):
+        for j, rc in enumerate(r.rejected_candidates):
+            entry = {
+                "generation_index": i + 1,
+                "attempt": j + 1,
+                "grid": rc.grid,
+                "gate_summary": {
+                    k: (round(v, 6) if isinstance(v, (int, float)) else v)
+                    for k, v in rc.gate_summary.items()
+                },
+                "issues": rc.issues,
+            }
+            metadata["rejected_candidates"].append(entry)
+
+    # Save rejected candidate grids as text files
+    all_rejected = []
+    for r in results:
+        all_rejected.extend(r.rejected_candidates)
+    for k, rc in enumerate(all_rejected):
+        rej_path = os.path.join(run_dir, f"rejected_{k + 1:03d}.txt")
+        with open(rej_path, 'w') as f:
+            f.write(rc.grid)
+        logger.info(f"Saved {rej_path}")
+
     meta_path = os.path.join(run_dir, "metadata.json")
     with open(meta_path, 'w') as f:
         json.dump(metadata, f, indent=2)
@@ -706,26 +754,35 @@ def save_results(
     ref_grids = [(ref.label, ref.grid) for ref in references]
     gen_grids = [(f"Generated {orig_idx + 1}", r.grid) for orig_idx, r in successful]
 
+    # Collect all rejected candidates across all generations
+    # Color scheme: blue=reference, green=accepted, yellow=rejected-diversity,
+    #               red=rejected-difficulty, orange=rejected-both
+    all_rejected = []
+    for r in results:
+        all_rejected.extend(r.rejected_candidates)
+
     n_refs = len(ref_grids)
     n_gens = len(gen_grids)
+    n_rejs = len(all_rejected)
 
-    if n_refs == 0 and n_gens == 0:
+    if n_refs == 0 and n_gens == 0 and n_rejs == 0:
         logger.warning("No mazes to visualize")
         return run_dir
 
-    # Layout: refs fill rows of max_cols, then generated fill rows of max_cols
+    # Layout: refs fill rows, then rejected, then accepted
     import math
     ref_rows = math.ceil(n_refs / max_cols) if n_refs > 0 else 0
+    rej_rows = math.ceil(n_rejs / max_cols) if n_rejs > 0 else 0
     gen_rows = math.ceil(n_gens / max_cols) if n_gens > 0 else 0
-    cols = min(max(n_refs, n_gens, 1), max_cols)
-    rows = ref_rows + gen_rows
+    cols = min(max(n_refs, n_gens, n_rejs, 1), max_cols)
+    rows = ref_rows + rej_rows + gen_rows
     if rows == 0:
         rows = 1
 
     fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4.5 * rows))
     fig.suptitle(
         f"LLM Maze Generation — {model}\n"
-        f"{n_gens}/{len(results)} successful, "
+        f"{n_gens}/{len(results)} accepted, {n_rejs} rejected, "
         f"{sum(r.latency_ms for r in results) / 1000:.0f}s total",
         fontsize=12, fontweight='bold',
     )
@@ -763,9 +820,52 @@ def save_results(
             color='blue', title=ref_title,
         )
 
-    # Generated mazes (red paths), filling rows of max_cols after references
-    for i, (orig_idx, result) in enumerate(successful):
+    # Rejected mazes — color by failure reason
+    for i, rc in enumerate(all_rejected):
         row = ref_rows + (i // cols)
+        col = i % cols
+        if row >= ref_rows + rej_rows:
+            break
+        ax = axes[row, col]
+        rt = rc.trajectory
+
+        # Color + reason tag by failure type
+        if rc.failed_difficulty and rc.failed_diversity:
+            path_color = 'orange'
+            title_color = 'orangered'
+            reason = "difficulty+diversity"
+        elif rc.failed_difficulty:
+            path_color = 'red'
+            title_color = 'firebrick'
+            reason = "difficulty"
+        else:
+            path_color = 'gold'
+            title_color = 'darkgoldenrod'
+            reason = "diversity"
+
+        # Build title with rejection reason + metrics
+        gate_sum = rc.gate_summary
+        title = f"Rejected {i + 1} [{reason}]"
+        if rt and "solve_rate" in rt:
+            title += f"\nsolve={rt['solve_rate']:.0%}"
+        if "learnability" in gate_sum:
+            title += f" learn={gate_sum['learnability']:.4f}"
+        elif "regret" in gate_sum:
+            title += f" regret={gate_sum['regret']:.3f}"
+        if "mean_diversity" in gate_sum:
+            title += f" div={gate_sum['min_diversity']:.4f}"
+
+        plot_maze_with_path(
+            ax, rc.grid,
+            positions=rt["positions"] if rt else None,
+            dones=rt["dones"] if rt else None,
+            color=path_color, title=title,
+            title_color=title_color,
+        )
+
+    # Accepted generated mazes (green paths), filling rows after rejected
+    for i, (orig_idx, result) in enumerate(successful):
+        row = ref_rows + rej_rows + (i // cols)
         col = i % cols
         if row >= rows:
             break
@@ -774,13 +874,13 @@ def save_results(
         gt = gen_trajectories[i] if gen_trajectories and i < len(gen_trajectories) else None
 
         # Build title with regret + diversity + solve rate
-        title = f"Generated {i + 1}"
+        title = f"Accepted {i + 1}"
         if gt:
             gi = compute_regret(gt)
             solve_str = f"solve={gt['solve_rate']:.0%}" if "solve_rate" in gt else ""
             title += f"\n{solve_str} regret={gi.regret:.3f}"
         if result.gate_metrics:
-            diversity_val = result.gate_metrics.get('mean_diversity')
+            diversity_val = result.gate_metrics.get('min_diversity')
             if diversity_val is not None:
                 title += f" div={diversity_val:.4f}"
 
@@ -788,9 +888,30 @@ def save_results(
             ax, result.grid,
             positions=gt["positions"] if gt else None,
             dones=gt["dones"] if gt else None,
-            color='red', title=title,
+            color='green', title=title,
             title_color='darkgreen', title_bold=True,
         )
+
+    # Add legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='blue', lw=2, label='Reference'),
+    ]
+    if n_rejs > 0:
+        # Only add legend entries for failure types that actually occurred
+        has_diff = any(rc.failed_difficulty and not rc.failed_diversity for rc in all_rejected)
+        has_div = any(rc.failed_diversity and not rc.failed_difficulty for rc in all_rejected)
+        has_both = any(rc.failed_difficulty and rc.failed_diversity for rc in all_rejected)
+        if has_div:
+            legend_elements.append(Line2D([0], [0], color='gold', lw=2, label='Rejected (diversity)'))
+        if has_diff:
+            legend_elements.append(Line2D([0], [0], color='red', lw=2, label='Rejected (difficulty)'))
+        if has_both:
+            legend_elements.append(Line2D([0], [0], color='orange', lw=2, label='Rejected (both)'))
+    if n_gens > 0:
+        legend_elements.append(Line2D([0], [0], color='green', lw=2, label='Accepted'))
+    fig.legend(handles=legend_elements, loc='lower center', ncol=len(legend_elements),
+               fontsize=9, frameon=True, bbox_to_anchor=(0.5, -0.01))
 
     plt.tight_layout()
     viz_path = os.path.join(run_dir, "visualization.png")
@@ -799,22 +920,41 @@ def save_results(
     logger.info(f"Saved {viz_path}")
 
     # --- Diversity embedding plot ---
-    # Compute pairwise TD Error EMD between all refs + generated, embed with t-SNE
+    # Compute pairwise TD Error EMD between all refs + rejected + accepted, embed with t-SNE
     all_trajs = []
     all_labels = []
     all_colors = []
+    all_markers = []
+    n_ref_in_emb = 0
     if ref_trajectories:
         for i, rt in enumerate(ref_trajectories):
             if rt is not None:
                 all_trajs.append(rt)
                 all_labels.append(references[i].label if i < len(references) else f"Ref {i+1}")
                 all_colors.append('blue')
+                all_markers.append('o')
+                n_ref_in_emb += 1
+    # Rejected candidates — colored by failure reason
+    for i, rc in enumerate(all_rejected):
+        rt = rc.trajectory
+        if rt is not None and "dones" in rt:
+            all_trajs.append(rt)
+            all_labels.append(f"Rej {i+1}")
+            if rc.failed_difficulty and rc.failed_diversity:
+                all_colors.append('orange')
+            elif rc.failed_difficulty:
+                all_colors.append('red')
+            else:
+                all_colors.append('gold')
+            all_markers.append('X')
+    # Accepted generated (green)
     if gen_trajectories:
         for i, gt in enumerate(gen_trajectories):
             if gt is not None:
                 all_trajs.append(gt)
-                all_labels.append(f"Gen {i+1}")
-                all_colors.append('red')
+                all_labels.append(f"Accepted {i+1}")
+                all_colors.append('green')
+                all_markers.append('*')
 
     if len(all_trajs) >= 3:
         try:
@@ -840,37 +980,77 @@ def save_results(
                 init="random",
             ).fit_transform(dist_matrix)
 
-            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(6, 5))
+            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(7, 6))
             for i in range(n):
                 ax_emb.scatter(
                     embedding[i, 0], embedding[i, 1],
-                    c=all_colors[i], s=120, zorder=5,
+                    c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
+                    marker=all_markers[i], zorder=5,
                     edgecolors='black', linewidths=0.5,
                 )
                 ax_emb.annotate(
                     all_labels[i], (embedding[i, 0], embedding[i, 1]),
                     textcoords="offset points", xytext=(6, 6),
-                    fontsize=8, color=all_colors[i], fontweight='bold',
+                    fontsize=7, color=all_colors[i], fontweight='bold',
+                )
+
+            # Plot reference centroid as black dot
+            if n_ref_in_emb >= 2:
+                ref_emb = embedding[:n_ref_in_emb]
+                centroid = ref_emb.mean(axis=0)
+                ax_emb.scatter(
+                    centroid[0], centroid[1],
+                    c='black', s=200, marker='D', zorder=6,
+                    edgecolors='white', linewidths=1.5,
+                )
+                ax_emb.annotate(
+                    "Centroid", (centroid[0], centroid[1]),
+                    textcoords="offset points", xytext=(6, -10),
+                    fontsize=7, color='black', fontweight='bold',
                 )
 
             # Draw edges with distance labels for nearest pairs
             for i in range(n):
                 for j in range(i + 1, n):
-                    alpha = 0.15
                     ax_emb.plot(
                         [embedding[i, 0], embedding[j, 0]],
                         [embedding[i, 1], embedding[j, 1]],
-                        'gray', alpha=alpha, linewidth=0.5,
+                        'gray', alpha=0.15, linewidth=0.5,
                     )
 
             ax_emb.set_title(
-                f"Diversity Embedding (TD Error EMD)\n"
-                f"blue=reference, red=generated",
-                fontsize=10, fontweight='bold',
+                "Diversity Embedding (TD Error EMD)",
+                fontsize=11, fontweight='bold',
             )
             ax_emb.set_xlabel("t-SNE dim 1", fontsize=9)
             ax_emb.set_ylabel("t-SNE dim 2", fontsize=9)
             ax_emb.grid(alpha=0.2)
+
+            # Legend
+            from matplotlib.lines import Line2D
+            emb_legend = [
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
+                       markersize=8, markeredgecolor='black', label='Reference'),
+                Line2D([0], [0], marker='D', color='w', markerfacecolor='black',
+                       markersize=8, markeredgecolor='white', label='Ref Centroid'),
+            ]
+            # Only add legend entries for failure types present
+            has_diff = any(rc.failed_difficulty and not rc.failed_diversity for rc in all_rejected)
+            has_div = any(rc.failed_diversity and not rc.failed_difficulty for rc in all_rejected)
+            has_both = any(rc.failed_difficulty and rc.failed_diversity for rc in all_rejected)
+            if has_div:
+                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='gold',
+                                         markersize=8, markeredgecolor='black', label='Rej (diversity)'))
+            if has_diff:
+                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='red',
+                                         markersize=8, markeredgecolor='black', label='Rej (difficulty)'))
+            if has_both:
+                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='orange',
+                                         markersize=8, markeredgecolor='black', label='Rej (both)'))
+            if n_gens > 0:
+                emb_legend.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='green',
+                                         markersize=10, markeredgecolor='black', label='Accepted'))
+            ax_emb.legend(handles=emb_legend, loc='best', fontsize=8, framealpha=0.9)
 
             emb_path = os.path.join(run_dir, "diversity_embedding.png")
             fig_emb.savefig(emb_path, dpi=150, bbox_inches='tight')
@@ -1038,7 +1218,8 @@ def run_test(args):
         ref_labels = [ref.label for ref in references]
 
         thresholds = DiversityThresholds(
-            min_regret=args.min_regret,
+            difficulty_threshold=args.difficulty_threshold,
+            difficulty_metric=args.difficulty_metric,
             min_diversity=args.min_diversity,
             diversity_metric=args.diversity_metric,
         )
@@ -1275,9 +1456,13 @@ def main():
                         help="Max diversity gate retries per maze")
     # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
     gate_cfg = cfg.get("gate", {})
-    parser.add_argument("--min-regret", type=float,
-                        default=gate_cfg.get("min_regret", cfg.get("min_regret")),
-                        help="Min regret to accept (null = disabled)")
+    parser.add_argument("--difficulty-threshold", type=float,
+                        default=gate_cfg.get("difficulty_threshold"),
+                        help="Min difficulty score to accept (null = disabled)")
+    parser.add_argument("--difficulty-metric",
+                        choices=["regret", "sfl"],
+                        default=gate_cfg.get("difficulty_metric", "regret"),
+                        help="Difficulty metric: 'regret' (MaxMC) or 'sfl' (learnability p*(1-p))")
     parser.add_argument("--min-diversity", type=float,
                         default=gate_cfg.get("min_diversity", cfg.get("min_diversity")),
                         help="Min mean pairwise diversity vs references (null = disabled)")

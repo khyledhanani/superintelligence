@@ -80,7 +80,7 @@ When a maze is too hard for the agent (0% solve rate across rollouts):
 - `V(s_t) > 0` (agent was trained on other mazes and expects some return)
 - `regret = max_return - V(s_t) < 0`
 
-This is not a bug — it correctly indicates the agent overestimates its prospects on an impossible maze. The `min_regret: 1` gate filters these out (negative regret < 1).
+This is not a bug — it correctly indicates the agent overestimates its prospects on an impossible maze. The `gate.difficulty_threshold` filters these out (negative regret < threshold). Alternatively, using `difficulty_metric: sfl` filters by learnability p×(1-p), which naturally rejects both too-hard (p≈0) and too-easy (p≈1) levels.
 
 With signed value error: `V(s_t) - G_t > 0` on these mazes, correctly flagging the agent as overconfident.
 

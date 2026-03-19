@@ -109,6 +109,17 @@ class GenerationConfig:
 
 
 @dataclass
+class RejectedCandidate:
+    """A candidate maze that was rejected by the diversity/difficulty gate."""
+    grid: str                          # ASCII grid
+    gate_summary: Dict                 # gate_result.summary
+    issues: List[str]                  # gate_result.issues
+    trajectory: Optional[Dict] = None  # agent trajectory (positions, values, dones, etc.)
+    failed_difficulty: bool = False    # Failed difficulty gate (regret or SFL)
+    failed_diversity: bool = False     # Failed diversity gate (td_error_emd etc.)
+
+
+@dataclass
 class GenerationResult:
     """Result of a maze generation attempt.
 
@@ -123,6 +134,7 @@ class GenerationResult:
         gate_metrics: Diversity metrics from decision gate (if evaluated)
         diversity_attempts: Number of diversity gate attempts
         diversity_issues: Unresolved diversity issues (if gate failed)
+        rejected_candidates: Candidates that failed the gate (with grids + trajectories)
     """
     success: bool = False
     grid: Optional[str] = None
@@ -131,12 +143,15 @@ class GenerationResult:
     errors: List[str] = field(default_factory=list)
     raw_responses: List[str] = field(default_factory=list)
     thinking_logs: List[Optional[str]] = field(default_factory=list)  # reasoning traces (None for non-thinking models)
+    system_prompt: Optional[str] = None   # system prompt sent to LLM
+    user_prompt: Optional[str] = None     # initial user prompt sent to LLM
     latency_ms: float = 0.0
     gate_metrics: Optional[Dict] = None
     gate_pair_metrics: Optional[List] = None  # List[PairGateMetrics] with local_costs vectors
     diversity_attempts: int = 0
     diversity_issues: List[str] = field(default_factory=list)
     feedback_prompts: List[str] = field(default_factory=list)  # diversity feedback prompts sent to LLM
+    rejected_candidates: List[RejectedCandidate] = field(default_factory=list)
 
 
 class MazeGenerator:
@@ -153,6 +168,7 @@ class MazeGenerator:
         instruction: str = "",
         target_metrics: Optional[List[MetricEntry]] = None,
         solvability_checker: Optional[Callable] = None,
+        prior_messages: Optional[List[Dict]] = None,
     ) -> GenerationResult:
         """Generate a new maze level via LLM.
 
@@ -164,6 +180,9 @@ class MazeGenerator:
             target_metrics: Target metric values for the new maze
             solvability_checker: Optional callable(Level) -> bool for solvability.
                 If None and config.validate_solvable is True, uses BFS flood fill.
+            prior_messages: Optional conversation history from previous diversity
+                attempts. List of {"role": ..., "content": ...} dicts appended
+                after the initial user prompt so the LLM sees its rejected mazes.
 
         Returns:
             GenerationResult with the generated maze (or error details)
@@ -184,6 +203,11 @@ class MazeGenerator:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+        # Append conversation history from previous diversity attempts
+        if prior_messages:
+            messages.extend(prior_messages)
+        result.system_prompt = system_prompt
+        result.user_prompt = user_prompt
 
         for attempt in range(1, self.config.max_retries + 1):
             result.attempts = attempt
@@ -784,6 +808,8 @@ class MazeGenerator:
             return result
 
         # Step 2-4: Metric feedback loop
+        # Accumulate conversation history so LLM sees its previous rejected mazes
+        diversity_history = []
         for diversity_attempt in range(max_diversity_retries + 1):
             # Run agent on candidate (100 rollouts for robust regret)
             logger.info(f"Running agent on candidate (diversity attempt {diversity_attempt + 1})...")
@@ -807,17 +833,23 @@ class MazeGenerator:
             )
 
             # Log metrics
-            regret_str = ""
+            difficulty_str = ""
             if gate_result.regret_info is not None:
                 ri = gate_result.regret_info
-                regret_str = (
+                difficulty_str = (
                     f", regret={ri.regret:.3f}, "
                     f"ep_len={ri.episode_length}, solved={ri.solved}"
                 )
+            if gate_result.learnability_info is not None:
+                li = gate_result.learnability_info
+                difficulty_str = (
+                    f", learnability={li.learnability:.4f}, "
+                    f"solve_rate={li.solve_rate:.0%}"
+                )
             logger.info(
                 f"Diversity gate: {'PASS' if gate_result.accepted else 'FAIL'} — "
-                f"diversity={gate_result.summary.get('mean_diversity', 0):.4f}"
-                f"{regret_str}"
+                f"min_div={gate_result.summary.get('min_diversity', 0):.4f}"
+                f"{difficulty_str}"
             )
 
             if gate_result.accepted:
@@ -826,6 +858,31 @@ class MazeGenerator:
                 result.gate_pair_metrics = gate_result.pair_metrics
                 result.diversity_attempts = diversity_attempt + 1
                 break
+
+            # Classify failure reason(s)
+            _failed_difficulty = False
+            _failed_diversity = False
+            for iss in gate_result.issues:
+                if "too similar" in iss.lower():
+                    _failed_diversity = True
+                else:
+                    _failed_difficulty = True
+
+            # Save rejected candidate (grid + trajectory + gate info)
+            result.rejected_candidates.append(RejectedCandidate(
+                grid=result.grid,
+                gate_summary=dict(gate_result.summary),
+                issues=list(gate_result.issues),
+                failed_difficulty=_failed_difficulty,
+                failed_diversity=_failed_diversity,
+                trajectory={
+                    k: np.array(v) if isinstance(v, np.ndarray) else v
+                    for k, v in candidate_traj.items()
+                    if k in ("positions", "values", "dones", "rewards",
+                             "actions", "entropy", "solve_rate", "best_return",
+                             "all_returns")
+                },
+            ))
 
             if diversity_attempt >= max_diversity_retries:
                 logger.info(
@@ -967,8 +1024,11 @@ class MazeGenerator:
                 div_key = _div_metric_map.get(thresholds.diversity_metric)
                 if div_key:
                     active_metric_keys.append(div_key)
-            if thresholds.min_regret is not None:
-                active_metric_keys.append("scalar_regret")
+            if thresholds.difficulty_threshold is not None:
+                if thresholds.difficulty_metric == "sfl":
+                    active_metric_keys.append("learnability")
+                else:
+                    active_metric_keys.append("scalar_regret")
             _analyzer_key_map = {
                 "PositionDTWAnalyzer": "position_dtw",
                 "PolicyEntropyAnalyzer": "per_step_entropy",
@@ -988,23 +1048,31 @@ class MazeGenerator:
                 metric_keys=active_metric_keys,
             )
 
+            # Accumulate conversation history: rejected grid + feedback
+            # The LLM's response was the rejected grid; the feedback is the user turn
+            diversity_history.append({"role": "assistant", "content": result.grid})
+            diversity_history.append({"role": "user", "content": feedback_prompt})
+
             # Save the feedback prompt and the previous raw responses for debugging
             prev_raw = list(result.raw_responses)
             prev_feedback = list(result.feedback_prompts)
+            prev_rejected = list(result.rejected_candidates)
 
-            # Regenerate with feedback context
+            # Regenerate with full conversation history
             result = self.generate(
                 references=references,
                 pairwise_metrics=pairwise_metrics,
                 global_metrics=global_metrics,
-                instruction=feedback_prompt,
+                instruction=instruction,
                 target_metrics=target_metrics,
                 solvability_checker=solvability_checker,
+                prior_messages=diversity_history,
             )
 
             # Carry forward the history from previous attempts
             result.raw_responses = prev_raw + result.raw_responses
             result.feedback_prompts = prev_feedback + [feedback_prompt]
+            result.rejected_candidates = prev_rejected
 
             if not result.success:
                 break

@@ -20,6 +20,11 @@ from metrics.standalone.regret import (
     compute_regret,
     check_regret,
 )
+from metrics.standalone.learnability import (
+    LearnabilityInfo,
+    compute_learnability,
+    check_learnability,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -32,10 +37,14 @@ class DiversityThresholds:
 
     Set any threshold to None to disable that metric entirely
     (skips computation and feedback).
+
+    difficulty_metric: "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
+    diversity_metric: "td_error_emd", "experience_divergence", or "position_dtw"
     """
-    min_regret: Optional[float] = None       # MaxMC regret (rejects trivial mazes)
-    min_diversity: Optional[float] = 0.04    # pairwise diversity vs references
-    diversity_metric: str = "td_error_emd"   # "td_error_emd", "experience_divergence", "position_dtw"
+    difficulty_threshold: Optional[float] = None  # Min difficulty score to accept
+    difficulty_metric: str = "regret"             # "regret" or "sfl"
+    min_diversity: Optional[float] = 0.04         # pairwise diversity vs references
+    diversity_metric: str = "td_error_emd"        # "td_error_emd", "experience_divergence", "position_dtw"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +84,7 @@ class GateResult:
     summary: Dict[str, float] = field(default_factory=dict)
     most_similar_ref: str = ""
     regret_info: Optional[RegretInfo] = None
+    learnability_info: Optional[LearnabilityInfo] = None
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +173,24 @@ def evaluate_candidate(
     thresholds = thresholds or DiversityThresholds()
     result = GateResult()
 
-    # --- Regret (standalone, no references needed) ---
-    if thresholds.min_regret is not None:
-        result.regret_info = compute_regret(
-            candidate_trajectory, max_steps,
-            stored_max_return=stored_max_return,
-        )
+    # --- Difficulty gate (standalone, no references needed) ---
+    if thresholds.difficulty_threshold is not None:
+        if thresholds.difficulty_metric == "sfl":
+            result.learnability_info = compute_learnability(candidate_trajectory)
+        else:
+            # Default: regret
+            result.regret_info = compute_regret(
+                candidate_trajectory, max_steps,
+                stored_max_return=stored_max_return,
+            )
 
     if not reference_trajectories:
         issues = []
-        if result.regret_info is not None:
-            check_regret(result.regret_info, thresholds.min_regret, issues)
+        if thresholds.difficulty_threshold is not None:
+            if thresholds.difficulty_metric == "sfl" and result.learnability_info is not None:
+                check_learnability(result.learnability_info, thresholds.difficulty_threshold, issues)
+            elif result.regret_info is not None:
+                check_regret(result.regret_info, thresholds.difficulty_threshold, issues)
         result.issues = issues
         result.accepted = len(issues) == 0
         return result
@@ -208,26 +225,40 @@ def evaluate_candidate(
         result.summary["max_return"] = result.regret_info.max_return
         result.summary["episode_length"] = result.regret_info.episode_length
 
+    if result.learnability_info is not None:
+        result.summary["learnability"] = result.learnability_info.learnability
+        result.summary["solve_rate"] = result.learnability_info.solve_rate
+        result.summary["difficulty_metric"] = "sfl"
+
+    if result.regret_info is not None and result.learnability_info is None:
+        result.summary["difficulty_metric"] = "regret"
+
     # --- Check thresholds (each metric independently) ---
     issues = []
 
-    if result.regret_info is not None and thresholds.min_regret is not None:
-        check_regret(result.regret_info, thresholds.min_regret, issues)
+    if thresholds.difficulty_threshold is not None:
+        if thresholds.difficulty_metric == "sfl" and result.learnability_info is not None:
+            check_learnability(result.learnability_info, thresholds.difficulty_threshold, issues)
+        elif result.regret_info is not None:
+            check_regret(result.regret_info, thresholds.difficulty_threshold, issues)
 
     if compute_diversity and result.pair_metrics:
-        mean_dist = float(np.mean([p.diversity_distance for p in result.pair_metrics]))
-        if mean_dist < thresholds.min_diversity:
+        distances = [p.diversity_distance for p in result.pair_metrics]
+        min_dist = min(distances)
+        if min_dist < thresholds.min_diversity:
             metric_name = {
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
             }.get(thresholds.diversity_metric, thresholds.diversity_metric)
+            closest = min(result.pair_metrics, key=lambda p: p.diversity_distance)
             issues.append(
-                f"Maze is too similar to buffer references "
-                f"(mean {metric_name} = {mean_dist:.4f}, "
+                f"Maze is too similar to {closest.ref_label} "
+                f"(min {metric_name} = {min_dist:.4f}, "
                 f"need > {thresholds.min_diversity:.4f}).\n"
                 f"  Per-reference distances: "
                 + ", ".join(f"{p.ref_label}={p.diversity_distance:.4f}" for p in result.pair_metrics)
+                + f"\n  Most similar to: {closest.ref_label} ({closest.diversity_distance:.4f})"
                 + "\n  Design a maze that produces fundamentally different agent behavior."
             )
 
