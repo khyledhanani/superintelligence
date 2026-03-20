@@ -4,8 +4,8 @@
 # All values here can be overridden by CLI flags.
 
 # --- Provider & Model ---
-provider: ollama            # "ollama" or "openrouter"
-model: kimi-k2.5:cloud      # Model identifier
+provider: claude-code       # "claude-code", "ollama", or "openrouter"
+model: sonnet               # Model identifier (claude-code: sonnet/opus/haiku)
 temperature: 0.8
 timeout: 600                # API request timeout in seconds
 
@@ -70,7 +70,10 @@ gate:
                                 #   regret: rejects too-easy mazes (threshold ~0.6, buffer max 0.475)
                                 #   sfl: rejects too-easy AND too-hard mazes (threshold ~0.1, max at p=0.5 is 0.25)
   min_diversity: 0.02           # Min distance to closest reference (calibrated: buffer median=0.02, 90th pctile=0.04)
-  diversity_metric: td_error_emd  # "td_error_emd", "experience_divergence", or "position_dtw"
+  diversity_metric: td_error_emd  # "td_error_emd", "experience_divergence", "position_dtw", or "cenie"
+
+# --- Visualization ---
+embedding_metric: td_error_emd    # Pairwise metric for t-SNE diversity embedding plot ("td_error_emd")
 
 # --- Metric Display ---
 downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt

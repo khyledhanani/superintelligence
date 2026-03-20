@@ -39,7 +39,7 @@ class DiversityThresholds:
     (skips computation and feedback).
 
     difficulty_metric: "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
-    diversity_metric: "td_error_emd", "experience_divergence", or "position_dtw"
+    diversity_metric: "td_error_emd", "experience_divergence", "position_dtw", or "cenie"
     """
     difficulty_threshold: Optional[float] = None  # Min difficulty score to accept
     difficulty_metric: str = "regret"             # "regret" or "sfl"
@@ -149,6 +149,7 @@ def evaluate_candidate(
     max_steps: int = 250,
     stored_max_return: Optional[float] = None,
     baseline_stats: Optional[dict] = None,
+    cenie_model: Optional[object] = None,
 ) -> GateResult:
     """Evaluate a candidate maze's trajectory against reference mazes.
 
@@ -166,6 +167,8 @@ def evaluate_candidate(
         max_steps: Max steps per episode for regret calculation
         stored_max_return: Previously stored max_return for accumulated regret
         baseline_stats: For experience_divergence mode classification
+        cenie_model: Fitted CENIEModel for CENIE diversity metric (required
+            when diversity_metric="cenie")
 
     Returns:
         GateResult with accept/reject decision, per-metric feedback, and metrics
@@ -196,29 +199,42 @@ def evaluate_candidate(
         return result
 
     compute_diversity = thresholds.min_diversity is not None
+    is_cenie = thresholds.diversity_metric == "cenie"
 
-    # --- Pairwise metrics (only compute what's needed) ---
-    for ref, label in zip(reference_trajectories, reference_labels):
-        pair = PairGateMetrics(ref_label=label)
+    # --- CENIE novelty (standalone, uses pre-fitted GMM) ---
+    if compute_diversity and is_cenie:
+        if cenie_model is not None:
+            from metrics.standalone.cenie import compute_cenie_novelty
+            novelty_info = compute_cenie_novelty(candidate_trajectory, cenie_model)
+            result.summary["cenie_novelty"] = novelty_info.novelty
+            result.summary["cenie_n_pairs"] = novelty_info.n_pairs
+            result.summary["min_diversity"] = novelty_info.novelty
+            result.summary["mean_diversity"] = novelty_info.novelty
+            result.summary["diversity_metric"] = "cenie"
 
-        if compute_diversity:
-            pair.diversity_distance = _compute_pairwise_diversity(
-                candidate_trajectory, ref,
-                thresholds.diversity_metric,
-                baseline_stats=baseline_stats,
-            )
-            pair.diversity_metric = thresholds.diversity_metric
+    # --- Pairwise metrics (only compute what's needed, skip for CENIE) ---
+    if not is_cenie:
+        for ref, label in zip(reference_trajectories, reference_labels):
+            pair = PairGateMetrics(ref_label=label)
 
-        result.pair_metrics.append(pair)
+            if compute_diversity:
+                pair.diversity_distance = _compute_pairwise_diversity(
+                    candidate_trajectory, ref,
+                    thresholds.diversity_metric,
+                    baseline_stats=baseline_stats,
+                )
+                pair.diversity_metric = thresholds.diversity_metric
 
-    # --- Summary scalars (only for computed metrics) ---
-    if compute_diversity and result.pair_metrics:
-        min_pair = min(result.pair_metrics, key=lambda p: p.diversity_distance)
-        result.most_similar_ref = min_pair.ref_label
-        distances = [p.diversity_distance for p in result.pair_metrics]
-        result.summary["min_diversity"] = min(distances)
-        result.summary["mean_diversity"] = float(np.mean(distances))
-        result.summary["diversity_metric"] = thresholds.diversity_metric
+            result.pair_metrics.append(pair)
+
+        # --- Summary scalars (only for computed metrics) ---
+        if compute_diversity and result.pair_metrics:
+            min_pair = min(result.pair_metrics, key=lambda p: p.diversity_distance)
+            result.most_similar_ref = min_pair.ref_label
+            distances = [p.diversity_distance for p in result.pair_metrics]
+            result.summary["min_diversity"] = min(distances)
+            result.summary["mean_diversity"] = float(np.mean(distances))
+            result.summary["diversity_metric"] = thresholds.diversity_metric
 
     if result.regret_info is not None:
         result.summary["regret"] = result.regret_info.regret
@@ -242,7 +258,19 @@ def evaluate_candidate(
         elif result.regret_info is not None:
             check_regret(result.regret_info, thresholds.difficulty_threshold, issues)
 
-    if compute_diversity and result.pair_metrics:
+    if compute_diversity and is_cenie:
+        novelty = result.summary.get("cenie_novelty", 0.0)
+        if novelty < thresholds.min_diversity:
+            issues.append(
+                f"Maze produces experiences too similar to the training buffer "
+                f"(CENIE novelty = {novelty:.4f}, "
+                f"need > {thresholds.min_diversity:.4f}).\n"
+                f"  The agent's state-action trajectory on this maze overlaps heavily "
+                f"with past curriculum experiences.\n"
+                f"  Design a maze that forces the agent into unfamiliar states "
+                f"and actions it hasn't encountered before."
+            )
+    elif compute_diversity and result.pair_metrics:
         distances = [p.diversity_distance for p in result.pair_metrics]
         min_dist = min(distances)
         if min_dist < thresholds.min_diversity:

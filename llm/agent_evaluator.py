@@ -117,8 +117,11 @@ class AgentEvaluator:
                     eval_env.step, in_axes=(0, 0, 0, None)
                 )(jax.random.split(rng_step, num_levels), state, action, env_params)
 
+                # Extract LSTM hidden state (carry_h, the output; not carry_c, the cell)
+                hstate_h = hstate[1]  # (N, 256)
+
                 carry = (rng, hstate, next_obs, next_state, next_done)
-                return carry, (obs.image, action, reward, done, agent_pos, value, entropy)
+                return carry, (obs.image, action, reward, done, agent_pos, value, entropy, hstate_h)
 
             _, traj = jax.lax.scan(
                 step,
@@ -195,6 +198,7 @@ class AgentEvaluator:
             "actions": results["actions"][:, best_idx],
             "rewards": results["rewards"][:, best_idx],
             "entropy": results["entropy"][:, best_idx],
+            "hstates": results["hstates"][:, best_idx],
             "best_return": float(returns[best_idx]),
             "solve_rate": float(np.mean(solved)),
             "all_returns": returns,
@@ -225,6 +229,7 @@ class AgentEvaluator:
                 "actions": results["actions"][:, i],
                 "rewards": results["rewards"][:, i],
                 "entropy": results["entropy"][:, i],
+                "hstates": results["hstates"][:, i],
             }
             trajectories.append(traj)
         return trajectories
@@ -242,7 +247,7 @@ class AgentEvaluator:
         rollout_fn = self._build_rollout_fn(num_levels)
 
         self.rng, rng_eval = jax.random.split(self.rng)
-        obs_images, actions, rewards, dones, positions, values, entropy = rollout_fn(
+        obs_images, actions, rewards, dones, positions, values, entropy, hstates = rollout_fn(
             rng_eval, batched_levels
         )
 
@@ -254,4 +259,5 @@ class AgentEvaluator:
             "positions": np.asarray(positions),        # (T, N, 2)
             "values": np.asarray(values),              # (T, N)
             "entropy": np.asarray(entropy),            # (T, N)
+            "hstates": np.asarray(hstates),            # (T, N, 256) LSTM hidden states
         }

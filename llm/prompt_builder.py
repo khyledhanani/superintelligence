@@ -268,6 +268,15 @@ METRIC_DEFINITIONS: Dict[str, tuple] = {
         "gradient updates. Higher EMD = more different learning signals. This is the most "
         "task-agnostic diversity metric.",
     ),
+    "cenie": (
+        "CENIE Novelty",
+        "CENIE Novelty measures how novel the agent's experience on a maze is compared to "
+        "the entire training buffer. It fits a Gaussian Mixture Model on the agent's LSTM "
+        "hidden states from past curriculum levels, then scores new levels by their negative "
+        "log-likelihood under the GMM. Higher novelty = the agent enters unfamiliar states "
+        "it hasn't encountered before. To increase novelty, design mazes that force the "
+        "agent into unusual spatial patterns and decision sequences.",
+    ),
 }
 
 

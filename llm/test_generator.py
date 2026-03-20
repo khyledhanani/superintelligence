@@ -627,6 +627,7 @@ def save_results(
     run_dir: str,
     ref_trajectories: list = None,
     gen_trajectories: list = None,
+    embedding_metric: str = "td_error_emd",
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
 
@@ -920,7 +921,8 @@ def save_results(
     logger.info(f"Saved {viz_path}")
 
     # --- Diversity embedding plot ---
-    # Compute pairwise TD Error EMD between all refs + rejected + accepted, embed with t-SNE
+    # Compute pairwise distances between all refs + rejected + accepted, embed with t-SNE
+    _emb_metric = embedding_metric
     all_trajs = []
     all_labels = []
     all_colors = []
@@ -958,19 +960,41 @@ def save_results(
 
     if len(all_trajs) >= 3:
         try:
-            from metrics.pairwise.td_error_distribution import td_error_divergence
             from sklearn.manifold import TSNE
+
+            def _pairwise_distance(t1, t2, metric):
+                """Compute pairwise distance between two trajectories."""
+                if metric == "td_error_emd":
+                    from metrics.pairwise.td_error_distribution import td_error_divergence
+                    return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
+                elif metric == "experience_divergence":
+                    from metrics.pairwise.mode_transition import mode_transition_divergence
+                    return mode_transition_divergence(
+                        t1, t1["dones"], t2, t2["dones"],
+                        entropy_a=t1.get("entropy"), entropy_b=t2.get("entropy"),
+                    )["kl_divergence"]
+                elif metric == "position_dtw":
+                    from metrics.pairwise.pos_dtw import position_trace_dtw
+                    return position_trace_dtw(
+                        t1["positions"], t1["dones"], t2["positions"], t2["dones"],
+                    )["distance"]
+                else:
+                    from metrics.pairwise.td_error_distribution import td_error_divergence
+                    return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
+
+            _emb_label = {
+                "td_error_emd": "TD Error EMD",
+                "experience_divergence": "Experience Divergence",
+                "position_dtw": "Position DTW",
+            }.get(_emb_metric, _emb_metric)
 
             n = len(all_trajs)
             dist_matrix = np.zeros((n, n))
             for i in range(n):
                 for j in range(i + 1, n):
-                    result_ij = td_error_divergence(
-                        all_trajs[i], all_trajs[i]["dones"],
-                        all_trajs[j], all_trajs[j]["dones"],
-                    )
-                    dist_matrix[i, j] = result_ij["emd"]
-                    dist_matrix[j, i] = result_ij["emd"]
+                    d = _pairwise_distance(all_trajs[i], all_trajs[j], _emb_metric)
+                    dist_matrix[i, j] = d
+                    dist_matrix[j, i] = d
 
             # t-SNE on precomputed distance matrix
             perplexity = min(5, n - 1)
@@ -1019,7 +1043,7 @@ def save_results(
                     )
 
             ax_emb.set_title(
-                "Diversity Embedding (TD Error EMD)",
+                f"Diversity Embedding ({_emb_label})",
                 fontsize=11, fontweight='bold',
             )
             ax_emb.set_xlabel("t-SNE dim 1", fontsize=9)
@@ -1224,6 +1248,26 @@ def run_test(args):
             diversity_metric=args.diversity_metric,
         )
 
+        # Fit CENIE GMM on buffer trajectories if using CENIE diversity metric
+        cenie_model = None
+        if args.diversity_metric == "cenie" and evaluator is not None:
+            from metrics.standalone.cenie import fit_cenie_model
+            # Use all reference trajectories (already computed) to fit the GMM.
+            # For a fuller model, roll out on more buffer levels.
+            cenie_trajs = ref_trajectories
+            if "hstates" not in ref_trajectories[0]:
+                logger.warning("Reference trajectories missing hstates — CENIE requires them")
+            else:
+                # Optionally expand to more buffer levels for better coverage
+                n_cenie_levels = min(size, 50)  # fit on up to 50 buffer levels
+                if n_cenie_levels > len(ref_trajectories):
+                    logger.info(f"Rolling out agent on {n_cenie_levels} buffer levels for CENIE GMM...")
+                    cenie_indices = np.argsort(-scores[:size])[:n_cenie_levels]
+                    cenie_levels = [tokens_to_level_obj(tokens[i]) for i in cenie_indices]
+                    cenie_trajs = evaluator.evaluate_levels(cenie_levels)
+                    logger.info(f"CENIE trajectories collected ({n_cenie_levels} levels)")
+                cenie_model = fit_cenie_model(cenie_trajs)
+
         results = generator.generate_batch_with_feedback(
             n=args.n,
             agent_evaluator=evaluator,
@@ -1236,6 +1280,7 @@ def run_test(args):
             diversity_thresholds=thresholds,
             max_diversity_retries=args.max_diversity_retries,
             n_rollouts=args.n_rollouts,
+            cenie_model=cenie_model,
         )
     else:
         print("\n" + "=" * 60)
@@ -1309,6 +1354,7 @@ def run_test(args):
         results, references, args.model, run_dir,
         ref_trajectories=ref_trajectories,
         gen_trajectories=gen_trajectories,
+        embedding_metric=args.embedding_metric,
     )
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    - maze_XXX.txt files (ASCII grids)")
@@ -1467,9 +1513,13 @@ def main():
                         default=gate_cfg.get("min_diversity", cfg.get("min_diversity")),
                         help="Min mean pairwise diversity vs references (null = disabled)")
     parser.add_argument("--diversity-metric",
-                        choices=["td_error_emd", "experience_divergence", "position_dtw"],
+                        choices=["td_error_emd", "experience_divergence", "position_dtw", "cenie"],
                         default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "td_error_emd")),
-                        help="Pairwise metric for diversity gate")
+                        help="Diversity metric: pairwise (td_error_emd, experience_divergence, position_dtw) or buffer-wide (cenie)")
+    parser.add_argument("--embedding-metric",
+                        choices=["td_error_emd"],
+                        default=cfg.get("embedding_metric", "td_error_emd"),
+                        help="Pairwise metric for t-SNE diversity embedding plot")
 
     # Mode
     parser.add_argument("--dry-run", action="store_true",

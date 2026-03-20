@@ -752,6 +752,7 @@ class MazeGenerator:
         diversity_thresholds=None,
         max_diversity_retries: int = 2,
         n_rollouts: int = 100,
+        cenie_model=None,
     ) -> GenerationResult:
         """Generate a maze with full metric feedback loop.
 
@@ -830,6 +831,7 @@ class MazeGenerator:
                 reference_labels,
                 thresholds,
                 stored_max_return=best_return,
+                cenie_model=cenie_model,
             )
 
             # Log metrics
@@ -1020,6 +1022,7 @@ class MazeGenerator:
                     "td_error_emd": "td_error",
                     "experience_divergence": "mode_transition",
                     "position_dtw": "position_dtw",
+                    "cenie": "cenie",
                 }
                 div_key = _div_metric_map.get(thresholds.diversity_metric)
                 if div_key:
@@ -1095,6 +1098,7 @@ class MazeGenerator:
         diversity_thresholds=None,
         max_diversity_retries: int = 2,
         n_rollouts: int = 100,
+        cenie_model=None,
     ) -> List[GenerationResult]:
         """Generate multiple mazes with metric feedback loop.
 
@@ -1121,6 +1125,7 @@ class MazeGenerator:
                 diversity_thresholds=diversity_thresholds,
                 max_diversity_retries=max_diversity_retries,
                 n_rollouts=n_rollouts,
+                cenie_model=cenie_model,
             )
             results.append(result)
 
