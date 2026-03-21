@@ -135,17 +135,36 @@ TD error distribution EMD uses Wasserstein-1 distance computed via quantile matc
 
 **Task-agnosticism:** TD error EMD requires only `(values, rewards, dones)` — the minimal interface any actor-critic provides. No observation access, no network internals, no entropy, no positions. This is the strongest task-agnostic guarantee of any pairwise metric in the system.
 
+**Temporal blind spot:** EMD compares distributions, not sequences. Two mazes where the agent is confused early vs confused late produce identical EMD if the overall δ distributions match. This is a real limitation — gradient updates happen in order, so temporal profile affects learning. For temporal sensitivity, use Regret DTW (r=0.290 correlation with EMD, captures temporal shape).
+
+---
+
+## CENIE GMM Properties
+
+CENIE fits a diagonal-covariance GMM on LSTM hidden state + action pairs (257D) from buffer trajectories.
+
+**Silhouette-based K selection:** Tries K from 2 to 10, picks K with highest silhouette score. Automates model complexity. In practice, K=2 consistently wins for the maze buffer — the agent's LSTM states cluster into two modes (exploring vs goal-directed).
+
+**NLL score interpretation:** Novelty = `-mean(log p(x_t | GMM))`. More negative = more familiar (high density). Less negative / positive = more novel (low density). Buffer levels typically score -250 to -110. A good gate threshold is around -200 (rejects the most familiar ~50% of experiences).
+
+**Not pairwise:** CENIE scores a trajectory against a density model, not against another trajectory. It cannot be used for the t-SNE diversity embedding (which requires pairwise distances). The embedding always uses TD Error EMD regardless of gate metric.
+
+**Architecture coupling:** Uses LSTM hidden states — tied to the agent's architecture. If the agent changes (different hidden dim, no LSTM), the GMM must be refitted and thresholds recalibrated.
+
+**FIFO buffer concept:** The paper uses a sliding window of recent experiences. Our implementation fits on a snapshot of 50 buffer levels (one-shot, not streaming). For integration into the training loop, a ring buffer approach is used (see `vae/cenie_scorer.py` in the training branch).
+
 ---
 
 ## Computational Cost
 
-| Metric | Per-pair cost | 16 levels (120 pairs) | 4000 levels (8M pairs) |
-|--------|-------------|----------------------|----------------------|
-| Position DTW | O(T1·T2) | ~1s total | Impractical |
-| Regret DTW | O(T1·T2) | ~1s total | Impractical |
-| Action DTW | O(T1·T2) | ~1s total | Impractical |
-| Mode Divergence | O(T) classify + O(1) KL | <1s total | ~minutes |
-| TD Error EMD | O(T) compute + O(T log T) sort | <1s total | ~minutes |
-| Value Error | O(T) per maze | <1s total | ~seconds |
+| Metric | Type | Per-eval cost | 16 levels (120 pairs) | 4000 levels |
+|--------|------|-------------|----------------------|-------------|
+| Position DTW | Pairwise | O(T1·T2) | ~1s total | Impractical (8M pairs) |
+| Regret DTW | Pairwise | O(T1·T2) | ~1s total | Impractical |
+| Action DTW | Pairwise | O(T1·T2) | ~1s total | Impractical |
+| Mode Divergence | Pairwise | O(T) classify + O(1) KL | <1s total | ~minutes |
+| TD Error EMD | Pairwise | O(T) compute + O(T log T) sort | <1s total | ~minutes |
+| Value Error | Standalone | O(T) per maze | <1s total | ~seconds |
+| CENIE Novelty | Standalone | O(T·K) score (K=GMM components) | <1s total | ~seconds + GMM fit |
 
-Mode transition divergence is the cheapest pairwise metric because it reduces each trajectory to a 5×5 matrix before comparison. For large-scale buffer analysis, it's the only viable option without sampling.
+**Pairwise metrics** scale as O(N²). **Standalone metrics** (Value Error, CENIE) scale as O(N). CENIE has a one-time GMM fitting cost (~3s for 50 levels / 4000 samples) but O(1) per candidate after that — this is its key scaling advantage over pairwise metrics for large buffers.
