@@ -17,6 +17,7 @@ Changes from original:
   8. New metrics: per-token accuracy, wall IoU, duplicate walls, latent stats.
   9. New plots: latent diagnostics (active units, mean/std distributions).
 """
+import argparse
 import math
 import jax
 import jax.numpy as jnp
@@ -45,7 +46,11 @@ from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 # ==========================================
 # CONFIG
 # ==========================================
-with open("vae_train_config.yml", "r") as f:
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--config", type=str, default="vae_train_config.yml")
+_args, _ = _parser.parse_known_args()
+
+with open(_args.config, "r") as f:
     CONFIG = yaml.safe_load(f)
 
 

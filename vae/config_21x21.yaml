@@ -1,13 +1,33 @@
 # VAE config for 21x21 mazes
 # SEQ_LEN = MAX_WALLS + 2 = 152 (150 wall slots + goal + agent)
-# Larger architecture than 13x13 to handle 3x longer sequences
+
+# --- Model architecture ---
 vocab_size: 442
 embed_dim: 300
 latent_dim: 96
 seq_len: 152
 grid_size: 21
 max_walls: 150
-
-# LSTM hidden dims (13x13 defaults: enc=300, dec=400)
 enc_lstm_dim: 400
 dec_lstm_dim: 512
+
+# --- Training ---
+platform: "gcp"
+batch_size: 64
+learning_rate: 5.0e-05
+num_steps: 500000
+anneal_steps: 100000
+beta_max: 10.0
+recon_weight: 1000
+max_grad_norm: 1.0
+wall_weight: 1
+agent_goal_weight: 5
+
+# --- Data paths (GCS) ---
+train_data_path: "gs://ucl-ued-project-bucket/vae/datasets/train_21x21_2M.npy"
+validation_data_path: "gs://ucl-ued-project-bucket/vae/datasets/val_21x21_20k.npy"
+
+# --- Evaluation & saving ---
+plot_freq: 10000
+save_freq: 50000
+eval_metric_freq: 10000
