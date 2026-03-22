@@ -23,9 +23,21 @@ max_grad_norm: 1.0
 wall_weight: 1
 agent_goal_weight: 5
 
-# --- Data paths (GCS) ---
-train_data_path: "gs://ucl-ued-project-bucket/vae/datasets/train_21x21_2M.npy"
-validation_data_path: "gs://ucl-ued-project-bucket/vae/datasets/val_21x21_20k.npy"
+# --- GCP / I/O ---
+gcp_bucket: "ucl-ued-project-bucket"
+gcp_bucket_prefix: "vae"
+gcp_project: "open-endedness-ued-project"
+working_path: "/home/rhautier/superintelligence"
+vae_folder: "vae"
+
+# --- Data paths (relative to gcs prefix) ---
+train_data_path: "datasets/train_21x21_2M.npy"
+validation_data_path: "datasets/val_21x21_20k.npy"
+
+# --- Experiment tracking ---
+enable_vertex_tracking: false
+resume_run_id: null
+run_tag: "21x21_scale_up"
 
 # --- Evaluation & saving ---
 plot_freq: 10000
