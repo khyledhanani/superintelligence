@@ -520,10 +520,12 @@ def run_training():
                 train_m = evaluate_cluttr_metrics(
                     dataset_np[:1000], np.array(train_preds), pad_token=0,
                     check_reachability=do_reachability,
+                    grid_size=cfg.get("grid_size", 13),
                 )
                 val_m = evaluate_cluttr_metrics(
                     val_dataset_small_np, np.array(val_preds), pad_token=0,
                     check_reachability=do_reachability,
+                    grid_size=cfg.get("grid_size", 13),
                 )
 
                 metric_history["steps"].append(step)
