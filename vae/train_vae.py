@@ -365,7 +365,8 @@ def run_training():
     print(f"Loaded Train dataset: {dataset_np.shape}")
 
     val_dataset_np = io.load_npy(cfg["validation_data_path"])
-    val_dataset_small_np = val_dataset_np[:1000]
+    val_eval_size = cfg.get("val_eval_size", 1000)
+    val_dataset_small_np = val_dataset_np[:val_eval_size]
     print(f"Loaded Val dataset (subset): {val_dataset_small_np.shape}")
 
 
