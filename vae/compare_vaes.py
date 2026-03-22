@@ -17,6 +17,8 @@ def load_vae(checkpoint_path, config_path):
         embed_dim=cfg["embed_dim"],
         latent_dim=cfg["latent_dim"],
         seq_len=cfg["seq_len"],
+        enc_lstm_dim=cfg.get("enc_lstm_dim", 300),
+        dec_lstm_dim=cfg.get("dec_lstm_dim", 400),
     )
     with open(checkpoint_path, "rb") as f:
         ckpt = pickle.load(f)

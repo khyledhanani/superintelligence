@@ -1,8 +1,13 @@
 # VAE config for 21x21 mazes
 # SEQ_LEN = MAX_WALLS + 2 = 152 (150 wall slots + goal + agent)
+# Larger architecture than 13x13 to handle 3x longer sequences
 vocab_size: 442
 embed_dim: 300
-latent_dim: 64
+latent_dim: 96
 seq_len: 152
 grid_size: 21
 max_walls: 150
+
+# LSTM hidden dims (13x13 defaults: enc=300, dec=400)
+enc_lstm_dim: 400
+dec_lstm_dim: 512

@@ -595,6 +595,8 @@ def main(config=None, project="JAXUED_TEST"):
             embed_dim=vae_cfg["embed_dim"],
             latent_dim=vae_cfg["latent_dim"],
             seq_len=vae_cfg["seq_len"],
+            enc_lstm_dim=vae_cfg.get("enc_lstm_dim", 300),
+            dec_lstm_dim=vae_cfg.get("dec_lstm_dim", 400),
         )
 
         # Load checkpoint
