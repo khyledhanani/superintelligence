@@ -41,5 +41,5 @@ run_tag: "21x21_scale_up"
 
 # --- Evaluation & saving ---
 plot_freq: 10000
-save_freq: 50000
+save_freq: 20000
 eval_metric_freq: 10000
