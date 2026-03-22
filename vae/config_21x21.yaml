@@ -16,8 +16,8 @@ platform: "gcp"
 batch_size: 64
 learning_rate: 5.0e-05
 num_steps: 500000
-anneal_steps: 100000
-beta_max: 10.0
+anneal_steps: 400000
+beta_max: 1.0
 recon_weight: 1000
 max_grad_norm: 1.0
 wall_weight: 1
