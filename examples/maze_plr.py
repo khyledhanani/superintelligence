@@ -32,7 +32,8 @@ from enum import IntEnum
 # VAE + CMA-ES imports (conditional on --use_cmaes flag)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vae'))
 from vae_model import CluttrVAE
-from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_level
+from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_level, grid_constants
+import functools
 from cmaes_manager import CMAESManager
 from cenie_scorer import CENIEScorer
 
@@ -685,13 +686,19 @@ def main(config=None, project="JAXUED_TEST"):
         wandb.log(log_dict)
     
     # Setup the environment
-    env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
+    env = Maze(max_height=config["maze_height"], max_width=config["maze_width"], agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
     sample_random_level = make_level_generator(env.max_height, env.max_width, config["n_walls"])
     env_renderer = MazeRenderer(env, tile_size=8)
     env = AutoReplayWrapper(env)
     env_params = env.default_params
     mutate_level = make_level_mutator_minimax(100)
+
+    # Grid-size-aware token conversion (supports 13x13, 21x21, etc.)
+    _grid_size = config["maze_height"]
+    assert config["maze_height"] == config["maze_width"], "Non-square grids not supported by VAE token format"
+    _l2t = functools.partial(level_to_tokens, grid_size=_grid_size)
+    _d2l = functools.partial(decode_latent_to_levels, grid_size=_grid_size)
 
     # --- Active latent dimension detection ---
     active_dims = None  # None = use all dims
@@ -716,7 +723,7 @@ def main(config=None, project="JAXUED_TEST"):
             print(f"[KL-filter] Generating {config['cmaes_kl_samples']} random levels...")
             sample_rng = jax.random.PRNGKey(0)
             sample_levels = jax.vmap(sample_random_level)(jax.random.split(sample_rng, config["cmaes_kl_samples"]))
-            sample_tokens = jax.vmap(level_to_tokens)(sample_levels)  # (n_samples, 52)
+            sample_tokens = jax.vmap(_l2t)(sample_levels)  # (n_samples, 52)
         print(f"[KL-filter] Estimating per-dim KL with {sample_tokens.shape[0]} levels...")
         # Encode in batches to avoid OOM
         batch_size = 256
@@ -806,7 +813,7 @@ def main(config=None, project="JAXUED_TEST"):
                 print(f"[PCA] Generating {n_pca_samples} random levels...")
                 sample_rng = jax.random.PRNGKey(0)
                 sample_levels = jax.vmap(sample_random_level)(jax.random.split(sample_rng, n_pca_samples))
-                pca_tokens = jax.vmap(level_to_tokens)(sample_levels)
+                pca_tokens = jax.vmap(_l2t)(sample_levels)
 
             print(f"[PCA] Encoding {pca_tokens.shape[0]} levels through VAE...")
             pca_latent_means = encode_levels_to_means(vae_encode_fn, pca_tokens)
@@ -1123,9 +1130,9 @@ def main(config=None, project="JAXUED_TEST"):
                     z_pop, es_new = cmaes_mgr.ask(rng_ask, es_state)
                     if use_pca:
                         z_full = train_state.pca_mean + z_pop @ train_state.pca_components
-                        levels = decode_latent_to_levels(_gen_pca_decode, z_full, rng_decode)
+                        levels = _d2l(_gen_pca_decode, z_full, rng_decode)
                     else:
-                        levels = decode_latent_to_levels(vae_decode_fn, z_pop, rng_decode)
+                        levels = _d2l(vae_decode_fn, z_pop, rng_decode)
                     return levels, es_new, z_pop
 
                 def _random_generate(rng_ask):
@@ -1141,7 +1148,7 @@ def main(config=None, project="JAXUED_TEST"):
                     def _cmaes_full_generate(rng_ask):
                         es_full = train_state.es_state_full
                         z_pop, es_full_new = cmaes_mgr_full.ask(rng_ask, es_full)
-                        levels = decode_latent_to_levels(vae_decode_fn, z_pop, rng_decode)
+                        levels = _d2l(vae_decode_fn, z_pop, rng_decode)
                         # Return dummy pca-dim z and unchanged es_state for the pca manager
                         dummy_z = jnp.zeros((config["num_train_envs"], cmaes_latent_dim))
                         return levels, es_state, dummy_z, es_full_new
@@ -1153,7 +1160,7 @@ def main(config=None, project="JAXUED_TEST"):
                     def _cmaes_pca_generate(rng_ask):
                         z_pop, es_new = cmaes_mgr.ask(rng_ask, es_state)
                         z_full = train_state.pca_mean + z_pop @ train_state.pca_components
-                        levels = decode_latent_to_levels(_pca_decode_fn, z_full, rng_decode)
+                        levels = _d2l(_pca_decode_fn, z_full, rng_decode)
                         return levels, es_new, z_pop, train_state.es_state_full
 
                     new_levels, es_state, z_population, es_state_full = jax.lax.cond(
@@ -1181,8 +1188,8 @@ def main(config=None, project="JAXUED_TEST"):
                     # Extract levels and convert to tokens
                     levels_a = jax.tree_util.tree_map(lambda x: x[idx_a], sampler["levels"])
                     levels_b = jax.tree_util.tree_map(lambda x: x[idx_b], sampler["levels"])
-                    tokens_a = jax.vmap(level_to_tokens)(levels_a)  # (N, 52)
-                    tokens_b = jax.vmap(level_to_tokens)(levels_b)  # (N, 52)
+                    tokens_a = jax.vmap(_l2t)(levels_a)  # (N, 52)
+                    tokens_b = jax.vmap(_l2t)(levels_b)  # (N, 52)
 
                     # Encode to latent space
                     mean_a, logvar_a = vae_encode_fn(tokens_a)  # each (N, 64)
@@ -1200,7 +1207,7 @@ def main(config=None, project="JAXUED_TEST"):
                     eps = jax.random.normal(rng_z, mean_interp.shape)
                     z = mean_interp + eps * std_interp
 
-                    return decode_latent_to_levels(vae_decode_fn, z, rng_decode)
+                    return _d2l(vae_decode_fn, z, rng_decode)
 
                 def random_generate(rng):
                     return jax.vmap(sample_random_level)(jax.random.split(rng, config["num_train_envs"]))
@@ -1796,7 +1803,7 @@ def main(config=None, project="JAXUED_TEST"):
             return
 
         buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
-        tokens = jax.vmap(level_to_tokens)(buffer_levels)
+        tokens = jax.vmap(_l2t)(buffer_levels)
 
         dump_data = {
             "tokens": np.asarray(tokens),
@@ -1868,7 +1875,7 @@ def main(config=None, project="JAXUED_TEST"):
 
                 # Encode buffer levels
                 buf_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], ts_cur.sampler["levels"])
-                buf_tokens = jax.vmap(level_to_tokens)(buf_levels)
+                buf_tokens = jax.vmap(_l2t)(buf_levels)
                 buf_means = encode_levels_to_means(vae_encode_fn, buf_tokens)
 
                 # KL filtering on buffer
@@ -1940,7 +1947,7 @@ def main(config=None, project="JAXUED_TEST"):
                 if buf_size >= config["cmaes_pca_dims"]:
                     # Encode buffer levels
                     buf_levels = jax.tree_util.tree_map(lambda x: x[:buf_size], ts_cur.sampler["levels"])
-                    buf_tokens = jax.vmap(level_to_tokens)(buf_levels)
+                    buf_tokens = jax.vmap(_l2t)(buf_levels)
                     buf_means = encode_levels_to_means(vae_encode_fn, buf_tokens)
                     # Determine which dims to use for PCA
                     # delayed-start uses _delayed_active_dims, normal mode uses active_dims
@@ -1958,7 +1965,7 @@ def main(config=None, project="JAXUED_TEST"):
                         print(f"[PCA refit @ eval_step={eval_step+1}] Using {buf_size} buffer + {n_random} random levels")
                         rng_pca = jax.random.PRNGKey(eval_step)
                         rand_levels = jax.vmap(sample_random_level)(jax.random.split(rng_pca, n_random))
-                        rand_tokens = jax.vmap(level_to_tokens)(rand_levels)
+                        rand_tokens = jax.vmap(_l2t)(rand_levels)
                         rand_means = encode_levels_to_means(vae_encode_fn, rand_tokens)
                         if _refit_active is not None:
                             rand_means = rand_means[:, _refit_active]
@@ -2009,7 +2016,7 @@ def main(config=None, project="JAXUED_TEST"):
 
     buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
     buffer_scores = np.asarray(sampler["scores"][:size])
-    tokens = jax.vmap(level_to_tokens)(buffer_levels)
+    tokens = jax.vmap(_l2t)(buffer_levels)
 
     # === Post-training: evaluate agent on buffer levels ===
     if config.get("skip_post_eval"):
@@ -2018,7 +2025,7 @@ def main(config=None, project="JAXUED_TEST"):
         return
 
     print(f"\n[Post-training] Evaluating agent on {size} buffer levels...")
-    eval_env_post = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
+    eval_env_post = Maze(max_height=config["maze_height"], max_width=config["maze_width"], agent_view_size=config["agent_view_size"], normalize_obs=True)
     max_steps = env_params.max_steps_in_episode
     num_eval_attempts = 5
 
@@ -2278,6 +2285,8 @@ if __name__=="__main__":
     group.add_argument("--use_accel", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--num_edits", type=int, default=5)
     # === ENV CONFIG ===
+    group.add_argument("--maze_height", type=int, default=13)
+    group.add_argument("--maze_width", type=int, default=13)
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)

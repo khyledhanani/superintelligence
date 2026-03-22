@@ -57,74 +57,13 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Token <-> Level conversion (from vae_level_utils.py)
+# Token <-> Level conversion (imported from shared vae_level_utils)
 # ═══════════════════════════════════════════════════════════════════════════
 
-GRID_SIZE = 13
-VOCAB_SIZE = 170
-SEQ_LEN = 52
-MAX_WALLS = 50
-
-
-def tokens_to_level(tokens):
-    """Convert a 52-token VAE sequence to a Level dataclass."""
-    agent_idx = tokens[-1]
-    goal_idx = tokens[-2]
-    wall_tokens = tokens[:-2]
-
-    num_cells = GRID_SIZE * GRID_SIZE
-    wall_map_flat = jnp.zeros(num_cells, dtype=jnp.bool_)
-    wall_idx_0 = jnp.clip(wall_tokens - 1, 0, num_cells - 1)
-    valid_walls = wall_tokens > 0
-    wall_map_flat = wall_map_flat.at[wall_idx_0].set(valid_walls)
-    wall_map = wall_map_flat.reshape(GRID_SIZE, GRID_SIZE)
-
-    agent_0 = jnp.clip(agent_idx - 1, 0, num_cells - 1)
-    agent_pos = jnp.array([agent_0 % GRID_SIZE, agent_0 // GRID_SIZE], dtype=jnp.uint32)
-
-    goal_0 = jnp.clip(goal_idx - 1, 0, num_cells - 1)
-    goal_pos = jnp.array([goal_0 % GRID_SIZE, goal_0 // GRID_SIZE], dtype=jnp.uint32)
-
-    wall_map = wall_map.at[agent_pos[1], agent_pos[0]].set(False)
-    wall_map = wall_map.at[goal_pos[1], goal_pos[0]].set(False)
-
-    return Level(
-        wall_map=wall_map,
-        goal_pos=goal_pos,
-        agent_pos=agent_pos,
-        agent_dir=jnp.array(0, dtype=jnp.uint8),
-        width=GRID_SIZE,
-        height=GRID_SIZE,
-    )
-
-
-def level_to_tokens(level):
-    """Convert a Level dataclass to a 52-token VAE sequence."""
-    wall_map = level.wall_map
-    wall_flat = wall_map.reshape(-1)
-
-    indices_1based = jnp.arange(1, GRID_SIZE * GRID_SIZE + 1)
-    wall_indices = jnp.where(wall_flat, indices_1based, 0)
-    wall_indices = jnp.sort(wall_indices)[::-1][:MAX_WALLS]
-    wall_indices = jnp.sort(wall_indices)
-
-    goal_idx = level.goal_pos[1] * GRID_SIZE + level.goal_pos[0] + 1
-    agent_idx = level.agent_pos[1] * GRID_SIZE + level.agent_pos[0] + 1
-
-    return jnp.concatenate([wall_indices, jnp.array([goal_idx, agent_idx])]).astype(jnp.int32)
-
-
-def repair_tokens(tokens):
-    """Ensure decoded tokens are valid."""
-    tokens = jnp.clip(tokens, 0, VOCAB_SIZE - 1).astype(jnp.int32)
-    goal = jnp.clip(tokens[-2], 1, VOCAB_SIZE - 1)
-    agent = jnp.clip(tokens[-1], 1, VOCAB_SIZE - 1)
-    agent = jnp.where(goal == agent, (agent % (VOCAB_SIZE - 1)) + 1, agent)
-    walls = tokens[:-2]
-    walls = jnp.where(walls == goal, 0, walls)
-    walls = jnp.where(walls == agent, 0, walls)
-    walls = jnp.sort(walls)
-    return jnp.concatenate([walls, jnp.array([goal, agent])])
+from vae_level_utils import (
+    tokens_to_level, level_to_tokens, repair_tokens, grid_constants,
+    GRID_SIZE, VOCAB_SIZE, SEQ_LEN, MAX_WALLS,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,27 +225,49 @@ def vae_decode(model, params, z):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_agent_checkpoint(checkpoint_dir, env, env_params, network):
-    """Load agent params from an Orbax checkpoint."""
+    """Load agent params from an Orbax checkpoint (works on both TPU and GPU)."""
     models_dir = os.path.join(checkpoint_dir, 'models')
+    print(f"[Agent] Loading from {models_dir}")
+    loaded, step = _orbax_restore(models_dir)
+    print(f"[Agent] Restored checkpoint step {step}")
+    return loaded['params'], step
+
+
+def _orbax_restore(models_dir):
+    """Restore an Orbax checkpoint, handling TPU->GPU topology mismatch."""
     checkpoint_manager = ocp.CheckpointManager(
         models_dir,
         item_handlers=ocp.StandardCheckpointHandler(),
     )
     step = checkpoint_manager.latest_step()
-    print(f"[Agent] Loading checkpoint step {step} from {models_dir}")
-    loaded = checkpoint_manager.restore(step)
-    return loaded['params'], step
+
+    try:
+        return checkpoint_manager.restore(step), step
+    except ValueError as e:
+        if "Topology mismatch" not in str(e) and "TPU" not in str(e):
+            raise
+        print(f"[Orbax] TPU->GPU topology mismatch, using abstract restore...")
+
+    from pathlib import Path
+    ckpt_path = Path(models_dir) / str(step)
+    default_path = ckpt_path / 'default'
+    handler = ocp.PyTreeCheckpointHandler()
+    metadata = handler.metadata(default_path)
+    local_sharding = jax.sharding.SingleDeviceSharding(jax.local_devices()[0])
+    restore_args = jax.tree_util.tree_map(
+        lambda _: ocp.ArrayRestoreArgs(sharding=local_sharding), metadata
+    )
+    loaded = handler.restore(
+        default_path,
+        args=ocp.args.PyTreeRestore(restore_args=restore_args),
+    )
+    return loaded, step
 
 
 def extract_buffer_levels(checkpoint_dir):
     """Load the sampler state from Orbax and extract buffer levels + scores."""
     models_dir = os.path.join(checkpoint_dir, 'models')
-    checkpoint_manager = ocp.CheckpointManager(
-        models_dir,
-        item_handlers=ocp.StandardCheckpointHandler(),
-    )
-    step = checkpoint_manager.latest_step()
-    loaded = checkpoint_manager.restore(step)
+    loaded, step = _orbax_restore(models_dir)
 
     # The sampler is stored in the train state
     sampler = loaded['sampler']
@@ -346,27 +307,27 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 
-def render_maze_from_tokens(ax, tokens, solvability=None, mean_return=None, title=None):
-    """Render a maze from a 52-token sequence onto a matplotlib axis."""
+def render_maze_from_tokens(ax, tokens, solvability=None, mean_return=None, title=None, grid_size=GRID_SIZE):
+    """Render a maze from a token sequence onto a matplotlib axis."""
     tokens = np.array(tokens).flatten().astype(int)
     agent_idx = int(tokens[-1])
     goal_idx = int(tokens[-2])
     walls = tokens[:-2]
 
-    grid = np.ones((GRID_SIZE, GRID_SIZE, 3))  # white background
+    grid = np.ones((grid_size, grid_size, 3))  # white background
     for w in walls:
         if w > 0:
-            r, c = divmod(w - 1, GRID_SIZE)
+            r, c = divmod(w - 1, grid_size)
             grid[r, c] = [0, 0, 0]  # black wall
 
     ax.imshow(grid, interpolation='nearest')
 
     # Agent (red) and goal (green)
     if agent_idx > 0:
-        ar, ac = divmod(agent_idx - 1, GRID_SIZE)
+        ar, ac = divmod(agent_idx - 1, grid_size)
         ax.scatter(ac, ar, color='red', s=40, zorder=3, edgecolors='darkred', linewidths=0.5)
     if goal_idx > 0:
-        gr, gc = divmod(goal_idx - 1, GRID_SIZE)
+        gr, gc = divmod(goal_idx - 1, grid_size)
         ax.scatter(gc, gr, color='lime', s=40, marker='*', zorder=3, edgecolors='darkgreen', linewidths=0.5)
 
     if title:
@@ -538,6 +499,73 @@ def plot_jaccard_vs_regret(all_results, plot_dir, eps):
     print(f"[Plot] Jaccard vs regret -> {path}")
 
 
+def plot_cross_scale(scale_summaries, plot_dir, n_base, n_pert, n_rollouts):
+    """Cross-scale comparison: how metrics change with perturbation magnitude."""
+    scales = sorted(scale_summaries.keys())
+    jaccards = [scale_summaries[e]["summary"]["mean_wall_jaccard"] for e in scales]
+    agreements = [scale_summaries[e]["summary"]["mean_solve_agreement"] for e in scales]
+    ret_stds = [scale_summaries[e]["summary"]["mean_return_std"] for e in scales]
+    base_rets = [scale_summaries[e]["summary"]["mean_base_return"] for e in scales]
+    pert_rets = [scale_summaries[e]["summary"]["mean_pert_return"] for e in scales]
+    solv_stds = [scale_summaries[e]["summary"]["mean_solvability_std"] for e in scales]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+    # Top-left: Jaccard vs eps
+    ax = axes[0, 0]
+    ax.plot(scales, jaccards, 'o-', color='steelblue', linewidth=2, markersize=8)
+    ax.set_xlabel("Perturbation Scale (eps)", fontsize=11)
+    ax.set_ylabel("Mean Wall Jaccard", fontsize=11)
+    ax.set_title("Structural Similarity vs Scale", fontsize=11, fontweight='bold')
+    ax.axhline(0.5, color='red', linestyle='--', alpha=0.3, label='50% threshold')
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    ax.set_ylim(0, 1.05)
+
+    # Top-right: Solve agreement vs eps
+    ax = axes[0, 1]
+    ax.plot(scales, agreements, 'o-', color='forestgreen', linewidth=2, markersize=8)
+    ax.set_xlabel("Perturbation Scale (eps)", fontsize=11)
+    ax.set_ylabel("Solve Agreement", fontsize=11)
+    ax.set_title("Solvability Consistency vs Scale", fontsize=11, fontweight='bold')
+    ax.axhline(0.7, color='red', linestyle='--', alpha=0.3, label='70% threshold')
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    ax.set_ylim(0, 1.05)
+
+    # Bottom-left: Return std vs eps
+    ax = axes[1, 0]
+    ax.plot(scales, ret_stds, 'o-', color='darkorange', linewidth=2, markersize=8)
+    ax.set_xlabel("Perturbation Scale (eps)", fontsize=11)
+    ax.set_ylabel("Mean Return Std (across perts)", fontsize=11)
+    ax.set_title("Regret Signal Noise vs Scale", fontsize=11, fontweight='bold')
+    ax.grid(alpha=0.3)
+
+    # Bottom-right: Base vs pert mean return
+    ax = axes[1, 1]
+    ax.plot(scales, base_rets, 's--', color='gray', linewidth=1.5, markersize=6, label='Base return')
+    ax.plot(scales, pert_rets, 'o-', color='crimson', linewidth=2, markersize=8, label='Pert return')
+    ax.fill_between(scales,
+                     [p - s for p, s in zip(pert_rets, ret_stds)],
+                     [p + s for p, s in zip(pert_rets, ret_stds)],
+                     color='crimson', alpha=0.15)
+    ax.set_xlabel("Perturbation Scale (eps)", fontsize=11)
+    ax.set_ylabel("Mean Return", fontsize=11)
+    ax.set_title("Base vs Perturbed Return", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+
+    fig.suptitle(
+        f"Cross-Scale Latent Space Analysis ({n_base} levels, {n_pert} perts, {n_rollouts} rollouts)",
+        fontsize=13, fontweight='bold'
+    )
+    plt.tight_layout()
+    path = os.path.join(plot_dir, "cross_scale.png")
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[Plot] Cross-scale -> {path}")
+
+
 def upload_to_gcs(local_path, gcs_dir):
     """Upload a local file to GCS using gcloud storage cp."""
     fname = os.path.basename(local_path)
@@ -596,11 +624,12 @@ def run_diagnostic(args):
     else:
         raise ValueError("Provide either --buffer_dump_path or --agent_checkpoint_dir")
 
-    # --- Sample base levels ---
+    # --- Sample base levels (shared across all scales) ---
     rng = jax.random.PRNGKey(args.seed)
     n_base = args.num_base_levels
     n_pert = args.num_perturbations
-    eps = args.perturbation_scale
+    n_rollouts = args.num_eval_rollouts
+    scales = [float(s) for s in args.perturbation_scale.split(",")]
 
     rng, rng_sample = jax.random.split(rng)
     indices = np.random.default_rng(args.seed).choice(len(buffer_tokens), n_base, replace=False)
@@ -613,225 +642,203 @@ def run_diagnostic(args):
     base_z = np.array(vae_encode(vae_model, vae_params, base_tokens))  # (n_base, latent_dim)
     print(f"[Encode] z shape: {base_z.shape}, mean norm: {np.linalg.norm(base_z, axis=1).mean():.2f}")
 
-    # --- Generate perturbations ---
+    # --- Pre-generate perturbation DIRECTIONS (shared across scales, only magnitude changes) ---
     rng, rng_pert = jax.random.split(rng)
-    all_results = []
-    all_repaired_tokens = []  # store for plotting
-
+    all_directions = []  # one per base level
     for i in range(n_base):
-        z_base = base_z[i]  # (latent_dim,)
-
-        # Generate random perturbation directions
         rng_pert, rng_dir = jax.random.split(rng_pert)
         directions = jax.random.normal(rng_dir, (n_pert, latent_dim))
         directions = directions / jnp.linalg.norm(directions, axis=1, keepdims=True)
+        all_directions.append(directions)
 
-        # Create perturbed z vectors
-        z_perturbed = z_base[None, :] + eps * directions  # (n_pert, latent_dim)
-
-        # Stack original + perturbations
-        z_all = jnp.concatenate([z_base[None, :], z_perturbed], axis=0)  # (1 + n_pert, latent_dim)
-
-        # Decode all
-        decoded_tokens = np.array(vae_decode(vae_model, vae_params, z_all))  # (1+n_pert, 52)
-
-        # Repair tokens and convert to levels
-        repaired = jax.vmap(repair_tokens)(jnp.array(decoded_tokens))
-        all_repaired_tokens.append(np.array(repaired))  # (1+n_pert, 52)
-        levels = jax.vmap(tokens_to_level)(repaired)
-
-        # Compute L2 distances from original
-        l2_dists = np.linalg.norm(np.array(z_all[1:]) - np.array(z_all[0:1]), axis=1)
-
-        # Compute token similarity (Jaccard on walls)
-        orig_walls = set(np.array(repaired[0][:-2])[np.array(repaired[0][:-2]) > 0].tolist())
-        token_sims = []
-        for j in range(1, len(repaired)):
-            pert_walls = set(np.array(repaired[j][:-2])[np.array(repaired[j][:-2]) > 0].tolist())
-            union = orig_walls | pert_walls
-            jaccard = len(orig_walls & pert_walls) / len(union) if union else 1.0
-            token_sims.append(jaccard)
-
-        # Evaluate agent on all levels with multiple rollouts
-        n_rollouts = args.num_eval_rollouts
-        num_levels_here = 1 + n_pert
-        all_solved_rollouts = np.zeros((n_rollouts, num_levels_here), dtype=bool)
-        all_reward_rollouts = np.zeros((n_rollouts, num_levels_here))
-
-        for r in range(n_rollouts):
-            rng, rng_eval = jax.random.split(rng)
-            cum_rewards_r, solved_r, _ = evaluate_agent_on_levels(
-                env, env_params, agent_params, network, levels, rng_eval,
-                max_steps=env_params.max_steps_in_episode,
-            )
-            all_solved_rollouts[r] = np.array(solved_r)
-            all_reward_rollouts[r] = np.array(cum_rewards_r)
-
-        # Mean solvability and mean return per level across rollouts
-        solvability = all_solved_rollouts.mean(axis=0)  # (1+n_pert,)
-        mean_returns = all_reward_rollouts.mean(axis=0)  # (1+n_pert,)
-
-        base_solvability = float(solvability[0])
-        pert_solvabilities = solvability[1:]
-        base_mean_return = float(mean_returns[0])
-        pert_mean_returns = mean_returns[1:]
-
-        # Solve agreement: does perturbation solvability stay close to original?
-        # Use threshold: if both > 0.5 or both <= 0.5, they agree
-        solve_agreement = ((pert_solvabilities > 0.5) == (base_solvability > 0.5)).astype(float)
-
-        result = {
-            "base_idx": int(indices[i]),
-            "base_buffer_score": float(base_scores[i]),
-            "base_solvability": base_solvability,
-            "base_mean_return": base_mean_return,
-            "pert_solvabilities": pert_solvabilities.tolist(),
-            "pert_mean_returns": pert_mean_returns.tolist(),
-            "pert_l2_dists": l2_dists.tolist(),
-            "pert_wall_jaccard": token_sims,
-            "mean_pert_solvability": float(pert_solvabilities.mean()),
-            "solvability_std": float(pert_solvabilities.std()),
-            "mean_pert_return": float(pert_mean_returns.mean()),
-            "return_std": float(pert_mean_returns.std()),
-            "solve_agreement": float(solve_agreement.mean()),
-        }
-        all_results.append(result)
-
-        print(f"\n--- Base level {i+1}/{n_base} (buffer idx {indices[i]}) ---")
-        print(f"  Buffer score: {base_scores[i]:.3f}")
-        print(f"  Original:  solvability={base_solvability:.0%}  mean_return={base_mean_return:.3f}  ({n_rollouts} rollouts)")
-        print(f"  Perturbed: solvability={pert_solvabilities.mean():.0%} +/- {pert_solvabilities.std():.2f}")
-        print(f"  Perturbed: mean_return={pert_mean_returns.mean():.3f} +/- {pert_mean_returns.std():.3f}")
-        print(f"  Solve agreement:       {solve_agreement.mean():.0%}")
-        print(f"  Wall Jaccard:          {np.mean(token_sims):.3f} +/- {np.std(token_sims):.3f}")
-        print(f"  L2 distances:          {l2_dists.mean():.3f} +/- {l2_dists.std():.3f}")
-
-    # --- Summary ---
-    print("\n" + "=" * 70)
-    print("  SUMMARY")
-    print("=" * 70)
-
-    all_base_solv = [r["base_solvability"] for r in all_results]
-    all_pert_solv = [r["mean_pert_solvability"] for r in all_results]
-    all_solv_stds = [r["solvability_std"] for r in all_results]
-    all_base_ret = [r["base_mean_return"] for r in all_results]
-    all_pert_ret = [r["mean_pert_return"] for r in all_results]
-    all_ret_stds = [r["return_std"] for r in all_results]
-    all_solve_agreements = [r["solve_agreement"] for r in all_results]
-    all_jaccards = [np.mean(r["pert_wall_jaccard"]) for r in all_results]
-
-    n_rollouts = args.num_eval_rollouts
-    print(f"\n  Across {n_base} base levels, {n_pert} perturbations each, {n_rollouts} rollouts (eps={eps}):")
-    print(f"  --- Solvability (coarse regret proxy) ---")
-    print(f"  Mean base solvability:     {np.mean(all_base_solv):.1%}")
-    print(f"  Mean pert solvability:     {np.mean(all_pert_solv):.1%}")
-    print(f"  Mean pert solvability std: {np.mean(all_solv_stds):.3f}")
-    print(f"  Mean solve agreement:      {np.mean(all_solve_agreements):.1%}")
-    print(f"  --- Mean Return (continuous regret proxy) ---")
-    print(f"  Mean base return:          {np.mean(all_base_ret):.3f}")
-    print(f"  Mean pert return:          {np.mean(all_pert_ret):.3f}")
-    print(f"  Mean pert return std:      {np.mean(all_ret_stds):.3f}")
-    print(f"  --- Structure ---")
-    print(f"  Mean wall Jaccard:         {np.mean(all_jaccards):.3f}")
-    print()
-
-    # Interpretation — solvability-focused
-    if np.mean(all_solve_agreements) > 0.7:
-        print("  -> HIGH solve agreement ({:.0%})".format(np.mean(all_solve_agreements)))
-        print("     Perturbations preserve solvability status.")
-        print("     Latent neighbors have consistent difficulty for the agent.")
-        print("     ES gradient estimation on solve rate should be meaningful.")
-    elif np.mean(all_solve_agreements) > 0.4:
-        print("  -> MODERATE solve agreement ({:.0%})".format(np.mean(all_solve_agreements)))
-        print("     Perturbations partially preserve solvability.")
-        print("     ES gradients may be noisy but contain some signal.")
-    else:
-        print("  -> LOW solve agreement ({:.0%})".format(np.mean(all_solve_agreements)))
-        print("     Perturbations flip solvability frequently.")
-        print("     Latent neighbors have unpredictable difficulty.")
-        print("     ES gradient steps on solve rate are unreliable.")
-
-    if np.mean(all_jaccards) > 0.5:
-        print("  -> HIGH wall overlap ({:.3f})".format(np.mean(all_jaccards)))
-        print("     VAE preserves maze structure under perturbation.")
-    else:
-        print("  -> LOW wall overlap ({:.3f})".format(np.mean(all_jaccards)))
-        print("     VAE produces structurally different mazes under perturbation.")
-
-    # --- Save readable summary ---
+    # --- Run at each scale ---
     plot_dir = os.path.dirname(args.output_path) or "."
     os.makedirs(plot_dir, exist_ok=True)
+    multi_scale = len(scales) > 1
+    scale_summaries = {}  # eps -> summary dict
+
+    for eps in scales:
+        print(f"\n{'='*70}")
+        print(f"  SCALE eps={eps}")
+        print(f"{'='*70}")
+
+        all_results = []
+        all_repaired_tokens = []
+        rng_scale = jax.random.PRNGKey(args.seed + int(eps * 1000))
+
+        for i in range(n_base):
+            z_base = base_z[i]
+            directions = all_directions[i]
+
+            z_perturbed = z_base[None, :] + eps * directions
+            z_all = jnp.concatenate([z_base[None, :], z_perturbed], axis=0)
+
+            decoded_tokens = np.array(vae_decode(vae_model, vae_params, z_all))
+            repaired = jax.vmap(repair_tokens)(jnp.array(decoded_tokens))
+            all_repaired_tokens.append(np.array(repaired))
+            levels = jax.vmap(tokens_to_level)(repaired)
+
+            l2_dists = np.linalg.norm(np.array(z_all[1:]) - np.array(z_all[0:1]), axis=1)
+
+            orig_walls = set(np.array(repaired[0][:-2])[np.array(repaired[0][:-2]) > 0].tolist())
+            token_sims = []
+            for j in range(1, len(repaired)):
+                pert_walls = set(np.array(repaired[j][:-2])[np.array(repaired[j][:-2]) > 0].tolist())
+                union = orig_walls | pert_walls
+                jaccard = len(orig_walls & pert_walls) / len(union) if union else 1.0
+                token_sims.append(jaccard)
+
+            num_levels_here = 1 + n_pert
+            all_solved_rollouts = np.zeros((n_rollouts, num_levels_here), dtype=bool)
+            all_reward_rollouts = np.zeros((n_rollouts, num_levels_here))
+
+            for r in range(n_rollouts):
+                rng_scale, rng_eval = jax.random.split(rng_scale)
+                cum_rewards_r, solved_r, _ = evaluate_agent_on_levels(
+                    env, env_params, agent_params, network, levels, rng_eval,
+                    max_steps=env_params.max_steps_in_episode,
+                )
+                all_solved_rollouts[r] = np.array(solved_r)
+                all_reward_rollouts[r] = np.array(cum_rewards_r)
+
+            solvability = all_solved_rollouts.mean(axis=0)
+            mean_returns = all_reward_rollouts.mean(axis=0)
+
+            base_solvability = float(solvability[0])
+            pert_solvabilities = solvability[1:]
+            base_mean_return = float(mean_returns[0])
+            pert_mean_returns = mean_returns[1:]
+
+            solve_agreement = ((pert_solvabilities > 0.5) == (base_solvability > 0.5)).astype(float)
+
+            result = {
+                "base_idx": int(indices[i]),
+                "base_buffer_score": float(base_scores[i]),
+                "base_solvability": base_solvability,
+                "base_mean_return": base_mean_return,
+                "pert_solvabilities": pert_solvabilities.tolist(),
+                "pert_mean_returns": pert_mean_returns.tolist(),
+                "pert_l2_dists": l2_dists.tolist(),
+                "pert_wall_jaccard": token_sims,
+                "mean_pert_solvability": float(pert_solvabilities.mean()),
+                "solvability_std": float(pert_solvabilities.std()),
+                "mean_pert_return": float(pert_mean_returns.mean()),
+                "return_std": float(pert_mean_returns.std()),
+                "solve_agreement": float(solve_agreement.mean()),
+            }
+            all_results.append(result)
+
+            print(f"\n  Level {i+1}/{n_base} (buf {indices[i]}): "
+                  f"solv={base_solvability:.0%}->{pert_solvabilities.mean():.0%}  "
+                  f"ret={base_mean_return:.3f}->{pert_mean_returns.mean():.3f}  "
+                  f"J={np.mean(token_sims):.3f}  agree={solve_agreement.mean():.0%}")
+
+        # --- Per-scale summary ---
+        all_base_solv = [r["base_solvability"] for r in all_results]
+        all_pert_solv = [r["mean_pert_solvability"] for r in all_results]
+        all_solv_stds = [r["solvability_std"] for r in all_results]
+        all_base_ret = [r["base_mean_return"] for r in all_results]
+        all_pert_ret = [r["mean_pert_return"] for r in all_results]
+        all_ret_stds = [r["return_std"] for r in all_results]
+        all_solve_agreements = [r["solve_agreement"] for r in all_results]
+        all_jaccards = [np.mean(r["pert_wall_jaccard"]) for r in all_results]
+
+        summary = {
+            "eps": eps,
+            "num_eval_rollouts": n_rollouts,
+            "mean_base_solvability": float(np.mean(all_base_solv)),
+            "mean_pert_solvability": float(np.mean(all_pert_solv)),
+            "mean_solvability_std": float(np.mean(all_solv_stds)),
+            "mean_solve_agreement": float(np.mean(all_solve_agreements)),
+            "mean_base_return": float(np.mean(all_base_ret)),
+            "mean_pert_return": float(np.mean(all_pert_ret)),
+            "mean_return_std": float(np.mean(all_ret_stds)),
+            "mean_wall_jaccard": float(np.mean(all_jaccards)),
+        }
+        scale_summaries[eps] = {"summary": summary, "per_level": all_results}
+
+        print(f"\n  eps={eps}: Jaccard={np.mean(all_jaccards):.3f}  "
+              f"agree={np.mean(all_solve_agreements):.0%}  "
+              f"ret_std={np.mean(all_ret_stds):.3f}")
+
+        # Per-scale plots (only for single-scale or save each)
+        eps_dir = os.path.join(plot_dir, f"eps_{eps}") if multi_scale else plot_dir
+        os.makedirs(eps_dir, exist_ok=True)
+        plot_maze_panels(all_results, all_repaired_tokens, eps_dir, n_base, n_pert, eps, args)
+        plot_regret_scatter(all_results, eps_dir, n_base, eps)
+        plot_jaccard_vs_regret(all_results, eps_dir, eps)
+
+    # --- Cross-scale comparison plots (if multi-scale) ---
+    if multi_scale:
+        plot_cross_scale(scale_summaries, plot_dir, n_base, n_pert, n_rollouts)
+
+    # --- Save readable summary ---
     summary_path = os.path.join(plot_dir, "summary.txt")
     with open(summary_path, "w") as f:
         f.write("LATENT PERTURBATION DIAGNOSTIC - SUMMARY\n")
         f.write("=" * 55 + "\n\n")
-        f.write(f"Config: {n_base} base levels, {n_pert} perturbations, {n_rollouts} rollouts, eps={eps}\n")
+        f.write(f"Config: {n_base} base levels, {n_pert} perturbations, {n_rollouts} rollouts\n")
+        f.write(f"Scales: {scales}\n")
         f.write(f"VAE:    {args.vae_checkpoint_path}\n")
         f.write(f"Agent:  {args.agent_checkpoint_dir or args.agent_params_pkl}\n\n")
-        f.write("--- Solvability (coarse regret proxy) ---\n")
-        f.write(f"  Mean base solvability:     {np.mean(all_base_solv):.1%}\n")
-        f.write(f"  Mean pert solvability:     {np.mean(all_pert_solv):.1%}\n")
-        f.write(f"  Mean pert solvability std: {np.mean(all_solv_stds):.3f}\n")
-        f.write(f"  Mean solve agreement:      {np.mean(all_solve_agreements):.1%}\n\n")
-        f.write("--- Mean Return (continuous regret proxy) ---\n")
-        f.write(f"  Mean base return:          {np.mean(all_base_ret):.3f}\n")
-        f.write(f"  Mean pert return:          {np.mean(all_pert_ret):.3f}\n")
-        f.write(f"  Mean pert return std:      {np.mean(all_ret_stds):.3f}\n\n")
-        f.write("--- Structure ---\n")
-        f.write(f"  Mean wall Jaccard:         {np.mean(all_jaccards):.3f}\n\n")
-        f.write("--- Per Level ---\n")
-        for i, r in enumerate(all_results):
-            f.write(f"\n  Level {i+1} (buffer idx {r['base_idx']}, score {r['base_buffer_score']:.3f}):\n")
-            f.write(f"    Base:  solv={r['base_solvability']:.0%}  return={r['base_mean_return']:.3f}\n")
-            f.write(f"    Perts: solv={r['mean_pert_solvability']:.0%}+/-{r['solvability_std']:.2f}  ")
-            f.write(f"return={r['mean_pert_return']:.3f}+/-{r['return_std']:.3f}\n")
-            f.write(f"    Jaccard={np.mean(r['pert_wall_jaccard']):.3f}  agree={r['solve_agreement']:.0%}\n")
+        for eps in scales:
+            s = scale_summaries[eps]["summary"]
+            f.write(f"--- eps={eps} ---\n")
+            f.write(f"  Jaccard:        {s['mean_wall_jaccard']:.3f}\n")
+            f.write(f"  Solve agree:    {s['mean_solve_agreement']:.1%}\n")
+            f.write(f"  Base return:    {s['mean_base_return']:.3f}\n")
+            f.write(f"  Pert return:    {s['mean_pert_return']:.3f} +/- {s['mean_return_std']:.3f}\n")
+            f.write(f"  Base solv:      {s['mean_base_solvability']:.1%}\n")
+            f.write(f"  Pert solv:      {s['mean_pert_solvability']:.1%} +/- {s['mean_solvability_std']:.3f}\n\n")
+        if multi_scale:
+            f.write("--- Per Level (each scale) ---\n")
+            for eps in scales:
+                f.write(f"\n  eps={eps}:\n")
+                for i, r in enumerate(scale_summaries[eps]["per_level"]):
+                    f.write(f"    L{i+1}(buf{r['base_idx']}): "
+                            f"solv={r['base_solvability']:.0%}->{r['mean_pert_solvability']:.0%}  "
+                            f"ret={r['base_mean_return']:.3f}->{r['mean_pert_return']:.3f}  "
+                            f"J={np.mean(r['pert_wall_jaccard']):.3f}\n")
     print(f"[Save] Summary -> {summary_path}")
 
-    # --- Plots ---
-    plot_maze_panels(all_results, all_repaired_tokens, plot_dir, n_base, n_pert, eps, args)
-    plot_regret_scatter(all_results, plot_dir, n_base, eps)
-    plot_jaccard_vs_regret(all_results, plot_dir, eps)
-
-    # Save results
+    # Save JSON results
     output_path = args.output_path
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w") as f:
         json.dump({
             "config": {
                 "num_base_levels": n_base,
                 "num_perturbations": n_pert,
-                "perturbation_scale": eps,
+                "perturbation_scales": scales,
                 "seed": args.seed,
+                "num_eval_rollouts": n_rollouts,
                 "vae_checkpoint": args.vae_checkpoint_path,
                 "agent_checkpoint": args.agent_checkpoint_dir or args.agent_params_pkl,
             },
-            "summary": {
-                "num_eval_rollouts": n_rollouts,
-                "mean_base_solvability": float(np.mean(all_base_solv)),
-                "mean_pert_solvability": float(np.mean(all_pert_solv)),
-                "mean_solvability_std": float(np.mean(all_solv_stds)),
-                "mean_solve_agreement": float(np.mean(all_solve_agreements)),
-                "mean_base_return": float(np.mean(all_base_ret)),
-                "mean_pert_return": float(np.mean(all_pert_ret)),
-                "mean_return_std": float(np.mean(all_ret_stds)),
-                "mean_wall_jaccard": float(np.mean(all_jaccards)),
-            },
-            "per_level": all_results,
+            "scales": {str(eps): scale_summaries[eps] for eps in scales},
         }, f, indent=2)
-    print(f"\n[Save] Results -> {output_path}")
+    print(f"[Save] Results -> {output_path}")
 
     # --- Upload to GCS ---
     if args.gcs_output_dir:
         gcs_dir = args.gcs_output_dir
         upload_to_gcs(output_path, gcs_dir)
-        for fname in ["summary.txt", "perturbation_mazes.png", "regret_scatter.png", "jaccard_vs_regret.png"]:
+        upload_to_gcs(summary_path, gcs_dir)
+        # Upload cross-scale plot
+        for fname in ["cross_scale.png"]:
             local = os.path.join(plot_dir, fname)
             if os.path.exists(local):
                 upload_to_gcs(local, gcs_dir)
+        # Upload per-scale plots
+        for eps in scales:
+            eps_dir = os.path.join(plot_dir, f"eps_{eps}") if multi_scale else plot_dir
+            for fname in ["perturbation_mazes.png", "regret_scatter.png", "jaccard_vs_regret.png"]:
+                local = os.path.join(eps_dir, fname)
+                if os.path.exists(local):
+                    gcs_sub = f"{gcs_dir.rstrip('/')}/eps_{eps}" if multi_scale else gcs_dir
+                    upload_to_gcs(local, gcs_sub)
         print(f"\n[GCS] All files uploaded to {gcs_dir}")
 
-    return all_results
+    return scale_summaries
 
 
 def parse_args():
@@ -846,8 +853,8 @@ def parse_args():
                    help="Path to VAE checkpoint .pkl")
     p.add_argument("--vae_config_path", type=str, default="vae_train_config.yml",
                    help="Path to VAE config YAML")
-    p.add_argument("--perturbation_scale", type=float, default=0.5,
-                   help="Epsilon for latent perturbation (L2 magnitude)")
+    p.add_argument("--perturbation_scale", type=str, default="0.5",
+                   help="Epsilon for latent perturbation. Comma-separated for multi-scale (e.g. 0.1,0.25,0.5,1.0,2.0)")
     p.add_argument("--num_base_levels", type=int, default=10,
                    help="Number of base levels to sample from buffer")
     p.add_argument("--num_perturbations", type=int, default=10,

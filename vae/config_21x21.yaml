@@ -1,0 +1,8 @@
+# VAE config for 21x21 mazes
+# SEQ_LEN = MAX_WALLS + 2 = 152 (150 wall slots + goal + agent)
+vocab_size: 442
+embed_dim: 300
+latent_dim: 64
+seq_len: 152
+grid_size: 21
+max_walls: 150
