@@ -1354,6 +1354,34 @@ if __name__=="__main__":
     group.add_argument("--diversity_sample_size", type=int, default=20,
                        help="Number of buffer levels to subsample for pairwise diversity metrics")
 
+    # === LLM INJECTION CONFIG ===
+    llm_group = parser.add_argument_group('LLM Injection')
+    llm_group.add_argument("--use_llm", action=argparse.BooleanOptionalAction, default=False,
+                           help="Enable LLM-based maze injection into PLR buffer")
+    llm_group.add_argument("--llm_provider", type=str, default="",
+                           help="LLM provider (required when --use_llm): 'openrouter', 'openai', 'ollama'")
+    llm_group.add_argument("--llm_model", type=str, default="",
+                           help="Model name for the LLM provider")
+    llm_group.add_argument("--llm_config", type=str, default="llm/config.yaml",
+                           help="Path to LLM config YAML file")
+    llm_group.add_argument("--llm_inject_interval", type=int, default=3000,
+                           help="Number of eval steps between LLM injection events")
+    llm_group.add_argument("--llm_warmup_steps", type=int, default=5000,
+                           help="No LLM injection before this many training steps")
+    llm_group.add_argument("--llm_batch_size", type=int, default=25,
+                           help="Number of raw mazes requested from LLM per injection event")
+    llm_group.add_argument("--llm_n_references", type=int, default=5,
+                           help="Number of buffer mazes shown to LLM as reference context")
+    llm_group.add_argument("--llm_ref_strategy", type=str, default="hardest",
+                           choices=["hardest", "random", "diverse"],
+                           help="Strategy for selecting reference mazes from PLR buffer")
+    llm_group.add_argument("--llm_amplification", action=argparse.BooleanOptionalAction, default=True,
+                           help="Enable mutation amplification of LLM seed mazes")
+    llm_group.add_argument("--llm_mutations_per_seed", type=int, default=30,
+                           help="Number of wall-flip mutations per LLM seed maze")
+    llm_group.add_argument("--llm_max_inject_per_event", type=int, default=200,
+                           help="Maximum number of levels to inject into buffer per injection event")
+
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])
