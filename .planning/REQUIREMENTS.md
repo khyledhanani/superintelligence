@@ -9,11 +9,11 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Integration Core
 
-- [ ] **INTG-01**: Training loop injects LLM-generated mazes at configurable interval (`--llm_inject_interval N` steps)
-- [ ] **INTG-02**: Existing `MazeGenerator` validation is extended with border wall check and BFS path length >5 (text→Level via `Level.from_str()` and `_bfs_solvable()` already exist)
-- [ ] **INTG-03**: Accepted LLM levels are inserted into the PLR buffer via `insert_batch()` with regret-derived scores
+- [x] **INTG-01**: Training loop injects LLM-generated mazes at configurable interval (`--llm_inject_interval N` steps)
+- [x] **INTG-02**: Existing `MazeGenerator` validation is extended with border wall check and BFS path length >5 (text→Level via `Level.from_str()` and `_bfs_solvable()` already exist)
+- [x] **INTG-03**: Accepted LLM levels are inserted into the PLR buffer via `insert_batch()` with regret-derived scores
 - [x] **INTG-04**: CLI flags `--use_llm`, `--llm_batch_size`, `--llm_config` control injection behavior
-- [ ] **INTG-05**: `LLMInjector` orchestration class in `llm/injector.py` encapsulates the full injection pipeline
+- [x] **INTG-05**: `LLMInjector` orchestration class in `llm/injector.py` encapsulates the full injection pipeline
 - [x] **INTG-06**: Existing `test_generator.py` buffer-to-prompt functions (`select_references`, `build_references_with_metrics`) are adapted to work with live `train_state.sampler` instead of `.npz` dumps
 
 ### Decision Gate
@@ -62,11 +62,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INTG-01 | Phase 1 | Pending |
-| INTG-02 | Phase 1 | Pending |
-| INTG-03 | Phase 1 | Pending |
+| INTG-01 | Phase 1 | Complete |
+| INTG-02 | Phase 1 | Complete |
+| INTG-03 | Phase 1 | Complete |
 | INTG-04 | Phase 1 | Complete (01-01) |
-| INTG-05 | Phase 1 | Pending |
+| INTG-05 | Phase 1 | Complete |
 | INTG-06 | Phase 1 | Complete (01-01) |
 | GATE-01 | Phase 2 | Pending |
 | GATE-02 | Phase 2 | Pending |

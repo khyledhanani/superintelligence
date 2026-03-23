@@ -10,27 +10,27 @@ See: .planning/PROJECT.md (updated 2026-03-23)
 ## Current Position
 
 Phase: 1 of 4 (Integration Scaffolding)
-Plan: 1 of 2 in current phase
-Status: In progress
-Last activity: 2026-03-23 — Completed 01-01: LLMInjectionConfig and BufferStatsExtractor
+Plan: 2 of 2 in current phase (COMPLETE)
+Status: Phase complete — all plans executed
+Last activity: 2026-03-23 — Completed 01-02: LLMInjectionManager and Training Loop Integration
 
-Progress: [█░░░░░░░░░] 10%
+Progress: [██░░░░░░░░] 20%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
-- Average duration: 2 min
-- Total execution time: 0.03 hours
+- Total plans completed: 2
+- Average duration: 3.5 min
+- Total execution time: 0.12 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01-checkpoint | 1 | 2 min | 2 min |
+| 01-checkpoint | 2 | 7 min | 3.5 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (2 min)
+- Last 5 plans: 01-01 (2 min), 01-02 (5 min)
 - Trend: -
 
 *Updated after each plan completion*
@@ -49,6 +49,9 @@ Recent decisions affecting current work:
 - [01-01]: score_seeds_with_rollout defaults False in Phase 1 — AgentEvaluator rollout scoring deferred to Phase 2
 - [01-01]: n_raw field maps to --llm_batch_size CLI flag per plan spec; naming reflects what user controls
 - [01-01]: BufferStatsExtractor is self-contained, does not import from test_generator.py — replaces file-based flow
+- [01-02]: validate_llm_level() border wall check is hard reject — LLM mazes without full borders are structurally invalid
+- [01-02]: Mutation amplification uses num_edits=3 (not max_num_edits=100) — creates nearby variants rather than completely random mutations
+- [01-02]: Plan test maze was unsolvable (goal trapped in disconnected compartment) — used actual Labyrinth prefab for verification instead
 
 ### Pending Todos
 
@@ -62,5 +65,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-23
-Stopped at: Completed 01-01-PLAN.md — LLMInjectionConfig and BufferStatsExtractor. Next: execute 01-02-PLAN.md
+Stopped at: Completed 01-02-PLAN.md — LLMInjectionManager and Training Loop Integration. Phase 1 complete.
 Resume file: None
