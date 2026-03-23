@@ -19,9 +19,9 @@ Requirements for initial release. Each maps to roadmap phases.
 ### Decision Gate
 
 - [ ] **GATE-01**: Existing `DecisionGate.evaluate_candidate()` (already fully implemented) is wired into the `LLMInjector` pipeline to filter every LLM maze before buffer insertion
-- [ ] **GATE-02**: Existing `AgentEvaluator` (loads checkpoint once) is extended with a refresh mechanism to re-load current policy params at each injection event
+- [x] **GATE-02**: Existing `AgentEvaluator` (loads checkpoint once) is extended with a refresh mechanism to re-load current policy params at each injection event
 - [ ] **GATE-03**: WandB logs `llm/injected_count`, `llm/acceptance_rate`, `llm/diversity_score_mean`, `llm/retained_rate` at each injection step
-- [ ] **GATE-04**: Existing `PromptBuilder.build_generation_prompt()` (already accepts `global_metrics` and `references` with `path_overlay`) is fed live buffer entropy stats computed from `train_state.sampler`
+- [x] **GATE-04**: Existing `PromptBuilder.build_generation_prompt()` (already accepts `global_metrics` and `references` with `path_overlay`) is fed live buffer entropy stats computed from `train_state.sampler`
 
 ### Experiments
 
@@ -69,9 +69,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INTG-05 | Phase 1 | Complete |
 | INTG-06 | Phase 1 | Complete (01-01) |
 | GATE-01 | Phase 2 | Pending |
-| GATE-02 | Phase 2 | Pending |
+| GATE-02 | Phase 2 | Complete |
 | GATE-03 | Phase 2 | Pending |
-| GATE-04 | Phase 2 | Pending |
+| GATE-04 | Phase 2 | Complete |
 | EXPT-01 | Phase 4 | Pending |
 | EXPT-02 | Phase 3 | Pending |
 | EXPT-03 | Phase 3 | Pending |

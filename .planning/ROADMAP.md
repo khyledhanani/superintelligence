@@ -85,6 +85,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Integration Scaffolding | 2/2 | Complete   | 2026-03-23 |
-| 2. Decision Gate and Tuning | 0/2 | Not started | - |
+| 2. Decision Gate and Tuning | 1/2 | In Progress|  |
 | 3. Reproducibility Infrastructure | 0/? | Not started | - |
 | 4. Comparison Experiments | 0/? | Not started | - |

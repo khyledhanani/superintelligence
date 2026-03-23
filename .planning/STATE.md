@@ -5,32 +5,33 @@
 See: .planning/PROJECT.md (updated 2026-03-23)
 
 **Core value:** LLM-generated mazes must measurably improve agent generalization (solve rate on held-out benchmarks) compared to ACCEL-only and CMA-ES-only baselines.
-**Current focus:** Phase 1 — Integration Scaffolding
+**Current focus:** Phase 2 — Grid Adapter
 
 ## Current Position
 
-Phase: 1 of 4 (Integration Scaffolding)
-Plan: 2 of 2 in current phase (COMPLETE)
-Status: Phase complete — all plans executed
-Last activity: 2026-03-23 — Completed 01-02: LLMInjectionManager and Training Loop Integration
+Phase: 2 of 4 (Grid Adapter)
+Plan: 1 of 3 in current phase (complete)
+Status: In progress — Plan 02-01 complete, proceeding to 02-02
+Last activity: 2026-03-23 — Completed 02-01: AgentEvaluator refactor, gate config, BufferStats extension
 
-Progress: [██░░░░░░░░] 20%
+Progress: [███░░░░░░░] 30%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
-- Average duration: 3.5 min
-- Total execution time: 0.12 hours
+- Total plans completed: 3
+- Average duration: 3.3 min
+- Total execution time: 0.17 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-checkpoint | 2 | 7 min | 3.5 min |
+| 02-grid-adapter | 1 | 3 min | 3 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (2 min), 01-02 (5 min)
+- Last 5 plans: 01-01 (2 min), 01-02 (5 min), 02-01 (3 min)
 - Trend: -
 
 *Updated after each plan completion*
@@ -52,6 +53,9 @@ Recent decisions affecting current work:
 - [01-02]: validate_llm_level() border wall check is hard reject — LLM mazes without full borders are structurally invalid
 - [01-02]: Mutation amplification uses num_edits=3 (not max_num_edits=100) — creates nearby variants rather than completely random mutations
 - [01-02]: Plan test maze was unsolvable (goal trapped in disconnected compartment) — used actual Labyrinth prefab for verification instead
+- [02-01]: AgentEvaluator uses None-sentinel for JIT invalidation — _rollout_fn=None forces retrace with fresh params; JAX re-uses trace by shape so cost is minimal
+- [02-01]: from_checkpoint() defers cross_evaluate import to call site — avoids loading checkpoint infra on every llm.agent_evaluator import
+- [02-01]: Gate defaults encode CONTEXT.md locked decisions: gate_enabled=True, difficulty_threshold=0.6, min_diversity=0.02, diversity_metric=td_error_emd, n_rollouts_gate=100
 
 ### Pending Todos
 
@@ -59,11 +63,11 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Phase 2 prep]: Gate threshold calibration needed — `DiversityThresholds(difficulty_threshold=0.3, min_diversity=0.04)` defaults were not tuned for live training; target acceptance rate 30-70%
+- [Phase 2 prep — RESOLVED in 02-01]: Gate threshold calibration needed — locked to difficulty_threshold=0.6, min_diversity=0.02 per CONTEXT.md decisions
 - [Phase 4 prep]: Confirm whether existing 50k `accel-baseline` runs (JAXUED_50K) are sufficient as control condition or whether fresh control runs are needed for identical experimental conditions
 
 ## Session Continuity
 
 Last session: 2026-03-23
-Stopped at: Completed 01-02-PLAN.md — LLMInjectionManager and Training Loop Integration. Phase 1 complete.
+Stopped at: Completed 02-01-PLAN.md — AgentEvaluator refactor, gate config, BufferStats extension. Phase 2 in progress.
 Resume file: None
