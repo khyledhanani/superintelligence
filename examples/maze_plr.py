@@ -35,6 +35,9 @@ from vae_model import CluttrVAE
 from vae_level_utils import decode_latent_to_levels, level_to_tokens
 from cmaes_manager import CMAESManager
 
+from llm.injection_config import LLMInjectionConfig
+from llm.injector import LLMInjectionManager
+
 class UpdateState(IntEnum):
     DR = 0
     REPLAY = 1
@@ -457,6 +460,8 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("PLR")
     if config.get("use_cmaes"):
         tags.append("CMA-ES")
+    if config.get("use_llm"):
+        tags.append("llm")
     run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
     config = wandb.config
     
@@ -1044,6 +1049,18 @@ def main(config=None, project="JAXUED_TEST"):
             _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens{tag}.npy")
             _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump{tag}.npz")
 
+    # LLM injection setup
+    llm_config = LLMInjectionConfig.from_config_dict(config)
+    llm_injector = None
+    if llm_config.enabled:
+        llm_injector = LLMInjectionManager(
+            config=llm_config,
+            level_sampler=level_sampler,
+            eval_freq=config["eval_freq"],
+        )
+        print(f"[LLM] Injection enabled: interval={llm_config.injection_interval}, "
+              f"n_raw={llm_config.n_raw}, warmup={llm_config.warmup_steps}")
+
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
@@ -1053,6 +1070,11 @@ def main(config=None, project="JAXUED_TEST"):
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
+
+        # LLM injection hook
+        if llm_injector is not None:
+            runner_state = llm_injector.maybe_inject(runner_state, eval_step)
+
         if config["checkpoint_save_interval"] > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
