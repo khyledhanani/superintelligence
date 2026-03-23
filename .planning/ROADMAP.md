@@ -13,7 +13,7 @@ This roadmap bridges two complete systems: the existing JAX/Flax ACCEL/PLR train
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Integration Scaffolding** - LLMInjector pipeline with format validation, buffer insertion, and WandB logging — gate disabled, injection unconditional (completed 2026-03-23)
-- [ ] **Phase 2: Decision Gate and Tuning** - Wire live AgentEvaluator + DecisionGate, refresh checkpoint per injection, tune interval/batch-size hyperparameters empirically
+- [x] **Phase 2: Decision Gate and Tuning** - Wire live AgentEvaluator + DecisionGate, refresh checkpoint per injection, tune interval/batch-size hyperparameters empirically (completed 2026-03-23)
 - [ ] **Phase 3: Reproducibility Infrastructure** - Level caching to disk, wall_map hash logging, comparison launch scripts, analysis tooling
 - [ ] **Phase 4: Comparison Experiments** - Run ACCEL+LLM vs ACCEL-only control at 50k steps, analyse solve rate differences, ablate injection frequency if needed
 
@@ -85,6 +85,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Integration Scaffolding | 2/2 | Complete   | 2026-03-23 |
-| 2. Decision Gate and Tuning | 1/2 | In Progress|  |
+| 2. Decision Gate and Tuning | 2/2 | Complete   | 2026-03-23 |
 | 3. Reproducibility Infrastructure | 0/? | Not started | - |
 | 4. Comparison Experiments | 0/? | Not started | - |
