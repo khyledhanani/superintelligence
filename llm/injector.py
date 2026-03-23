@@ -27,6 +27,7 @@ import numpy as np
 import wandb
 
 from llm.buffer_stats import BufferStatsExtractor
+from llm.decision_gate import DiversityThresholds
 from llm.injection_config import LLMInjectionConfig
 from llm.maze_generator import GenerationConfig, MazeGenerator
 from jaxued.environments.maze.util import make_level_mutator_minimax
@@ -149,10 +150,12 @@ class LLMInjectionManager:
         config: LLMInjectionConfig,
         level_sampler: LevelSampler,
         eval_freq: int,
+        agent_evaluator=None,
     ) -> None:
         self.config = config
         self.level_sampler = level_sampler
         self.eval_freq = eval_freq
+        self.agent_evaluator = agent_evaluator  # AgentEvaluator instance (None if gate disabled)
 
         # Buffer stats extractor for reference maze selection
         self.buffer_stats = BufferStatsExtractor(
@@ -170,6 +173,7 @@ class LLMInjectionManager:
         # Cumulative counters for WandB logging
         self.total_injected = 0
         self.total_attempted = 0
+        self.batch_all_rejected_count = 0  # Number of events where all gate attempts failed
 
     def _build_generation_config(self, config: LLMInjectionConfig) -> GenerationConfig:
         """Build a GenerationConfig from LLMInjectionConfig.
@@ -249,13 +253,21 @@ class LLMInjectionManager:
     def _do_injection(self, runner_state: tuple) -> tuple:
         """Execute the full injection pipeline.
 
+        Two code paths:
+        - Gate enabled (gate_enabled=True, agent_evaluator set):
+            Uses generate_with_feedback() which internally handles rollout,
+            gate evaluation (difficulty+diversity), and feedback retry loop.
+        - Gate disabled (gate_enabled=False or no agent_evaluator):
+            Falls back to Phase 1 behavior: generate() + validate_llm_level().
+
         Steps:
-        1. Extract reference mazes and buffer summary from live sampler
-        2. Generate n_raw candidate mazes via LLM (raises on API failure)
-        3. Validate each candidate (validate_llm_level)
-        4. Mutation amplification for each valid seed (optional)
-        5. Batch-insert all accepted levels into PLR buffer with max-priority score
-        6. Log WandB metrics
+        1. Refresh evaluator params from live train_state (gate path)
+        2. Extract references (+ Level objects for gate path) and buffer summary
+        3. Compute reference trajectories once at start (gate path)
+        4. Generate n_raw candidate mazes via LLM using appropriate code path
+        5. Mutation amplification for each valid seed (optional)
+        6. Batch-insert all accepted levels into PLR buffer with max-priority score
+        7. Log WandB metrics including gate-specific metrics (GATE-03)
 
         Args:
             runner_state: (rng, train_state) tuple
@@ -267,47 +279,115 @@ class LLMInjectionManager:
         rng, train_state = runner_state
         sampler = train_state.sampler
 
+        gate_active = self.config.gate_enabled and self.agent_evaluator is not None
+
         # ---------------------------------------------------------------
-        # Step 1: Extract references and buffer summary
+        # Step 1: Refresh evaluator with live train_state params
         # ---------------------------------------------------------------
-        references = self.buffer_stats.extract_references(sampler)
+        if gate_active:
+            self.agent_evaluator.update_params(train_state.params)
+
+        # ---------------------------------------------------------------
+        # Step 2: Extract references and buffer summary
+        # ---------------------------------------------------------------
+        if gate_active:
+            references, ref_levels = self.buffer_stats.extract_references_with_levels(sampler)
+        else:
+            references = self.buffer_stats.extract_references(sampler)
+            ref_levels = []
+
         buffer_summary = self.buffer_stats.extract_buffer_summary(sampler)
+        global_metrics = BufferStatsExtractor.extract_global_metrics(buffer_summary)
         logger.debug(f"[LLM] Buffer: size={buffer_summary['buffer_size']}, "
                      f"mean_score={buffer_summary['mean_score']:.4f}")
 
         # ---------------------------------------------------------------
-        # Step 2: Generate n_raw candidate mazes via LLM
+        # Step 3: Compute reference trajectories ONCE (gate path)
+        # ---------------------------------------------------------------
+        ref_trajectories = []
+        ref_labels = []
+        if gate_active and ref_levels:
+            for ref, level in zip(references, ref_levels):
+                traj = self.agent_evaluator.evaluate_level_multi_rollout(
+                    level, n_rollouts=self.config.n_rollouts_gate
+                )
+                ref_trajectories.append(traj)
+                ref_labels.append(ref.label)
+
+        # Build DiversityThresholds from config (gate path)
+        thresholds = DiversityThresholds(
+            difficulty_threshold=self.config.difficulty_threshold,
+            min_diversity=self.config.min_diversity,
+            diversity_metric=self.config.diversity_metric,
+        )
+
+        # ---------------------------------------------------------------
+        # Step 4: Generate n_raw candidate mazes via LLM
         # ---------------------------------------------------------------
         seeds_generated = self.config.n_raw
-        raw_results = []
-        for i in range(seeds_generated):
-            result = self.generator.generate(references=references)
-            if not result.success:
-                # API failure or exhausted retries — crash training immediately
-                error_detail = "; ".join(result.errors) if result.errors else "unknown error"
-                raise RuntimeError(
-                    f"[LLM] MazeGenerator.generate() failed on attempt {i+1}/{seeds_generated}: "
-                    f"{error_detail}. Training crashed (no silent skip per design)."
-                )
-            raw_results.append(result)
-
-        # ---------------------------------------------------------------
-        # Step 3: Validate generated mazes
-        # ---------------------------------------------------------------
         valid_levels = []
-        for i, result in enumerate(raw_results):
-            level = result.level
-            is_valid, reason = validate_llm_level(level)
-            if is_valid:
-                valid_levels.append(level)
+        gate_accepted = 0
+        gate_rejected = 0
+        diversity_scores = []
+        difficulty_scores = []
+
+        for i in range(seeds_generated):
+            if gate_active:
+                # Gated path: generate_with_feedback handles rollout+gate+retry internally
+                result = self.generator.generate_with_feedback(
+                    agent_evaluator=self.agent_evaluator,
+                    reference_trajectories=ref_trajectories,
+                    reference_labels=ref_labels,
+                    references=references,
+                    global_metrics=global_metrics,
+                    diversity_thresholds=thresholds,
+                    max_diversity_retries=self.config.max_diversity_retries,
+                    n_rollouts=self.config.n_rollouts_gate,
+                )
+                if not result.success:
+                    error_detail = "; ".join(result.errors) if result.errors else "unknown error"
+                    raise RuntimeError(
+                        f"[LLM] generate_with_feedback() failed on attempt {i+1}/{seeds_generated}: "
+                        f"{error_detail}. Training crashed (no silent skip per design)."
+                    )
+                # Check if gate ultimately accepted (no unresolved diversity issues)
+                gate_metrics = result.gate_metrics or {}
+                was_accepted = not result.diversity_issues
+                if was_accepted:
+                    gate_accepted += 1
+                    valid_levels.append(result.level)
+                    diversity_scores.append(float(gate_metrics.get("mean_diversity", 0.0)))
+                    difficulty_scores.append(float(gate_metrics.get("regret", 0.0)))
+                else:
+                    gate_rejected += 1
+                    logger.info(f"[LLM] Seed {i+1} gate rejected: {result.diversity_issues}")
             else:
-                logger.info(f"[LLM] Seed {i+1} rejected: {reason}")
+                # Ungated path (Phase 1 fallback): generate + validate_llm_level
+                result = self.generator.generate(references=references, global_metrics=global_metrics)
+                if not result.success:
+                    error_detail = "; ".join(result.errors) if result.errors else "unknown error"
+                    raise RuntimeError(
+                        f"[LLM] MazeGenerator.generate() failed on attempt {i+1}/{seeds_generated}: "
+                        f"{error_detail}. Training crashed (no silent skip per design)."
+                    )
+                is_valid, reason = validate_llm_level(result.level)
+                if is_valid:
+                    gate_accepted += 1
+                    valid_levels.append(result.level)
+                else:
+                    gate_rejected += 1
+                    logger.info(f"[LLM] Seed {i+1} rejected: {reason}")
 
         seeds_valid = len(valid_levels)
-        logger.info(f"[LLM] Seeds: {seeds_valid}/{seeds_generated} passed validation")
+        logger.info(f"[LLM] Seeds: {seeds_valid}/{seeds_generated} accepted "
+                    f"(gate_accepted={gate_accepted}, gate_rejected={gate_rejected})")
+
+        # Track batch events where all seeds were rejected
+        if gate_accepted == 0 and seeds_generated > 0:
+            self.batch_all_rejected_count += 1
 
         # ---------------------------------------------------------------
-        # Step 4: Mutation amplification
+        # Step 5: Mutation amplification
         # ---------------------------------------------------------------
         mutations_generated = 0
         mutations_solvable = 0
@@ -417,6 +497,11 @@ class LLMInjectionManager:
             "llm/injection_time_seconds": injection_time,
             "llm/total_injected": self.total_injected,
             "llm/mutation_survival_rate": mutation_survival_rate,
+            # Gate-specific metrics (GATE-03)
+            "llm/diversity_score_mean": float(np.mean(diversity_scores)) if diversity_scores else 0.0,
+            "llm/difficulty_score_mean": float(np.mean(difficulty_scores)) if difficulty_scores else 0.0,
+            "llm/gate_rejection_rate": gate_rejected / seeds_generated if seeds_generated > 0 else 0.0,
+            "llm/batch_all_rejected_count": self.batch_all_rejected_count,
         }
 
         try:

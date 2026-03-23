@@ -1053,13 +1053,25 @@ def main(config=None, project="JAXUED_TEST"):
     llm_config = LLMInjectionConfig.from_config_dict(config)
     llm_injector = None
     if llm_config.enabled:
+        agent_evaluator = None
+        if llm_config.gate_enabled:
+            from llm.agent_evaluator import AgentEvaluator
+            # Construct with live train_state params — will be refreshed each injection event
+            rng_init, train_state_init = runner_state
+            agent_evaluator = AgentEvaluator(
+                apply_fn=train_state_init.apply_fn,
+                params=train_state_init.params,
+                env_params=env_params,
+            )
         llm_injector = LLMInjectionManager(
             config=llm_config,
             level_sampler=level_sampler,
             eval_freq=config["eval_freq"],
+            agent_evaluator=agent_evaluator,
         )
+        gate_status = "gate=ON" if llm_config.gate_enabled else "gate=OFF"
         print(f"[LLM] Injection enabled: interval={llm_config.injection_interval}, "
-              f"n_raw={llm_config.n_raw}, warmup={llm_config.warmup_steps}")
+              f"n_raw={llm_config.n_raw}, warmup={llm_config.warmup_steps}, {gate_status}")
 
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
@@ -1403,6 +1415,19 @@ if __name__=="__main__":
                            help="Number of wall-flip mutations per LLM seed maze")
     llm_group.add_argument("--llm_max_inject_per_event", type=int, default=200,
                            help="Maximum number of levels to inject into buffer per injection event")
+    llm_group.add_argument("--llm_gate", action=argparse.BooleanOptionalAction, default=True,
+                           help="Enable decision gate (difficulty+diversity filter) for LLM mazes")
+    llm_group.add_argument("--llm_difficulty_threshold", type=float, default=0.6,
+                           help="Minimum difficulty score (regret) for gate acceptance")
+    llm_group.add_argument("--llm_min_diversity", type=float, default=0.02,
+                           help="Minimum diversity score (td_error_emd) for gate acceptance")
+    llm_group.add_argument("--llm_diversity_metric", type=str, default="td_error_emd",
+                           choices=["td_error_emd", "experience_divergence", "position_dtw"],
+                           help="Diversity metric for decision gate")
+    llm_group.add_argument("--llm_max_diversity_retries", type=int, default=2,
+                           help="Max LLM retries when gate rejects a maze")
+    llm_group.add_argument("--llm_n_rollouts", type=int, default=100,
+                           help="Number of agent rollouts per candidate for gate evaluation")
 
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
