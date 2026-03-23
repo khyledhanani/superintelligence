@@ -35,11 +35,13 @@ class LLMInjectionConfig:
     reference_maze_strategy: str = "hardest"  # --llm_ref_strategy
     n_reference_mazes: int = 5         # --llm_n_references
 
-    # Diversity gate (Phase 1: disabled; Phase 2: enabled)
-    gate_enabled: bool = False
-    diversity_threshold: float = 0.1
-    min_difficulty: float = 0.1
-    max_difficulty: float = 0.9
+    # Diversity gate (Phase 2: enabled by default; locked decisions from CONTEXT.md)
+    gate_enabled: bool = True               # --llm_gate
+    difficulty_threshold: float = 0.6       # --llm_difficulty_threshold
+    min_diversity: float = 0.02             # --llm_min_diversity
+    diversity_metric: str = "td_error_emd"  # --llm_diversity_metric
+    max_diversity_retries: int = 2          # --llm_max_diversity_retries
+    n_rollouts_gate: int = 100              # --llm_n_rollouts (rollouts per candidate)
 
     # Mutation amplification
     amplification_enabled: bool = True   # --llm_amplification
@@ -85,6 +87,12 @@ class LLMInjectionConfig:
             n_raw=config.get("llm_batch_size", 25),
             reference_maze_strategy=config.get("llm_ref_strategy", "hardest"),
             n_reference_mazes=config.get("llm_n_references", 5),
+            gate_enabled=config.get("llm_gate", True),
+            difficulty_threshold=config.get("llm_difficulty_threshold", 0.6),
+            min_diversity=config.get("llm_min_diversity", 0.02),
+            diversity_metric=config.get("llm_diversity_metric", "td_error_emd"),
+            max_diversity_retries=config.get("llm_max_diversity_retries", 2),
+            n_rollouts_gate=config.get("llm_n_rollouts", 100),
             amplification_enabled=config.get("llm_amplification", True),
             mutations_per_seed=config.get("llm_mutations_per_seed", 30),
             max_inject_per_event=config.get("llm_max_inject_per_event", 200),

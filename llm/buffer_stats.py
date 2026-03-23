@@ -5,7 +5,7 @@ for LLM prompt context. This replaces the .npz-based flow in test_generator.py
 with a live-buffer flow that reads directly from the training state.
 """
 
-from typing import List
+from typing import List, Tuple
 
 import jax
 import numpy as np
@@ -32,12 +32,12 @@ class BufferStatsExtractor:
         self.n_references = n_references
         self.strategy = strategy
 
-    def extract_references(self, sampler: dict) -> List[ReferenceMaze]:
-        """Convert live sampler state to a list of ReferenceMaze objects.
+    def extract_references_with_levels(self, sampler: dict) -> Tuple[List[ReferenceMaze], list]:
+        """Return both ReferenceMaze objects (for prompt) and Level objects (for rollouts).
 
-        Reads the live PLR buffer (JAX pytree) and returns the top-N reference
-        mazes according to the configured selection strategy. All JAX arrays are
-        converted to numpy before Python operations.
+        Combines ReferenceMaze construction and raw Level extraction in a single pass
+        to avoid iterating the sampler pytree twice. Used by Plan 02-02 injector to
+        compute trajectories for the diversity gate.
 
         Args:
             sampler: PLR sampler dict from train_state.sampler, with keys:
@@ -46,15 +46,17 @@ class BufferStatsExtractor:
                 - "size": int number of active levels
 
         Returns:
-            List of ReferenceMaze objects, one per selected reference level.
-            Each has label "Maze A", "Maze B", etc. and a RegretScore metric.
+            (references, levels) tuple where:
+                - references: List[ReferenceMaze] for prompt context
+                - levels: list of raw Level pytree objects (one per selected index)
+                  suitable for passing to AgentEvaluator.evaluate_levels()
         """
         size = int(np.asarray(sampler["size"]))
         if size == 0:
-            return []
+            return [], []
 
         scores = np.asarray(sampler["scores"])[:size]
-        levels = sampler["levels"]
+        levels_pytree = sampler["levels"]
 
         # Select indices by strategy
         n = min(self.n_references, size)
@@ -73,9 +75,10 @@ class BufferStatsExtractor:
             )
 
         references = []
+        level_objects = []
         for i, idx in enumerate(selected_indices):
             # Extract single Level from batched pytree
-            level = jax.tree_util.tree_map(lambda x: x[idx], levels)
+            level = jax.tree_util.tree_map(lambda x: x[idx], levels_pytree)
             ascii_grid = level.to_str()
 
             metric = MetricEntry(
@@ -91,7 +94,30 @@ class BufferStatsExtractor:
                 metrics=[metric],
             )
             references.append(ref)
+            level_objects.append(level)
 
+        return references, level_objects
+
+    def extract_references(self, sampler: dict) -> List[ReferenceMaze]:
+        """Convert live sampler state to a list of ReferenceMaze objects.
+
+        Reads the live PLR buffer (JAX pytree) and returns the top-N reference
+        mazes according to the configured selection strategy. All JAX arrays are
+        converted to numpy before Python operations.
+
+        Delegates to extract_references_with_levels() for DRY selection logic.
+
+        Args:
+            sampler: PLR sampler dict from train_state.sampler, with keys:
+                - "levels": batched Level pytree (capacity-first dimension)
+                - "scores": float[capacity] regret scores
+                - "size": int number of active levels
+
+        Returns:
+            List of ReferenceMaze objects, one per selected reference level.
+            Each has label "Maze A", "Maze B", etc. and a RegretScore metric.
+        """
+        references, _ = self.extract_references_with_levels(sampler)
         return references
 
     def extract_buffer_summary(self, sampler: dict) -> dict:
@@ -128,3 +154,40 @@ class BufferStatsExtractor:
             "min_score": float(np.min(scores)),
             "score_std": float(np.std(scores)),
         }
+
+    @staticmethod
+    def extract_global_metrics(buffer_summary: dict) -> List[MetricEntry]:
+        """Convert buffer summary stats to MetricEntry list for prompt context.
+
+        Converts the dict returned by extract_buffer_summary() into a structured
+        list of MetricEntry objects for use in prompt_builder global_metrics.
+
+        Args:
+            buffer_summary: dict with keys buffer_size, mean_score, max_score,
+                min_score, score_std (as returned by extract_buffer_summary())
+
+        Returns:
+            List of MetricEntry objects representing global training state.
+        """
+        return [
+            MetricEntry(
+                name="Buffer Mean Regret",
+                value=buffer_summary["mean_score"],
+                description="Mean regret score across all active buffer levels",
+                higher_is="more challenging curriculum",
+                metric_key="scalar_regret",
+            ),
+            MetricEntry(
+                name="Buffer Max Regret",
+                value=buffer_summary["max_score"],
+                description="Highest regret score in buffer (hardest level for agent)",
+                higher_is="harder top level",
+                metric_key="scalar_regret",
+            ),
+            MetricEntry(
+                name="Buffer Size",
+                value=buffer_summary["buffer_size"],
+                description="Number of active levels in the PLR replay buffer",
+                metric_key="",
+            ),
+        ]
