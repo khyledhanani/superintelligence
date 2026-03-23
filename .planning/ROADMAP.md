@@ -44,10 +44,11 @@ Plans:
   2. Agent solve rate does not drop more than 0.1 within 500 steps after any injection event — injected OOD mazes do not destabilize training
   3. `AgentEvaluator` uses the current policy checkpoint at each injection event — the timestamp delta between checkpoint mtime and injection time is less than one injection interval
   4. `PromptBuilder.build_generation_prompt()` receives live buffer entropy stats computed from `train_state.sampler`, not hardcoded or stale values
-**Plans**: TBD
+**Plans**: 2 plans in 2 waves
 
 Plans:
-- [ ] 02-01: TBD
+- [ ] 02-01-PLAN.md — AgentEvaluator refactor, gate config fields, BufferStatsExtractor extensions (Wave 1)
+- [ ] 02-02-PLAN.md — Gate wiring into injection pipeline, WandB metrics, CLI flags, smoke test (Wave 2)
 
 ### Phase 3: Reproducibility Infrastructure
 **Goal**: Accepted LLM levels are cached to disk with wall_map hashes logged to WandB, and comparison launch scripts exist for running ACCEL+LLM vs ACCEL-only control with matching seeds and conditions
@@ -84,6 +85,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Integration Scaffolding | 2/2 | Complete   | 2026-03-23 |
-| 2. Decision Gate and Tuning | 0/? | Not started | - |
+| 2. Decision Gate and Tuning | 0/2 | Not started | - |
 | 3. Reproducibility Infrastructure | 0/? | Not started | - |
 | 4. Comparison Experiments | 0/? | Not started | - |
