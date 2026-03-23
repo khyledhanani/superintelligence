@@ -3,6 +3,16 @@
 Provides the trajectory data needed by the decision gate.
 Wraps the checkpoint loading and rollout logic from cross_evaluate.py
 and plot_metrics_demo.py into a reusable class.
+
+Usage (direct params — preferred for live training integration):
+    evaluator = AgentEvaluator(apply_fn=train_state.apply_fn,
+                               params=train_state.params,
+                               env_params=env_params)
+    trajectory = evaluator.evaluate_level(level)
+
+Usage (checkpoint loading — backward compat for test_generator.py):
+    evaluator = AgentEvaluator.from_checkpoint("gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198")
+    trajectory = evaluator.evaluate_level(level)
 """
 
 import os
@@ -29,63 +39,138 @@ from jaxued.environments import Maze
 from jaxued.environments.maze import Level
 from jaxued.wrappers import AutoReplayWrapper
 from maze_plr import ActorCritic
-from cross_evaluate import load_agent
 
 logger = logging.getLogger(__name__)
 
 
 class AgentEvaluator:
-    """Loads a trained agent checkpoint and evaluates it on maze levels.
+    """Evaluates a trained agent on maze levels.
 
-    Usage:
-        evaluator = AgentEvaluator("gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198")
+    Accepts live policy params directly (no file I/O). Call update_params()
+    at each injection event to refresh the policy weights and invalidate the
+    cached JIT rollout function.
+
+    Usage (direct params — preferred for live training integration):
+        evaluator = AgentEvaluator(apply_fn=train_state.apply_fn,
+                                   params=train_state.params,
+                                   env_params=env_params)
+        evaluator.update_params(new_params)  # call at each injection event
         trajectory = evaluator.evaluate_level(level)
-        trajectories = evaluator.evaluate_levels([level1, level2, ...])
+
+    Usage (checkpoint loading — backward compat for test_generator.py):
+        evaluator = AgentEvaluator.from_checkpoint("path/to/checkpoint")
     """
 
     def __init__(
         self,
-        checkpoint_dir: str,
-        checkpoint_step: int = -1,
+        apply_fn,
+        params,
+        env_params,
         num_steps: int = 250,
         seed: int = 42,
     ):
-        """Load agent from checkpoint.
+        """Construct AgentEvaluator with direct policy params.
 
         Args:
-            checkpoint_dir: Path to agent checkpoint directory
-            checkpoint_step: Specific checkpoint step (-1 for latest)
+            apply_fn: Policy network apply function (train_state.apply_fn)
+            params: Policy network parameters (train_state.params)
+            env_params: Environment parameters for rollout
             num_steps: Max rollout steps per episode
             seed: Random seed for rollouts
         """
+        self.apply_fn = apply_fn
+        self.params = params
+        self.env_params = env_params
         self.num_steps = num_steps
         self.rng = jax.random.PRNGKey(seed)
-
-        # Orbax requires absolute paths
-        checkpoint_dir = os.path.abspath(checkpoint_dir)
-        logger.info(f"Loading agent from {checkpoint_dir}...")
-        self.train_state, self.config, self.env, self.env_params = load_agent(
-            checkpoint_dir, checkpoint_step=checkpoint_step
-        )
-
-        if self.train_state is None:
-            raise RuntimeError(f"Failed to load agent from {checkpoint_dir}")
 
         # Build a clean eval env (no wrappers that interfere)
         self.eval_env = Maze(
             max_height=13, max_width=13,
             agent_view_size=5, normalize_obs=True,
         )
+        # Override env_params with clean eval defaults
         self.env_params = self.eval_env.default_params
 
-        logger.info("Agent loaded successfully")
         self._rollout_fn = None
+        self._rollout_fn_num_levels = None
+
+        logger.info("AgentEvaluator constructed")
+
+    def update_params(self, params) -> None:
+        """Refresh policy params. Call at each injection event.
+
+        Forces rollout fn rebuild so next evaluate uses current policy.
+        The old JIT-compiled function is discarded; JAX will retrace on
+        next call to _build_rollout_fn (traces once per num_levels shape).
+
+        Args:
+            params: Updated policy network parameters (train_state.params)
+        """
+        self.params = params
+        self._rollout_fn = None
+        self._rollout_fn_num_levels = None
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_dir: str,
+        checkpoint_step: int = -1,
+        num_steps: int = 250,
+        seed: int = 42,
+    ) -> "AgentEvaluator":
+        """Load agent from checkpoint directory (backward compat for test_generator.py).
+
+        Args:
+            checkpoint_dir: Path to agent checkpoint directory
+            checkpoint_step: Specific checkpoint step (-1 for latest)
+            num_steps: Max rollout steps per episode
+            seed: Random seed for rollouts
+
+        Returns:
+            AgentEvaluator instance with params loaded from checkpoint
+
+        Raises:
+            RuntimeError: If checkpoint loading fails
+        """
+        from cross_evaluate import load_agent
+
+        checkpoint_dir = os.path.abspath(checkpoint_dir)
+        logger.info(f"Loading agent from {checkpoint_dir}...")
+        train_state, config, env, env_params = load_agent(
+            checkpoint_dir, checkpoint_step
+        )
+
+        if train_state is None:
+            raise RuntimeError(f"Failed to load agent from {checkpoint_dir}")
+
+        return cls(
+            apply_fn=train_state.apply_fn,
+            params=train_state.params,
+            env_params=env_params,
+            num_steps=num_steps,
+            seed=seed,
+        )
 
     def _build_rollout_fn(self, num_levels: int):
-        """Build a JIT-compiled rollout function for a given batch size."""
+        """Build a JIT-compiled rollout function for a given batch size.
+
+        Caches the compiled function by num_levels. When update_params() is called,
+        self._rollout_fn is set to None, forcing a rebuild with fresh params on
+        the next evaluate call.
+
+        Args:
+            num_levels: Number of levels in the evaluation batch
+        """
+        # Return cached fn if still valid for this batch size
+        if self._rollout_fn is not None and self._rollout_fn_num_levels == num_levels:
+            return self._rollout_fn
+
         eval_env = self.eval_env
         env_params = self.env_params
-        train_state = self.train_state
+        # Snapshot params into local var — captured in JIT closure at trace time
+        params = self.params
+        apply_fn = self.apply_fn
         num_steps = self.num_steps
 
         @jax.jit
@@ -105,8 +190,8 @@ class AgentEvaluator:
 
                 # Network forward pass
                 x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, done))
-                hstate, pi, value = train_state.apply_fn(
-                    train_state.params, x, hstate
+                hstate, pi, value = apply_fn(
+                    params, x, hstate
                 )
                 action = pi.sample(seed=rng_action).squeeze(0)
                 value = value.squeeze(0)
@@ -132,6 +217,8 @@ class AgentEvaluator:
             )
             return traj
 
+        self._rollout_fn = rollout
+        self._rollout_fn_num_levels = num_levels
         return rollout
 
     def evaluate_level(self, level) -> dict:

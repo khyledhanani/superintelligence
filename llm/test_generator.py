@@ -1105,7 +1105,7 @@ def run_test(args):
     if args.inject_metrics or args.strategy == "diverse":
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
-        evaluator = AgentEvaluator(args.agent_dir, num_steps=args.num_steps)
+        evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
 
     # Select reference mazes
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
@@ -1235,7 +1235,7 @@ def run_test(args):
         # Reuse evaluator/trajectories if already loaded for metrics
         if not args.inject_metrics:
             from llm.agent_evaluator import AgentEvaluator
-            evaluator = AgentEvaluator(args.agent_dir, num_steps=args.num_steps)
+            evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
             ref_levels = [tokens_to_level_obj(tok) for _, tok, _ in ref_data]
             ref_trajectories = evaluator.evaluate_levels(ref_levels)
 
