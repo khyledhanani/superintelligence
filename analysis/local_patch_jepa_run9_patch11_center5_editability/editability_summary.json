@@ -1,0 +1,18 @@
+{
+  "checkpoint": "analysis/local_patch_jepa_run9_patch11_center5/checkpoint_final.pkl",
+  "dataset": "/Users/khyledhanani/Documents/openend/superintelligence/vae/datasets/vae_og/train_200k_grids.npz",
+  "dataset_key": "grids",
+  "num_codes": 16,
+  "num_eval_mazes": 128,
+  "num_eval_sites": 1152,
+  "mean_unique_canonical_patterns_per_site": 1.0,
+  "fraction_sites_with_multiple_patterns": 0.0,
+  "mean_confidence_all_code_site_pairs": 0.7174595594406128,
+  "mean_best_site_confidence": 0.9986659288406372,
+  "best_code_active": 1,
+  "best_code_perplexity": 1.0,
+  "best_code_weighted_top_canonical_pattern_prob": 1.0,
+  "mean_code_pattern_change_rate": 0.8802083134651184,
+  "mean_code_top_canonical_pattern_prob_all_sites": 1.0,
+  "mean_code_top_canonical_pattern_prob_top_quartile_sites": 1.0
+}

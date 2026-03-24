@@ -1,0 +1,17 @@
+{
+  "checkpoint": "analysis/local_patch_jepa_run5_codes16/checkpoint_final.pkl",
+  "dataset": "/Users/khyledhanani/Documents/openend/superintelligence/vae/datasets/vae_og/train_200k_grids.npz",
+  "dataset_key": "grids",
+  "num_eval_batches": 64,
+  "batch_size": 256,
+  "num_eval_examples": 16384,
+  "num_codes": 16,
+  "active_codes": 11,
+  "assignment_perplexity": 8.38870127132965,
+  "max_code_prob": 0.1827392578125,
+  "weighted_top_raw_pattern_prob": 0.418212890625,
+  "weighted_top_canonical_pattern_prob": 0.583740234375,
+  "raw_pattern_nmi": 0.5940698538765099,
+  "canonical_pattern_nmi": 0.6577007417604974,
+  "center_wall_density_between_group_ratio": 0.8099707961082458
+}

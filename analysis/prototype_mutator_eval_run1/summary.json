@@ -1,0 +1,36 @@
+{
+  "dataset": "/Users/khyledhanani/Documents/openend/superintelligence/vae/datasets/vae_og/train_200k_grids.npz",
+  "library": "analysis/context_prototype_sweep_patch7_center5/best_library.npz",
+  "num_parents": 2048,
+  "num_edits": 5,
+  "results": [
+    {
+      "method": "prototype",
+      "child_solvable_rate": 1.0,
+      "solvability_flip_rate": 0.0,
+      "both_solvable_rate": 1.0,
+      "exact_match_rate": 0.0,
+      "mean_wall_hamming": 5.2490234375,
+      "mean_wall_hamming_frac": 0.03105930984020233,
+      "bfs_up_rate": 0.0068359375,
+      "mean_bfs_gain": -0.150390625,
+      "unique_child_rate": 0.99658203125,
+      "mean_abs_bfs_delta_both_solvable": 0.193359375,
+      "mean_selected_alt_mass": 0.7575180530548096,
+      "num_codes_used": 16.0
+    },
+    {
+      "method": "random_toggle",
+      "child_solvable_rate": 0.98486328125,
+      "solvability_flip_rate": 0.01513671875,
+      "both_solvable_rate": 0.98486328125,
+      "exact_match_rate": 0.0,
+      "mean_wall_hamming": 4.8955078125,
+      "mean_wall_hamming_frac": 0.02896750159561634,
+      "bfs_up_rate": 0.07421875,
+      "mean_bfs_gain": 2.4833984375,
+      "unique_child_rate": 1.0,
+      "mean_abs_bfs_delta_both_solvable": 0.23996033713435796
+    }
+  ]
+}

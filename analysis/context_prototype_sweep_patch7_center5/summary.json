@@ -1,0 +1,66 @@
+{
+  "dataset": "/Users/khyledhanani/Documents/openend/superintelligence/vae/datasets/vae_og/train_200k_grids.npz",
+  "dataset_key": "grids",
+  "patch_size": 7,
+  "center_size": 5,
+  "num_train_patches": 50000,
+  "num_val_patches": 20000,
+  "ks": [
+    16,
+    32,
+    64,
+    128
+  ],
+  "results": [
+    {
+      "k": 16,
+      "context_seen_rate": 0.6027,
+      "best_code_active": 16,
+      "best_code_perplexity": 1.7437866926193237,
+      "cluster_top1_accuracy": 0.46045,
+      "prototype_center_cell_acc": 0.846002,
+      "prototype_center_exact_match": 0.1212,
+      "num_unique_prototypes": 16
+    },
+    {
+      "k": 32,
+      "context_seen_rate": 0.6027,
+      "best_code_active": 32,
+      "best_code_perplexity": 2.194446086883545,
+      "cluster_top1_accuracy": 0.3229,
+      "prototype_center_cell_acc": 0.844358,
+      "prototype_center_exact_match": 0.11955,
+      "num_unique_prototypes": 32
+    },
+    {
+      "k": 64,
+      "context_seen_rate": 0.6027,
+      "best_code_active": 62,
+      "best_code_perplexity": 2.9242708683013916,
+      "cluster_top1_accuracy": 0.2061,
+      "prototype_center_cell_acc": 0.843366,
+      "prototype_center_exact_match": 0.1169,
+      "num_unique_prototypes": 64
+    },
+    {
+      "k": 128,
+      "context_seen_rate": 0.6027,
+      "best_code_active": 127,
+      "best_code_perplexity": 2.767195701599121,
+      "cluster_top1_accuracy": 0.2114,
+      "prototype_center_cell_acc": 0.843982,
+      "prototype_center_exact_match": 0.1194,
+      "num_unique_prototypes": 128
+    }
+  ],
+  "best_by_exact_match": {
+    "k": 16,
+    "context_seen_rate": 0.6027,
+    "best_code_active": 16,
+    "best_code_perplexity": 1.7437866926193237,
+    "cluster_top1_accuracy": 0.46045,
+    "prototype_center_cell_acc": 0.846002,
+    "prototype_center_exact_match": 0.1212,
+    "num_unique_prototypes": 16
+  }
+}

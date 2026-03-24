@@ -165,3 +165,6 @@ results
 # ES outputs
 es/evolved/
 es/*.png
+
+# Generated prototype sweep artifacts
+analysis/context_prototype_sweep_*/best_model.pkl

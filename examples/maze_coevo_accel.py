@@ -69,6 +69,11 @@ from es.online_level_model import (
     init_level_model_state,
     retrain_level_model,
 )
+from es.prototype_maze_mutator import (
+    library_to_jax_arrays,
+    load_context_prototype_library,
+    mutate_levels_with_prototypes,
+)
 
 # Re-use PPO utilities defined at module scope in maze_plr
 from examples.maze_plr import (
@@ -181,6 +186,17 @@ def main(config=None, project: str = "COEVO_ACCEL"):
     )
 
     latent_dim: int = int(config["level_model_latent_dim"])
+    prototype_library = None
+    if str(config["coevo_mutation_mode"]) == "prototype":
+        library_path = os.path.abspath(str(config["coevo_prototype_library_path"]))
+        if not os.path.exists(library_path):
+            raise FileNotFoundError(f"Prototype library not found: {library_path}")
+        prototype_library = library_to_jax_arrays(load_context_prototype_library(library_path))
+        print(
+            "Loaded prototype mutator library "
+            f"(patch={prototype_library['patch_size']}, center={prototype_library['center_size']}, "
+            f"codes={prototype_library['num_codes']}) from {library_path}"
+        )
 
     # ------------------------------------------------------------------
     # Level model initialization (outside JIT)
@@ -391,6 +407,16 @@ def main(config=None, project: str = "COEVO_ACCEL"):
 
             # --- Coevo mutation branch (inside JIT) ---
             def _coevo_mutate(rng_m: chex.PRNGKey) -> Level:
+                if coevo_mutation_mode == "prototype":
+                    child_levels, _ = mutate_levels_with_prototypes(
+                        rng_m,
+                        parent_levels,
+                        prototype_library,
+                        deterministic=False,
+                        prototype_wall_bias=float(config["coevo_prototype_wall_bias"]),
+                    )
+                    return child_levels
+
                 parent_grids = jax.vmap(
                     lambda wm, gp, ap: maze_level_to_grid(wm, gp, ap, height, width)
                 )(parent_levels.wall_map, parent_levels.goal_pos, parent_levels.agent_pos)
@@ -435,7 +461,12 @@ def main(config=None, project: str = "COEVO_ACCEL"):
                 )
 
             # Decide: use coevo if model initialized AND random draw < coevo_mutation_prob
-            use_coevo = train_state.level_model_initialized & (
+            coevo_ready = (
+                jnp.array(True, dtype=jnp.bool_)
+                if coevo_mutation_mode == "prototype"
+                else train_state.level_model_initialized
+            )
+            use_coevo = coevo_ready & (
                 jax.random.uniform(rng_decide) < coevo_mutation_prob
             )
             child_levels = jax.lax.cond(use_coevo, _coevo_mutate, _random_mutate, rng_mutate)
@@ -826,10 +857,28 @@ if __name__ == "__main__":
     group.add_argument("--coevo_sigma", type=float, default=0.5,
                        help="Gaussian noise sigma in latent space.")
     group.add_argument("--coevo_mutation_mode", type=str, default="gaussian",
-                       choices=["gaussian", "pca"],
-                       help="Perturbation mode: gaussian or pca-scaled.")
+                       choices=["gaussian", "pca", "prototype"],
+                       help="Perturbation mode: gaussian, pca-scaled, or local prototype edits.")
     group.add_argument("--coevo_decode_temperature", type=float, default=0.25,
                        help="Gumbel-max temperature for VAE decoder.")
+    group.add_argument(
+        "--coevo_prototype_library_path",
+        type=str,
+        default=os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "analysis",
+            "context_prototype_sweep_patch7_center5",
+            "best_library.npz",
+        ),
+        help="NPZ artifact written by run_context_prototype_sweep.py for prototype mutation mode.",
+    )
+    group.add_argument(
+        "--coevo_prototype_wall_bias",
+        type=float,
+        default=2.0,
+        help="Bias toward denser (>0) or sparser (<0) prototype wall patterns in prototype mode.",
+    )
     group.add_argument("--coevo_reservoir_size", type=int, default=100,
                        help="Number of random mazes in the retraining reservoir.")
     group.add_argument("--coevo_reservoir_fraction", type=float, default=0.3,

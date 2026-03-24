@@ -1,0 +1,3 @@
+method,child_solvable_rate,solvability_flip_rate,both_solvable_rate,exact_match_rate,mean_wall_hamming,mean_wall_hamming_frac,bfs_up_rate,mean_bfs_gain,unique_child_rate,mean_abs_bfs_delta_both_solvable,mean_selected_alt_mass,num_codes_used
+prototype,1.0,0.0,1.0,0.0,5.2490234375,0.03105930984020233,0.0068359375,-0.150390625,0.99658203125,0.193359375,0.7575180530548096,16.0
+random_toggle,0.98486328125,0.01513671875,0.98486328125,0.0,4.8955078125,0.02896750159561634,0.07421875,2.4833984375,1.0,0.23996033713435796,,

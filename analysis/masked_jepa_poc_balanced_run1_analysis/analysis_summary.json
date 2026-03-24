@@ -1,0 +1,21 @@
+{
+  "checkpoint": "analysis/masked_jepa_poc_balanced_run1/checkpoint_final.pkl",
+  "dataset": "/Users/khyledhanani/Documents/openend/superintelligence/vae/datasets/vae_og/train_200k_grids.npz",
+  "dataset_key": "grids",
+  "num_eval_batches": 64,
+  "batch_size": 128,
+  "num_eval_examples": 8192,
+  "num_codes": 16,
+  "active_codes": 5,
+  "assignment_perplexity": 2.4411600141719396,
+  "max_code_prob": 0.6815185546875,
+  "min_nonzero_code_prob": 0.0,
+  "specialization": {
+    "wall_density_between_group_ratio": 0.003640684233985834,
+    "goal_in_mask_between_group_ratio": 0.0010764723081702178,
+    "agent_in_mask_between_group_ratio": 0.0009404908835981653,
+    "mask_area_between_group_ratio": 0.0,
+    "mask_center_y_between_group_ratio": 0.20188786525707167,
+    "mask_center_x_between_group_ratio": 0.2134447008142813
+  }
+}
