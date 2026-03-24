@@ -70,13 +70,14 @@ Plans:
 **Depends on**: Phase 3
 **Requirements**: EXPT-01
 **Success Criteria** (what must be TRUE):
-  1. WandB `JAXUED_LLM` project contains 6+ completed runs (3 ACCEL+LLM, 3 ACCEL-only) with matched seeds and identical non-injection hyperparameters
-  2. `scripts/compare_llm_injection.py` produces a comparison table showing mean and std of final solve rate for each condition
+  1. WandB `JAXUED_LLM` project contains 3 completed ACCEL+LLM runs; JAXUED_LEARNABILITY contains 3 ACCEL-only (accel-sfl) runs used as control
+  2. `scripts/compare_llm_results.py` produces a comparison table showing mean and std of final solve_rate/mean for each condition, plus a learning-curves PNG
   3. The core claim is evaluable from the data: ACCEL+LLM mean solve rate is either higher than ACCEL-only (supporting the thesis) or the gap is quantified and explained
-**Plans**: TBD
+**Plans**: 2 plans in 2 waves
 
 Plans:
-- [ ] 04-01: TBD
+- [ ] 04-01-PLAN.md — Patch launch scripts (SEED var, openrouter), pre-flight WandB check, human verify 3 seeds running (Wave 1)
+- [ ] 04-02-PLAN.md — Extend compare_llm_results.py (cross-project, learning curves, diagnostics), human verify analysis (Wave 2)
 
 ## Progress
 
@@ -88,4 +89,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Integration Scaffolding | 2/2 | Complete   | 2026-03-23 |
 | 2. Decision Gate and Tuning | 2/2 | Complete   | 2026-03-23 |
 | 3. Reproducibility Infrastructure | 2/2 | Complete    | 2026-03-24 |
-| 4. Comparison Experiments | 0/? | Not started | - |
+| 4. Comparison Experiments | 0/2 | Not started | - |
