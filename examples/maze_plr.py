@@ -37,6 +37,7 @@ from cmaes_manager import CMAESManager
 
 from llm.injection_config import LLMInjectionConfig
 from llm.injector import LLMInjectionManager
+from llm.level_cache import LevelCache
 
 class UpdateState(IntEnum):
     DR = 0
@@ -1063,15 +1064,22 @@ def main(config=None, project="JAXUED_TEST"):
                 params=train_state_init.params,
                 env_params=env_params,
             )
+        # Build level cache dir: results/<run_name>/llm_levels/<seed>
+        # Provides per-run audit trail for accepted LLM levels (EXPT-02)
+        llm_cache_dir = os.path.join("results", config["run_name"], "llm_levels", str(config["seed"]))
+        level_cache = LevelCache(llm_cache_dir)
+        print(f"[LLM] Level cache: {llm_cache_dir}")
+
         llm_injector = LLMInjectionManager(
             config=llm_config,
             level_sampler=level_sampler,
             eval_freq=config["eval_freq"],
             agent_evaluator=agent_evaluator,
+            level_cache=level_cache,
         )
         gate_status = "gate=ON" if llm_config.gate_enabled else "gate=OFF"
         print(f"[LLM] Injection enabled: interval={llm_config.injection_interval}, "
-              f"n_raw={llm_config.n_raw}, warmup={llm_config.warmup_steps}, {gate_status}")
+              f"n_raw={llm_config.n_raw}, start_step={llm_config.inject_start_step}, {gate_status}")
 
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
@@ -1400,8 +1408,8 @@ if __name__=="__main__":
                            help="Path to LLM config YAML file")
     llm_group.add_argument("--llm_inject_interval", type=int, default=3000,
                            help="Number of eval steps between LLM injection events")
-    llm_group.add_argument("--llm_warmup_steps", type=int, default=5000,
-                           help="No LLM injection before this many training steps")
+    llm_group.add_argument("--llm_inject_start_step", type=int, default=5000,
+                           help="Training step at which LLM injection begins (no injection before this step)")
     llm_group.add_argument("--llm_batch_size", type=int, default=25,
                            help="Number of raw mazes requested from LLM per injection event")
     llm_group.add_argument("--llm_n_references", type=int, default=5,

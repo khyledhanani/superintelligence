@@ -28,7 +28,7 @@ class LLMInjectionConfig:
 
     # Timing
     injection_interval: int = 3000     # --llm_inject_interval (eval steps between injections)
-    warmup_steps: int = 5000           # --llm_warmup_steps (no injection before this step)
+    inject_start_step: int = 5000      # --llm_inject_start_step (no injection before this training step)
 
     # LLM generation
     n_raw: int = 25                    # --llm_batch_size (mazes requested per injection)
@@ -83,7 +83,7 @@ class LLMInjectionConfig:
             model=config.get("llm_model", ""),
             config_path=config.get("llm_config", ""),
             injection_interval=config.get("llm_inject_interval", 3000),
-            warmup_steps=config.get("llm_warmup_steps", 5000),
+            inject_start_step=config.get("llm_inject_start_step", config.get("llm_warmup_steps", 5000)),
             n_raw=config.get("llm_batch_size", 25),
             reference_maze_strategy=config.get("llm_ref_strategy", "hardest"),
             n_reference_mazes=config.get("llm_n_references", 5),

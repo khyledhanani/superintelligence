@@ -244,7 +244,7 @@ class LLMInjectionManager:
 
         current_step = eval_step * self.eval_freq
 
-        if current_step < self.config.warmup_steps:
+        if current_step < self.config.inject_start_step:
             return runner_state
 
         if current_step % self.config.injection_interval != 0:
