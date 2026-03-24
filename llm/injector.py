@@ -29,6 +29,7 @@ import wandb
 from llm.buffer_stats import BufferStatsExtractor
 from llm.decision_gate import DiversityThresholds
 from llm.injection_config import LLMInjectionConfig
+from llm.level_cache import LevelCache
 from llm.maze_generator import GenerationConfig, MazeGenerator
 from jaxued.environments.maze.util import make_level_mutator_minimax
 from jaxued.level_sampler import LevelSampler
@@ -151,11 +152,13 @@ class LLMInjectionManager:
         level_sampler: LevelSampler,
         eval_freq: int,
         agent_evaluator=None,
+        level_cache: Optional[LevelCache] = None,
     ) -> None:
         self.config = config
         self.level_sampler = level_sampler
         self.eval_freq = eval_freq
         self.agent_evaluator = agent_evaluator  # AgentEvaluator instance (None if gate disabled)
+        self.level_cache = level_cache  # LevelCache instance (None if caching disabled)
 
         # Buffer stats extractor for reference maze selection
         self.buffer_stats = BufferStatsExtractor(
@@ -248,9 +251,9 @@ class LLMInjectionManager:
             return runner_state
 
         logger.info(f"[LLM] Injection event at step {current_step} (eval_step={eval_step})")
-        return self._do_injection(runner_state)
+        return self._do_injection(runner_state, current_step)
 
-    def _do_injection(self, runner_state: tuple) -> tuple:
+    def _do_injection(self, runner_state: tuple, current_step: int) -> tuple:
         """Execute the full injection pipeline.
 
         Two code paths:
@@ -265,12 +268,14 @@ class LLMInjectionManager:
         2. Extract references (+ Level objects for gate path) and buffer summary
         3. Compute reference trajectories once at start (gate path)
         4. Generate n_raw candidate mazes via LLM using appropriate code path
+        4b. Cache accepted LLM seeds to disk + collect hashes for WandB table
         5. Mutation amplification for each valid seed (optional)
         6. Batch-insert all accepted levels into PLR buffer with max-priority score
-        7. Log WandB metrics including gate-specific metrics (GATE-03)
+        7. Log WandB metrics including gate-specific metrics (GATE-03) and hash table
 
         Args:
-            runner_state: (rng, train_state) tuple
+            runner_state:  (rng, train_state) tuple
+            current_step:  Current training step (used for caching file names)
 
         Returns:
             Updated runner_state with modified train_state.sampler
@@ -385,6 +390,27 @@ class LLMInjectionManager:
         # Track batch events where all seeds were rejected
         if gate_accepted == 0 and seeds_generated > 0:
             self.batch_all_rejected_count += 1
+
+        # ---------------------------------------------------------------
+        # Step 4b: Cache accepted LLM seeds to disk + collect hashes
+        # ---------------------------------------------------------------
+        # Only LLM-generated seeds are cached — not mutations (per CONTEXT.md decision).
+        # gate_metrics per seed: diversity_scores[i] / difficulty_scores[i] for gate path,
+        # empty dict for ungated path.
+        accepted_hashes = []
+        if valid_levels:
+            for idx, level in enumerate(valid_levels):
+                gate_metrics_for_seed = {}
+                if gate_active and idx < len(diversity_scores):
+                    gate_metrics_for_seed = {
+                        "mean_diversity": diversity_scores[idx],
+                        "regret": difficulty_scores[idx],
+                    }
+                if self.level_cache is not None:
+                    h = self.level_cache.save_accepted(level, current_step, idx, gate_metrics_for_seed)
+                else:
+                    h = LevelCache.compute_hash(level)
+                accepted_hashes.append(h)
 
         # ---------------------------------------------------------------
         # Step 5: Mutation amplification
@@ -503,6 +529,15 @@ class LLMInjectionManager:
             "llm/gate_rejection_rate": gate_rejected / seeds_generated if seeds_generated > 0 else 0.0,
             "llm/batch_all_rejected_count": self.batch_all_rejected_count,
         }
+
+        # Add wall_map hash table to log_payload for audit trail (EXPT-02)
+        # Guard against empty list to avoid logging empty WandB tables.
+        if accepted_hashes:
+            hash_table = wandb.Table(
+                columns=["step", "batch_index", "wall_map_hash"],
+                data=[[current_step, i, h] for i, h in enumerate(accepted_hashes)]
+            )
+            log_payload["llm/accepted_level_hashes"] = hash_table
 
         try:
             wandb.log(log_payload)
