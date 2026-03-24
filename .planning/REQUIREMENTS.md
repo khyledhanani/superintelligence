@@ -26,8 +26,8 @@ Requirements for initial release. Each maps to roadmap phases.
 ### Experiments
 
 - [ ] **EXPT-01**: Comparison launch scripts for ACCEL+LLM injection vs ACCEL-only control with matching seeds
-- [ ] **EXPT-02**: Accepted levels are cached to disk (`.npy` + metadata JSON) with wall_map hashes logged to WandB for reproducibility
-- [ ] **EXPT-03**: Injection frequency is ablatable via `--llm_inject_start_step` and `--llm_inject_interval` parameters
+- [x] **EXPT-02**: Accepted levels are cached to disk (`.npy` + metadata JSON) with wall_map hashes logged to WandB for reproducibility
+- [x] **EXPT-03**: Injection frequency is ablatable via `--llm_inject_start_step` and `--llm_inject_interval` parameters
 
 ## v2 Requirements
 
@@ -73,8 +73,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | GATE-03 | Phase 2 | Complete |
 | GATE-04 | Phase 2 | Complete |
 | EXPT-01 | Phase 4 | Pending |
-| EXPT-02 | Phase 3 | Pending |
-| EXPT-03 | Phase 3 | Pending |
+| EXPT-02 | Phase 3 | Complete (03-01) |
+| EXPT-03 | Phase 3 | Complete (03-01) |
 
 **Coverage:**
 - v1 requirements: 13 total

@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Integration Scaffolding** - LLMInjector pipeline with format validation, buffer insertion, and WandB logging — gate disabled, injection unconditional (completed 2026-03-23)
 - [x] **Phase 2: Decision Gate and Tuning** - Wire live AgentEvaluator + DecisionGate, refresh checkpoint per injection, tune interval/batch-size hyperparameters empirically (completed 2026-03-23)
-- [ ] **Phase 3: Reproducibility Infrastructure** - Level caching to disk, wall_map hash logging, comparison launch scripts, analysis tooling
+- [ ] **Phase 3: Reproducibility Infrastructure** - Level caching to disk, wall_map hash logging, comparison launch scripts, analysis tooling (Plan 03-01 complete 2026-03-24)
 - [ ] **Phase 4: Comparison Experiments** - Run ACCEL+LLM vs ACCEL-only control at 50k steps, analyse solve rate differences, ablate injection frequency if needed
 
 ## Phase Details
@@ -59,10 +59,11 @@ Plans:
   2. Every accepted LLM level is written to disk as `.npy` + metadata JSON, and its `wall_map` hash appears in WandB — an auditor can reconstruct which levels were injected into which run
   3. `launch_llm_injection.sh` and `launch_accel_only_control.sh` exist, use matching seeds and buffer sizes, and both successfully start training on the GPU nodes
   4. `--llm_inject_start_step` and `--llm_inject_interval` are independently configurable and an ablation can be run by changing only those flags
-**Plans**: TBD
+**Plans**: 2 plans in 2 waves
 
 Plans:
-- [ ] 03-01: TBD
+- [x] 03-01-PLAN.md — LevelCache, wall-map hash WandB logging, rename --llm_inject_start_step (Wave 1) — completed 2026-03-24
+- [ ] 03-02-PLAN.md — Launch scripts, WandB comparison script, human-verify checkpoint (Wave 2)
 
 ### Phase 4: Comparison Experiments
 **Goal**: At least 3 ACCEL+LLM seeds and 3 ACCEL-only control seeds complete 50k-step training runs, producing a WandB comparison table with statistical evidence for or against the core claim
@@ -86,5 +87,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Integration Scaffolding | 2/2 | Complete   | 2026-03-23 |
 | 2. Decision Gate and Tuning | 2/2 | Complete   | 2026-03-23 |
-| 3. Reproducibility Infrastructure | 0/? | Not started | - |
+| 3. Reproducibility Infrastructure | 1/2 | In progress | - |
 | 4. Comparison Experiments | 0/? | Not started | - |

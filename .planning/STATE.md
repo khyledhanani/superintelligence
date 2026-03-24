@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-03-23)
 
 **Core value:** LLM-generated mazes must measurably improve agent generalization (solve rate on held-out benchmarks) compared to ACCEL-only and CMA-ES-only baselines.
-**Current focus:** Phase 2 — Grid Adapter
+**Current focus:** Phase 3 — Reproducibility Infrastructure
 
 ## Current Position
 
-Phase: 2 of 4 (Grid Adapter)
-Plan: 3 of 3 in current phase (Plan 02-02 complete — ready for 02-03)
-Status: In progress — Plan 02-02 complete (all 3 tasks done, checkpoint approved)
-Last activity: 2026-03-23 — Completed 02-02: gated injection pipeline, smoke test script, human-verify checkpoint approved
+Phase: 3 of 4 (Reproducibility Infrastructure)
+Plan: 2 of 2 in current phase (Plan 03-01 complete — ready for 03-02)
+Status: In progress — Plan 03-01 complete (2 tasks done)
+Last activity: 2026-03-24 — Completed 03-01: LevelCache audit trail, WandB hash table logging, --llm_inject_start_step flag rename
 
-Progress: [█████░░░░░] 50%
+Progress: [███████░░░] 70%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: 3.5 min
-- Total execution time: 0.23 hours
+- Total plans completed: 5
+- Average duration: 4 min
+- Total execution time: 0.27 hours
 
 **By Phase:**
 
@@ -29,9 +29,10 @@ Progress: [█████░░░░░] 50%
 |-------|-------|-------|----------|
 | 01-checkpoint | 2 | 7 min | 3.5 min |
 | 02-grid-adapter | 2 | 10 min | 5 min |
+| 03-reproducibility-infrastructure | 1 | 12 min | 12 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (2 min), 01-02 (5 min), 02-01 (3 min), 02-02 (5 min + checkpoint)
+- Last 5 plans: 01-02 (5 min), 02-01 (3 min), 02-02 (5 min + checkpoint), 03-01 (12 min)
 - Trend: -
 
 *Updated after each plan completion*
@@ -59,6 +60,9 @@ Recent decisions affecting current work:
 - [02-02]: Gate acceptance detected via empty result.diversity_issues — generate_with_feedback() always returns but marks unresolved issues when exhausted retries with gate failure
 - [02-02]: Reference trajectories computed once per injection event, not per seed — avoids N redundant rollouts across seeds in same event
 - [02-02]: Phase 1 fallback path preserved exactly with --no-llm_gate — generate() + validate_llm_level() for backward compat
+- [03-01]: Only valid_levels (LLM seeds that passed gate) are cached — mutations are derived variants not part of audit trail
+- [03-01]: accepted_hashes collected even when level_cache is None (via compute_hash) so WandB table is always populated
+- [03-01]: Backward compat: from_config_dict reads llm_inject_start_step with llm_warmup_steps fallback for old configs
 
 ### Pending Todos
 
@@ -71,6 +75,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-23
-Stopped at: Completed 02-02 all 3 tasks. Task 3 checkpoint:human-verify approved (gate CLI flags confirmed 6/6, LLM setup block runs without errors). Plan 02-02 complete.
+Last session: 2026-03-24
+Stopped at: Completed 03-01 all 2 tasks. LevelCache audit trail + WandB hash table + --llm_inject_start_step rename complete.
 Resume file: None
