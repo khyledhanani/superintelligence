@@ -1,24 +1,19 @@
 #!/bin/bash
-# ACCEL+LLM Injection Experiment
-# Run this script on a GPU node (albacore, smew, or canada).
-# Set SEED below — one seed per machine for parallel execution.
+# ACCEL+LLM Injection — Seed 1 via OpenRouter (Claude Sonnet)
+# Run on a DIFFERENT GPU node than seed 0.
 #
-# === Seed (set per machine: 0, 1, or 2) ===
-SEED=0
-#
-# === Ablation parameters (change these for ablation experiments) ===
-INJECT_START=3000       # --llm_inject_start_step
-INJECT_INTERVAL=3000    # --llm_inject_interval
-BATCH_SIZE=10           # --llm_batch_size
+SEED=1
+
+# === Ablation parameters ===
+INJECT_START=3000
+INJECT_INTERVAL=3000
+BATCH_SIZE=10
 
 set -e
 
 # Force conda CUDA libs (system CUDA 13.1 cuSOLVER is incompatible)
 export LD_LIBRARY_PATH=/cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env/lib:${LD_LIBRARY_PATH:-}
 PYTHON=/cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env/bin/python
-
-# OpenRouter API key — set in environment or .env file in repo root
-# export OPENROUTER_API_KEY="sk-or-..."
 
 COMMON="--project JAXUED_LLM \
         --num_updates 50000 --eval_freq 250 \
@@ -29,11 +24,11 @@ export WANDB_DIR=/tmp/wandb
 export JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache
 mkdir -p /tmp/jax_cache
 
-echo "=== [$(date)] Seed $SEED starting ==="
+echo "=== [$(date)] Seed $SEED (openrouter claude-sonnet) starting ==="
 
 $PYTHON examples/maze_plr.py $COMMON \
   --use_accel --use_llm \
-  --llm_provider openrouter --llm_model openai/gpt-5.4 --llm_config llm/config.yaml \
+  --llm_provider openrouter --llm_model anthropic/claude-sonnet-4 --llm_config llm/config.yaml \
   --llm_inject_start_step ${INJECT_START} \
   --llm_inject_interval ${INJECT_INTERVAL} \
   --llm_batch_size ${BATCH_SIZE} \

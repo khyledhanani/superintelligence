@@ -38,7 +38,16 @@ class LLMInjectionConfig:
     # Diversity gate (Phase 2: enabled by default; locked decisions from CONTEXT.md)
     gate_enabled: bool = True               # --llm_gate
     difficulty_threshold: float = 0.6       # --llm_difficulty_threshold
+    difficulty_gate_mode: str = "fixed"     # --llm_difficulty_gate_mode
+    #   "fixed": use difficulty_threshold as absolute floor
+    #   "buffer_mean": threshold = mean score across entire buffer
+    #   "reference_mean": threshold = mean score of N reference mazes
+    #   "competitive": no difficulty gate, insert with actual SFL score (same as ACCEL)
     min_diversity: float = 0.02             # --llm_min_diversity
+    diversity_gate_mode: str = "fixed"      # --llm_diversity_gate_mode
+    #   "fixed": use min_diversity as absolute floor
+    #   "buffer_median": threshold = median pairwise distance among N reference mazes
+    #   "disabled": no diversity gate
     diversity_metric: str = "td_error_emd"  # --llm_diversity_metric
     max_diversity_retries: int = 2          # --llm_max_diversity_retries
     n_rollouts_gate: int = 100              # --llm_n_rollouts (rollouts per candidate)
@@ -89,7 +98,9 @@ class LLMInjectionConfig:
             n_reference_mazes=config.get("llm_n_references", 5),
             gate_enabled=config.get("llm_gate", True),
             difficulty_threshold=config.get("llm_difficulty_threshold", 0.6),
+            difficulty_gate_mode=config.get("llm_difficulty_gate_mode", "fixed"),
             min_diversity=config.get("llm_min_diversity", 0.02),
+            diversity_gate_mode=config.get("llm_diversity_gate_mode", "fixed"),
             diversity_metric=config.get("llm_diversity_metric", "td_error_emd"),
             max_diversity_retries=config.get("llm_max_diversity_retries", 2),
             n_rollouts_gate=config.get("llm_n_rollouts", 100),

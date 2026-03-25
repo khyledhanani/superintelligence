@@ -365,14 +365,15 @@ class MazeGenerator:
                 logger.info(f"Model reasoning ({len(thinking)} chars)")
             return content, thinking
         except requests.exceptions.RequestException as e:
-            logger.error(f"LLM API error: {e}")
+            err_msg = f"LLM API error: {e}"
             if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response status: {e.response.status_code}")
-                logger.error(f"Response body: {e.response.text[:500]}")
+                err_msg += f" | status={e.response.status_code} body={e.response.text[:500]}"
+            logger.error(err_msg)
+            print(f"[LLM ERROR] {err_msg}", flush=True)
             return None, None
         except (KeyError, IndexError) as e:
             logger.error(f"Unexpected API response format: {e}")
-            logger.error(f"Response data: {data}")
+            print(f"[LLM ERROR] Unexpected response format: {e}", flush=True)
             return None, None
 
     def _call_claude_code(self, messages: List[Dict]) -> tuple:
@@ -381,6 +382,9 @@ class MazeGenerator:
         Uses the local CLI subscription — no API key needed.
         Each call is a fresh session; multi-turn context is flattened.
         User prompt is piped via stdin to handle long prompts.
+
+        Uses stream-json output to work around CLI bug where --output-format json
+        returns empty result field (CLI v2.1.83+, issues #7124/#1920).
 
         Returns:
             (content, thinking) tuple. thinking is always None (CLI doesn't
@@ -400,7 +404,8 @@ class MazeGenerator:
 
         cmd = [
             "claude", "-p", "-",  # read prompt from stdin
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",
             "--max-turns", "1",
         ]
         if system:
@@ -422,35 +427,67 @@ class MazeGenerator:
                 timeout=self.config.timeout,
             )
             if proc.returncode != 0:
-                logger.error(f"claude CLI exited with code {proc.returncode}")
+                err_msg = f"claude CLI exited with code {proc.returncode}"
                 if proc.stderr:
-                    logger.error(f"stderr: {proc.stderr[:500]}")
+                    err_msg += f" | stderr: {proc.stderr[:500]}"
+                logger.error(err_msg)
+                print(f"[LLM ERROR] {err_msg}", flush=True)
                 return None, None
 
-            data = json.loads(proc.stdout)
-            content = data.get("result", "")
+            # Parse stream-json output: extract text from assistant messages,
+            # fall back to result field for older CLI versions.
+            content_parts = []
+            total_input = 0
+            total_output = 0
+            for line in proc.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if event.get("type") == "assistant":
+                    msg = event.get("message", {})
+                    for block in msg.get("content", []):
+                        if block.get("type") == "text":
+                            content_parts.append(block["text"])
+                    usage = msg.get("usage", {})
+                    total_input += usage.get("input_tokens", 0)
+                    total_output += usage.get("output_tokens", 0)
+                elif event.get("type") == "result":
+                    # Fallback for older CLI versions where result field works
+                    result_text = event.get("result", "")
+                    if result_text and not content_parts:
+                        content_parts.append(result_text)
+                    usage = event.get("usage", {})
+                    if not total_input:
+                        total_input = usage.get("input_tokens", 0)
+                    if not total_output:
+                        total_output = usage.get("output_tokens", 0)
+
+            content = "\n".join(content_parts).strip()
             if not content:
-                logger.error("claude CLI returned empty result")
+                print("[LLM ERROR] claude CLI returned no content in stream", flush=True)
+                if proc.stdout:
+                    print(f"[LLM ERROR] stdout: {proc.stdout[:500]}", flush=True)
+                if proc.stderr:
+                    print(f"[LLM ERROR] stderr: {proc.stderr[:500]}", flush=True)
                 return None, None
 
-            # Log token usage if available
-            usage = data.get("usage", {})
-            if usage:
-                logger.info(
-                    f"Claude CLI tokens: {usage.get('input_tokens', '?')} in, "
-                    f"{usage.get('output_tokens', '?')} out"
-                )
+            if total_input or total_output:
+                print(f"[LLM] Claude CLI tokens: {total_input} in, {total_output} out", flush=True)
 
             return content, None
         except subprocess.TimeoutExpired:
-            logger.error(f"claude CLI timed out after {self.config.timeout}s")
+            print(f"[LLM ERROR] claude CLI timed out after {self.config.timeout}s", flush=True)
             return None, None
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse claude CLI output: {e}")
-            logger.error(f"stdout: {proc.stdout[:500]}")
+            print(f"[LLM ERROR] Failed to parse CLI output: {e}", flush=True)
+            print(f"[LLM ERROR] stdout: {proc.stdout[:500]}", flush=True)
             return None, None
         except FileNotFoundError:
-            logger.error("claude CLI not found — is Claude Code installed?")
+            print("[LLM ERROR] claude CLI not found — is Claude Code installed?", flush=True)
             return None, None
 
     def _call_openai_compatible(self, messages: List[Dict]) -> tuple:
@@ -512,14 +549,15 @@ class MazeGenerator:
                 logger.info(f"Model reasoning ({len(thinking)} chars)")
             return content, thinking
         except requests.exceptions.RequestException as e:
-            logger.error(f"LLM API error: {e}")
+            err_msg = f"LLM API error: {e}"
             if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response status: {e.response.status_code}")
-                logger.error(f"Response body: {e.response.text[:500]}")
+                err_msg += f" | status={e.response.status_code} body={e.response.text[:500]}"
+            logger.error(err_msg)
+            print(f"[LLM ERROR] {err_msg}", flush=True)
             return None, None
         except (KeyError, IndexError) as e:
             logger.error(f"Unexpected API response format: {e}")
-            logger.error(f"Response data: {data}")
+            print(f"[LLM ERROR] Unexpected response format: {e}", flush=True)
             return None, None
 
     def _extract_inline_reasoning(self, raw_response: str) -> Optional[str]:
@@ -861,7 +899,19 @@ class MazeGenerator:
                 result.diversity_attempts = diversity_attempt + 1
                 break
 
-            # Classify failure reason(s)
+            if diversity_attempt >= max_diversity_retries:
+                logger.info(
+                    f"Diversity gate failed after {max_diversity_retries + 1} attempts, "
+                    f"accepting anyway"
+                )
+                result.gate_metrics = gate_result.summary
+                result.gate_pair_metrics = gate_result.pair_metrics
+                result.diversity_attempts = diversity_attempt + 1
+                result.diversity_issues = gate_result.issues
+                break
+
+            # Save rejected candidate (not saved for the last attempt that gets
+            # accepted anyway — avoids duplicate in rejected + accepted)
             _failed_difficulty = False
             _failed_diversity = False
             for iss in gate_result.issues:
@@ -869,8 +919,6 @@ class MazeGenerator:
                     _failed_diversity = True
                 else:
                     _failed_difficulty = True
-
-            # Save rejected candidate (grid + trajectory + gate info)
             result.rejected_candidates.append(RejectedCandidate(
                 grid=result.grid,
                 gate_summary=dict(gate_result.summary),
@@ -885,17 +933,6 @@ class MazeGenerator:
                              "all_returns")
                 },
             ))
-
-            if diversity_attempt >= max_diversity_retries:
-                logger.info(
-                    f"Diversity gate failed after {max_diversity_retries + 1} attempts, "
-                    f"accepting anyway"
-                )
-                result.gate_metrics = gate_result.summary
-                result.gate_pair_metrics = gate_result.pair_metrics
-                result.diversity_attempts = diversity_attempt + 1
-                result.diversity_issues = gate_result.issues
-                break
 
             # Build diversity feedback and regenerate
             logger.info(f"Diversity issues: {gate_result.issues}")
@@ -1078,6 +1115,21 @@ class MazeGenerator:
             result.rejected_candidates = prev_rejected
 
             if not result.success:
+                # Regeneration failed structurally — fall back to the last
+                # valid candidate and force-accept it
+                if prev_rejected:
+                    last_valid = prev_rejected[-1]
+                    logger.info(
+                        "Regeneration failed, force-accepting last valid candidate"
+                    )
+                    result.success = True
+                    result.grid = last_valid.grid
+                    # Re-parse the level from the grid
+                    level, _ = self._parse_level(last_valid.grid)
+                    result.level = level
+                    result.gate_metrics = last_valid.gate_summary
+                    result.diversity_attempts = diversity_attempt + 1
+                    result.diversity_issues = last_valid.issues
                 break
 
         result.latency_ms = (time.time() - start) * 1000
@@ -1102,6 +1154,10 @@ class MazeGenerator:
     ) -> List[GenerationResult]:
         """Generate multiple mazes with metric feedback loop.
 
+        Each accepted maze is added to the reference set so subsequent
+        generations are diverse from both the buffer AND previously
+        generated mazes in this batch.
+
         Args:
             n: Number of mazes to generate
             (other args same as generate_with_feedback())
@@ -1109,14 +1165,19 @@ class MazeGenerator:
         Returns:
             List of GenerationResult objects
         """
+        # Copy reference lists so we can grow them without mutating the originals
+        ref_trajs = list(reference_trajectories) if reference_trajectories else []
+        ref_labels = list(reference_labels) if reference_labels else []
+        refs = list(references) if references else []
+
         results = []
         for i in range(n):
-            logger.info(f"Generating maze {i+1}/{n} (with feedback)...")
+            logger.info(f"Generating maze {i+1}/{n} (with feedback, {len(ref_labels)} references)...")
             result = self.generate_with_feedback(
                 agent_evaluator=agent_evaluator,
-                reference_trajectories=reference_trajectories,
-                reference_labels=reference_labels,
-                references=references,
+                reference_trajectories=ref_trajs,
+                reference_labels=ref_labels,
+                references=refs,
                 pairwise_metrics=pairwise_metrics,
                 global_metrics=global_metrics,
                 instruction=instruction,
@@ -1128,6 +1189,38 @@ class MazeGenerator:
                 cenie_model=cenie_model,
             )
             results.append(result)
+
+            # Add accepted maze to reference set for subsequent generations
+            if result.success and result.level is not None:
+                gen_label = f"Gen {i + 1}"
+                logger.info(f"Adding {gen_label} to reference set for next generation")
+
+                # Run agent to get trajectory for the new reference
+                gen_traj = agent_evaluator.evaluate_level_multi_rollout(
+                    result.level, n_rollouts=n_rollouts,
+                )
+                ref_trajs.append(gen_traj)
+                ref_labels.append(gen_label)
+
+                # Build a minimal ReferenceMaze for the prompt
+                gen_ref = ReferenceMaze(
+                    grid=result.grid,
+                    label=gen_label,
+                    metrics=[MetricEntry(
+                        name="Scalar Regret",
+                        value=result.gate_metrics.get("regret", 0.0) if result.gate_metrics else 0.0,
+                        description="Previously generated maze",
+                        metric_key="scalar_regret",
+                    )],
+                )
+                # Add path overlay if possible
+                try:
+                    from metrics.utils import truncate_at_done
+                    ep_pos = truncate_at_done(gen_traj["positions"], gen_traj["dones"])
+                    gen_ref.path_overlay = overlay_path_on_grid(result.grid, ep_pos)
+                except Exception:
+                    pass
+                refs.append(gen_ref)
 
         successes = sum(1 for r in results if r.success)
         logger.info(f"Feedback batch complete: {successes}/{n} successful")

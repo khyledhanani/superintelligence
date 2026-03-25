@@ -153,6 +153,14 @@ CENIE fits a diagonal-covariance GMM on LSTM hidden state + action pairs (257D) 
 
 **FIFO buffer concept:** The paper uses a sliding window of recent experiences. Our implementation fits on a snapshot of 50 buffer levels (one-shot, not streaming). For integration into the training loop, a ring buffer approach is used (see `vae/cenie_scorer.py` in the training branch).
 
+**Double subsampling problem:** CENIE's "buffer-wide" coverage has two layers of subsampling:
+
+1. **50 of ~4000 levels** from the buffer — `n_cenie_levels = min(size, 50)` in `test_generator.py:1295`. The cap exists because each level requires an agent rollout to extract LSTM hidden states. This gives ~4000 state-action pairs (50 levels × ~80 timesteps), not the full buffer population.
+
+2. **1 rollout per level** — CENIE uses `evaluate_levels()` (single rollout), not `evaluate_level_multi_rollout()` (100 rollouts). Since the policy is stochastic, a single rollout captures one possible behavior — the agent might solve the maze or not, or take an unusual path. The multi-rollout function picks the best-case trajectory, which better represents the agent's capability on that level.
+
+This means CENIE's advantage over pairwise metrics (which subsample ~6 references) is real but narrower than it appears: 50 levels vs 6, not 4000 vs 6. To truly fit on the full buffer, you'd need to either cache LSTM hidden states during training (avoiding re-rollouts) or accept the cost of thousands of rollouts before each generation batch.
+
 ---
 
 ## Computational Cost

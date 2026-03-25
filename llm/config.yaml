@@ -4,10 +4,10 @@
 # All values here can be overridden by CLI flags.
 
 # --- Provider & Model ---
-provider: claude-code       # "claude-code", "ollama", or "openrouter"
-model: sonnet               # Model identifier (claude-code: sonnet/opus/haiku)
+provider: openrouter        # "claude-code", "ollama", or "openrouter"
+model: anthropic/claude-sonnet-4  # OpenRouter model ID (see llm/models.md for benchmarks)
 temperature: 0.8
-timeout: 600                # API request timeout in seconds
+timeout: 120                # API request timeout in seconds
 
 # Provider-specific settings (auto-selected by provider field)
 ollama:
@@ -65,11 +65,11 @@ max_diversity_retries: 3
 # Thresholds for accepting a generated maze. Set to null to disable a gate.
 # A maze must pass ALL enabled gates. On failure, LLM gets metric feedback and retries.
 gate:
-  difficulty_threshold: 0.6     # Min difficulty score to accept (null = disabled)
-  difficulty_metric: regret     # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
+  difficulty_threshold: 0.1     # Min difficulty score to accept (null = disabled)
+  difficulty_metric: sfl        # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
                                 #   regret: rejects too-easy mazes (threshold ~0.6, buffer max 0.475)
                                 #   sfl: rejects too-easy AND too-hard mazes (threshold ~0.1, max at p=0.5 is 0.25)
-  min_diversity: 0.02           # Min distance to closest reference (calibrated: buffer median=0.02, 90th pctile=0.04)
+  min_diversity: 0.015          # Min distance to closest reference
   diversity_metric: td_error_emd  # "td_error_emd", "experience_divergence", "position_dtw", or "cenie"
 
 # --- Visualization ---

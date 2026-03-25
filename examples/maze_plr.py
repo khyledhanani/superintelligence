@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from typing import Sequence, Tuple
 import numpy as np
@@ -448,10 +449,16 @@ def compute_score(config, dones, values, max_returns, advantages):
         return max_mc(dones, values, max_returns)
     elif config['score_function'] == "pvl":
         return positive_value_loss(dones, advantages)
+    elif config['score_function'] == "sfl":
+        # SFL doesn't use regret-based scores; return zeros as placeholder
+        # (actual SFL scores computed separately via multi-rollout eval)
+        return jnp.zeros(dones.shape[1])
     else:
         raise ValueError(f"Unknown score function: {config['score_function']}")
 
 def main(config=None, project="JAXUED_TEST"):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    logging.getLogger("wandb").setLevel(logging.WARNING)
     tags = []
     if not config["exploratory_grad_updates"]:
         tags.append("robust")
@@ -463,6 +470,15 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("CMA-ES")
     if config.get("use_llm"):
         tags.append("llm")
+    if config.get("score_function") == "sfl":
+        tags.append("SFL")
+    print("=" * 60)
+    print("CONFIGURATION")
+    print("=" * 60)
+    for k, v in sorted(config.items()):
+        print(f"  {k}: {v}")
+    print("=" * 60)
+
     run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
     config = wandb.config
     
@@ -477,6 +493,8 @@ def main(config=None, project="JAXUED_TEST"):
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
     wandb.define_metric("diversity/*", step_metric="num_updates")
+    if config.get("use_llm"):
+        wandb.define_metric("llm/*", step_metric="num_updates")
 
     # --- CMA-ES + VAE setup ---
     vae_decode_fn = None
@@ -550,7 +568,7 @@ def main(config=None, project="JAXUED_TEST"):
         for i, level_name in enumerate(config["eval_levels"]):
             frames, episode_length = stats["eval_animation"][0][:, i], stats["eval_animation"][1][i]
             frames = np.array(frames[:episode_length])
-            log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
+            log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4, format="gif")})
 
         # Validity rate and insertion rate logging (averaged over eval_freq steps, excluding replay steps where it's 0)
         if "gen/valid_structure_pct" in stats:
@@ -574,7 +592,7 @@ def main(config=None, project="JAXUED_TEST"):
                 log_dict["cmaes/mean_z_norm"] = float(np.array(stats["cmaes/mean_z_norm"])[dr_mask].mean())
 
         wandb.log(log_dict)
-    
+
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
@@ -584,7 +602,38 @@ def main(config=None, project="JAXUED_TEST"):
     env_params = env.default_params
     mutate_level = make_level_mutator_minimax(100)
 
-    # And the level sampler    
+    # --- SFL: multi-rollout learnability scoring ---
+    def compute_sfl_scores(rng, train_state, levels, max_returns):
+        """Estimate learnability = p * (1-p) via multi-rollout evaluation."""
+        train_success = (max_returns > 0).astype(jnp.float32)
+
+        def sfl_eval_step(carry, rng_eval):
+            rng_r, rng_e = jax.random.split(rng_eval)
+            init_obs_e, init_env_state_e = jax.vmap(eval_env.reset_to_level, (0, 0, None))(
+                jax.random.split(rng_r, config["num_train_envs"]), levels, env_params)
+            _, rewards_e, _ = evaluate_rnn(
+                rng_e, eval_env, env_params, train_state,
+                ActorCritic.initialize_carry((config["num_train_envs"],)),
+                init_obs_e, init_env_state_e,
+                env_params.max_steps_in_episode)
+            success = (rewards_e.sum(axis=0) > 0).astype(jnp.float32)
+            return carry, success
+
+        eval_rngs = jax.random.split(rng, config["num_sfl_rollouts"] - 1)
+        _, eval_successes = jax.lax.scan(sfl_eval_step, jnp.int32(0), eval_rngs)
+
+        all_successes = jnp.concatenate([train_success[None], eval_successes], axis=0)
+        p = all_successes.mean(axis=0)
+        return p * (1 - p)
+
+    def compute_level_scores(rng, train_state, levels, dones, values, max_returns, advantages):
+        """Unified score dispatch: SFL uses multi-rollout eval, others use regret."""
+        if config["score_function"] == "sfl":
+            return compute_sfl_scores(rng, train_state, levels, max_returns)
+        else:
+            return compute_score(config, dones, values, max_returns, advantages)
+
+    # And the level sampler
     level_sampler = LevelSampler(
         capacity=config["level_buffer_capacity"],
         replay_prob=config["replay_prob"],
@@ -694,7 +743,8 @@ def main(config=None, project="JAXUED_TEST"):
             )
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
             max_returns = compute_max_returns(dones, rewards)
-            scores = compute_score(config, dones, values, max_returns, advantages)
+            rng, rng_score = jax.random.split(rng)
+            scores = compute_level_scores(rng_score, train_state, new_levels, dones, values, max_returns, advantages)
 
             # CMA-ES: tell fitness and insert into buffer
             if config["use_cmaes"]:
@@ -785,7 +835,8 @@ def main(config=None, project="JAXUED_TEST"):
             )
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
             max_returns = jnp.maximum(level_sampler.get_levels_extra(sampler, level_inds)["max_return"], compute_max_returns(dones, rewards))
-            scores = compute_score(config, dones, values, max_returns, advantages)
+            rng, rng_score = jax.random.split(rng)
+            scores = compute_level_scores(rng_score, train_state, levels, dones, values, max_returns, advantages)
             sampler = level_sampler.update_batch(sampler, level_inds, scores, {"max_return": max_returns})
             
             # Update the policy using trajectories collected from replay levels
@@ -856,7 +907,8 @@ def main(config=None, project="JAXUED_TEST"):
             )
             advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
             max_returns = compute_max_returns(dones, rewards)
-            scores = compute_score(config, dones, values, max_returns, advantages)
+            rng, rng_score = jax.random.split(rng)
+            scores = compute_level_scores(rng_score, train_state, child_levels, dones, values, max_returns, advantages)
             sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
 
             # Update: train_state only modified if exploratory_grad_updates is on
@@ -1080,6 +1132,15 @@ def main(config=None, project="JAXUED_TEST"):
         gate_status = "gate=ON" if llm_config.gate_enabled else "gate=OFF"
         print(f"[LLM] Injection enabled: interval={llm_config.injection_interval}, "
               f"n_raw={llm_config.n_raw}, start_step={llm_config.inject_start_step}, {gate_status}")
+        # Print injection schedule
+        eval_freq = config["eval_freq"]
+        num_updates = config["num_updates"]
+        inject_steps = []
+        for es in range(num_updates // eval_freq):
+            cs = (es + 1) * eval_freq
+            if cs >= llm_config.inject_start_step and cs % llm_config.injection_interval == 0:
+                inject_steps.append(cs)
+        print(f"[LLM] Injection schedule ({len(inject_steps)} events): {inject_steps}")
 
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
@@ -1355,7 +1416,11 @@ if __name__=="__main__":
     group.add_argument("--entropy_coeff", type=float, default=1e-3)
     group.add_argument("--critic_coeff", type=float, default=0.5)
     # === PLR ===
-    group.add_argument("--score_function", type=str, default="MaxMC", choices=["MaxMC", "pvl"])
+    group.add_argument("--score_function", type=str, default="MaxMC",
+                       choices=["MaxMC", "pvl", "sfl"],
+                       help="Level scoring: MaxMC (regret), pvl (positive value loss), sfl (learnability p*(1-p))")
+    group.add_argument("--num_sfl_rollouts", type=int, default=10,
+                       help="Number of evaluation rollouts for SFL learnability estimation")
     group.add_argument("--exploratory_grad_updates", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--level_buffer_capacity", type=int, default=4000)
     group.add_argument("--replay_prob", type=float, default=0.8)
@@ -1427,8 +1492,18 @@ if __name__=="__main__":
                            help="Enable decision gate (difficulty+diversity filter) for LLM mazes")
     llm_group.add_argument("--llm_difficulty_threshold", type=float, default=0.6,
                            help="Minimum difficulty score (regret) for gate acceptance")
+    llm_group.add_argument("--llm_difficulty_gate_mode", type=str, default="fixed",
+                           choices=["fixed", "buffer_mean", "reference_mean", "competitive"],
+                           help="How LLM difficulty threshold is set: fixed=absolute, "
+                                "buffer_mean=mean buffer score, reference_mean=mean of N references, "
+                                "competitive=actual SFL score competes with buffer (same as ACCEL)")
     llm_group.add_argument("--llm_min_diversity", type=float, default=0.02,
                            help="Minimum diversity score (td_error_emd) for gate acceptance")
+    llm_group.add_argument("--llm_diversity_gate_mode", type=str, default="fixed",
+                           choices=["fixed", "buffer_median", "disabled"],
+                           help="How LLM diversity threshold is set: fixed=absolute, "
+                                "buffer_median=median pairwise distance among references, "
+                                "disabled=no diversity gate")
     llm_group.add_argument("--llm_diversity_metric", type=str, default="td_error_emd",
                            choices=["td_error_emd", "experience_divergence", "position_dtw"],
                            help="Diversity metric for decision gate")

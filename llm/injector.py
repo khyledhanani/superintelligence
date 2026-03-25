@@ -242,7 +242,7 @@ class LLMInjectionManager:
         if not self.config.enabled:
             return runner_state
 
-        current_step = eval_step * self.eval_freq
+        current_step = (eval_step + 1) * self.eval_freq
 
         if current_step < self.config.inject_start_step:
             return runner_state
@@ -250,8 +250,12 @@ class LLMInjectionManager:
         if current_step % self.config.injection_interval != 0:
             return runner_state
 
-        logger.info(f"[LLM] Injection event at step {current_step} (eval_step={eval_step})")
-        return self._do_injection(runner_state, current_step)
+        print(f"[LLM] Injection event at step {current_step} (eval_step={eval_step})", flush=True)
+        try:
+            return self._do_injection(runner_state, current_step)
+        except Exception as e:
+            print(f"[LLM] Injection FAILED at step {current_step}: {e}. Training continues.", flush=True)
+            return runner_state
 
     def _do_injection(self, runner_state: tuple, current_step: int) -> tuple:
         """Execute the full injection pipeline.
@@ -320,9 +324,53 @@ class LLMInjectionManager:
                 ref_labels.append(ref.label)
 
         # Build DiversityThresholds from config (gate path)
+        # Compute effective difficulty threshold based on gate mode
+        buffer_size = int(np.asarray(sampler["size"]))
+        buffer_scores = np.asarray(sampler["scores"][:buffer_size]) if buffer_size > 0 else np.array([0.0])
+
+        mode = self.config.difficulty_gate_mode
+        if mode == "fixed":
+            effective_threshold = self.config.difficulty_threshold
+        elif mode == "buffer_mean":
+            effective_threshold = float(buffer_scores.mean())
+        elif mode == "reference_mean":
+            ref_scores = [r.metrics[0].value for r in references] if references else []
+            effective_threshold = float(np.mean(ref_scores)) if ref_scores else 0.0
+        elif mode == "competitive":
+            effective_threshold = None  # no difficulty gate; seeds insert with actual score
+        else:
+            effective_threshold = self.config.difficulty_threshold
+
+        # Compute effective diversity threshold based on diversity gate mode
+        div_mode = self.config.diversity_gate_mode
+        if div_mode == "fixed":
+            effective_diversity = self.config.min_diversity
+        elif div_mode == "buffer_median":
+            # Median pairwise distance among reference trajectories
+            if len(ref_trajectories) >= 2:
+                from llm.decision_gate import _compute_pairwise_diversity
+                pairwise_dists = []
+                for a in range(len(ref_trajectories)):
+                    for b in range(a + 1, len(ref_trajectories)):
+                        d = _compute_pairwise_diversity(
+                            ref_trajectories[a], ref_trajectories[b],
+                            self.config.diversity_metric,
+                        )
+                        pairwise_dists.append(d)
+                effective_diversity = float(np.median(pairwise_dists))
+            else:
+                effective_diversity = self.config.min_diversity  # fallback
+        elif div_mode == "disabled":
+            effective_diversity = None
+        else:
+            effective_diversity = self.config.min_diversity
+
+        logger.info(f"[LLM] Difficulty gate: mode={mode}, threshold={effective_threshold}")
+        logger.info(f"[LLM] Diversity gate: mode={div_mode}, threshold={effective_diversity}")
+
         thresholds = DiversityThresholds(
-            difficulty_threshold=self.config.difficulty_threshold,
-            min_diversity=self.config.min_diversity,
+            difficulty_threshold=effective_threshold,
+            min_diversity=effective_diversity,
             diversity_metric=self.config.diversity_metric,
         )
 
@@ -331,6 +379,7 @@ class LLMInjectionManager:
         # ---------------------------------------------------------------
         seeds_generated = self.config.n_raw
         valid_levels = []
+        seed_sfl_scores = []  # actual SFL scores per accepted seed (for competitive mode)
         gate_accepted = 0
         gate_rejected = 0
         diversity_scores = []
@@ -351,10 +400,13 @@ class LLMInjectionManager:
                 )
                 if not result.success:
                     error_detail = "; ".join(result.errors) if result.errors else "unknown error"
-                    raise RuntimeError(
-                        f"[LLM] generate_with_feedback() failed on attempt {i+1}/{seeds_generated}: "
-                        f"{error_detail}. Training crashed (no silent skip per design)."
+                    print(
+                        f"[LLM] generate_with_feedback() failed on maze {i+1}/{seeds_generated}: "
+                        f"{error_detail}. Skipping this maze.",
+                        flush=True,
                     )
+                    gate_rejected += 1
+                    continue
                 # Check if gate ultimately accepted (no unresolved diversity issues)
                 gate_metrics = result.gate_metrics or {}
                 was_accepted = not result.diversity_issues
@@ -363,6 +415,7 @@ class LLMInjectionManager:
                     valid_levels.append(result.level)
                     diversity_scores.append(float(gate_metrics.get("mean_diversity", 0.0)))
                     difficulty_scores.append(float(gate_metrics.get("regret", 0.0)))
+                    seed_sfl_scores.append(float(gate_metrics.get("learnability", 0.0)))
                 else:
                     gate_rejected += 1
                     logger.info(f"[LLM] Seed {i+1} gate rejected: {result.diversity_issues}")
@@ -371,10 +424,13 @@ class LLMInjectionManager:
                 result = self.generator.generate(references=references, global_metrics=global_metrics)
                 if not result.success:
                     error_detail = "; ".join(result.errors) if result.errors else "unknown error"
-                    raise RuntimeError(
-                        f"[LLM] MazeGenerator.generate() failed on attempt {i+1}/{seeds_generated}: "
-                        f"{error_detail}. Training crashed (no silent skip per design)."
+                    print(
+                        f"[LLM] MazeGenerator.generate() failed on maze {i+1}/{seeds_generated}: "
+                        f"{error_detail}. Skipping this maze.",
+                        flush=True,
                     )
+                    gate_rejected += 1
+                    continue
                 is_valid, reason = validate_llm_level(result.level)
                 if is_valid:
                     gate_accepted += 1
@@ -413,91 +469,141 @@ class LLMInjectionManager:
                 accepted_hashes.append(h)
 
         # ---------------------------------------------------------------
-        # Step 5: Mutation amplification
+        # Step 5: Mutation amplification (collected separately from seeds)
         # ---------------------------------------------------------------
         mutations_generated = 0
         mutations_solvable = 0
-        all_accepted_levels = list(valid_levels)
+        mutation_levels = []
 
         if self.config.amplification_enabled and valid_levels:
+            total_so_far = len(valid_levels)
+            max_mutation_rounds = 10  # safety cap to avoid infinite loop
             for seed_level in valid_levels:
-                # Check if we already hit the max inject cap
-                if len(all_accepted_levels) >= self.config.max_inject_per_event:
+                if total_so_far + len(mutation_levels) >= self.config.max_inject_per_event:
                     break
 
-                n_mutations = self.config.mutations_per_seed
-                mutations_generated += n_mutations
+                target = self.config.mutations_per_seed
+                seed_mutations = []
 
-                # Generate mutations using JAX vmap over a batch of random keys
-                rng, mut_rng = jax.random.split(rng)
-                mut_rngs = jax.random.split(mut_rng, n_mutations)
-                # vmap mutate_level(rng, level, num_edits) over rngs, with same seed_level
-                mutated_levels = jax.vmap(
-                    lambda r: self.mutate_level(r, seed_level, 3)
-                )(mut_rngs)
-
-                # Filter mutations by solvability (BFS, Python-side)
-                wall_map_batch = np.asarray(mutated_levels.wall_map)  # (n_mutations, H, W)
-                agent_pos_batch = np.asarray(mutated_levels.agent_pos)  # (n_mutations, 2)
-                goal_pos_batch = np.asarray(mutated_levels.goal_pos)   # (n_mutations, 2)
-
-                for j in range(n_mutations):
-                    if len(all_accepted_levels) >= self.config.max_inject_per_event:
+                for round_idx in range(max_mutation_rounds):
+                    if len(seed_mutations) >= target:
+                        break
+                    if total_so_far + len(mutation_levels) + len(seed_mutations) >= self.config.max_inject_per_event:
                         break
 
-                    if self.config.mutations_solvability_check:
-                        wm = wall_map_batch[j]
-                        ap = (int(agent_pos_batch[j, 0]), int(agent_pos_batch[j, 1]))
-                        gp = (int(goal_pos_batch[j, 0]), int(goal_pos_batch[j, 1]))
-                        path_len = _bfs_path_length(wm, ap, gp)
-                        if path_len < 0:
-                            continue
-                        mutations_solvable += 1
-                    else:
-                        mutations_solvable += 1
+                    # Generate a batch of mutations
+                    n_batch = min(target * 2, 100)  # generate 2x target per round
+                    mutations_generated += n_batch
+                    rng, mut_rng = jax.random.split(rng)
+                    mut_rngs = jax.random.split(mut_rng, n_batch)
+                    mutated_levels = jax.vmap(
+                        lambda r: self.mutate_level(r, seed_level, 3)
+                    )(mut_rngs)
 
-                    # Extract this mutation as a single Level
-                    mutation = jax.tree_util.tree_map(lambda x: x[j], mutated_levels)
-                    all_accepted_levels.append(mutation)
+                    # Filter by solvability (BFS, Python-side)
+                    wall_map_batch = np.asarray(mutated_levels.wall_map)
+                    agent_pos_batch = np.asarray(mutated_levels.agent_pos)
+                    goal_pos_batch = np.asarray(mutated_levels.goal_pos)
 
-        total_levels_to_inject = len(all_accepted_levels)
+                    for j in range(n_batch):
+                        if len(seed_mutations) >= target:
+                            break
+
+                        if self.config.mutations_solvability_check:
+                            wm = wall_map_batch[j]
+                            ap = (int(agent_pos_batch[j, 0]), int(agent_pos_batch[j, 1]))
+                            gp = (int(goal_pos_batch[j, 0]), int(goal_pos_batch[j, 1]))
+                            path_len = _bfs_path_length(wm, ap, gp)
+                            if path_len < 0:
+                                continue
+
+                        mutation = jax.tree_util.tree_map(lambda x: x[j], mutated_levels)
+                        seed_mutations.append(mutation)
+
+                mutations_solvable += len(seed_mutations)
+                mutation_levels.extend(seed_mutations)
+                if len(seed_mutations) < target:
+                    print(f"[LLM] Warning: only found {len(seed_mutations)}/{target} solvable mutations after {max_mutation_rounds} rounds", flush=True)
+
+        total_levels_to_inject = len(valid_levels) + len(mutation_levels)
         logger.info(f"[LLM] Injecting {total_levels_to_inject} levels "
                     f"(seeds={seeds_valid}, mutations={mutations_solvable})")
 
         # ---------------------------------------------------------------
-        # Step 5: Score and batch-insert into buffer
+        # Step 6: Score and batch-insert into buffer
+        # Seeds: max priority (or actual SFL for competitive mode)
+        # Mutations: actual SFL score via 10-rollout eval (standard buffer competition)
         # ---------------------------------------------------------------
-        if total_levels_to_inject == 0:
-            logger.warning("[LLM] No levels accepted for injection this event")
-            retained_count = 0
-            retained_rate = 0.0
-        else:
-            # Max-priority score: slightly above current buffer max to force replay
-            buffer_size = int(np.asarray(sampler["size"]))
-            if buffer_size > 0:
-                max_score = float(np.asarray(sampler["scores"][:buffer_size]).max())
+        retained_seeds = 0
+        retained_mutations = 0
+
+        # --- Insert seeds ---
+        if valid_levels:
+            if mode == "competitive":
+                # Competitive: use actual SFL scores from gate evaluation
+                seed_scores_arr = jnp.array(seed_sfl_scores, dtype=jnp.float32)
             else:
-                max_score = 1.0
-            inject_score = max_score + 1e-4
+                # Non-competitive: max priority to force replay
+                buf_size = int(np.asarray(sampler["size"]))
+                if buf_size > 0:
+                    max_score = float(np.asarray(sampler["scores"][:buf_size]).max())
+                else:
+                    max_score = 1.0
+                inject_score = max_score + 1e-4
+                seed_scores_arr = jnp.full(len(valid_levels), inject_score, dtype=jnp.float32)
 
-            # Stack all accepted Level objects into a batched Level pytree
-            levels_batch = jax.tree_util.tree_map(
-                lambda *xs: jnp.stack(xs), *all_accepted_levels
+            seed_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *valid_levels
             )
-            scores_batch = jnp.full(total_levels_to_inject, inject_score, dtype=jnp.float32)
-
-            # Single batch insert (not a loop of insert() calls)
-            new_sampler, inserted_indices = self.level_sampler.insert_batch(
-                sampler, levels_batch, scores_batch
+            new_sampler, seed_indices = self.level_sampler.insert_batch(
+                sampler, seed_batch, seed_scores_arr
             )
-
-            # Count actually inserted levels (index != -1 means inserted)
-            retained_count = int(jnp.sum(inserted_indices >= 0))
-            retained_rate = retained_count / total_levels_to_inject if total_levels_to_inject > 0 else 0.0
-
-            # Update train_state with new sampler
+            retained_seeds = int(jnp.sum(seed_indices >= 0))
             train_state = train_state.replace(sampler=new_sampler)
             sampler = new_sampler
+
+        # --- Insert mutations with actual SFL scores (standard buffer competition) ---
+        if mutation_levels and self.agent_evaluator is not None:
+            logger.info(f"[LLM] Scoring {len(mutation_levels)} mutations via 10-rollout SFL eval...")
+            mut_sfl_scores = []
+            for mut_level in mutation_levels:
+                traj = self.agent_evaluator.evaluate_level_multi_rollout(mut_level, n_rollouts=10)
+                p = traj.get("solve_rate", 0.0)
+                mut_sfl_scores.append(p * (1.0 - p))
+
+            mut_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *mutation_levels
+            )
+            mut_scores_arr = jnp.array(mut_sfl_scores, dtype=jnp.float32)
+            new_sampler, mut_indices = self.level_sampler.insert_batch(
+                sampler, mut_batch, mut_scores_arr
+            )
+            retained_mutations = int(jnp.sum(mut_indices >= 0))
+            train_state = train_state.replace(sampler=new_sampler)
+            sampler = new_sampler
+            logger.info(f"[LLM] Mutations: {retained_mutations}/{len(mutation_levels)} inserted "
+                        f"(mean SFL={np.mean(mut_sfl_scores):.4f})")
+        elif mutation_levels:
+            # No agent evaluator (gate disabled) — insert with max priority (legacy fallback)
+            buf_size = int(np.asarray(sampler["size"]))
+            max_score = float(np.asarray(sampler["scores"][:buf_size]).max()) if buf_size > 0 else 1.0
+            inject_score = max_score + 1e-4
+            mut_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *mutation_levels
+            )
+            mut_scores_arr = jnp.full(len(mutation_levels), inject_score, dtype=jnp.float32)
+            new_sampler, mut_indices = self.level_sampler.insert_batch(
+                sampler, mut_batch, mut_scores_arr
+            )
+            retained_mutations = int(jnp.sum(mut_indices >= 0))
+            train_state = train_state.replace(sampler=new_sampler)
+            sampler = new_sampler
+
+        retained_count = retained_seeds + retained_mutations
+        retained_rate = retained_count / total_levels_to_inject if total_levels_to_inject > 0 else 0.0
+
+        if total_levels_to_inject == 0:
+            logger.warning("[LLM] No levels accepted for injection this event")
 
         # ---------------------------------------------------------------
         # Step 6: Update counters and WandB logging
@@ -514,6 +620,8 @@ class LLMInjectionManager:
 
         log_payload = {
             "llm/injected_count": retained_count,
+            "llm/retained_seeds": retained_seeds,
+            "llm/retained_mutations": retained_mutations,
             "llm/seeds_generated": seeds_generated,
             "llm/seeds_valid": seeds_valid,
             "llm/mutations_generated": mutations_generated,
@@ -528,6 +636,10 @@ class LLMInjectionManager:
             "llm/difficulty_score_mean": float(np.mean(difficulty_scores)) if difficulty_scores else 0.0,
             "llm/gate_rejection_rate": gate_rejected / seeds_generated if seeds_generated > 0 else 0.0,
             "llm/batch_all_rejected_count": self.batch_all_rejected_count,
+            "llm/effective_difficulty_threshold": effective_threshold if effective_threshold is not None else 0.0,
+            "llm/effective_diversity_threshold": effective_diversity if effective_diversity is not None else 0.0,
+            "llm/difficulty_gate_mode": mode,
+            "llm/diversity_gate_mode": div_mode,
         }
 
         # Add wall_map hash table to log_payload for audit trail (EXPT-02)
@@ -540,15 +652,17 @@ class LLMInjectionManager:
             log_payload["llm/accepted_level_hashes"] = hash_table
 
         try:
+            log_payload["num_updates"] = current_step
             wandb.log(log_payload)
         except Exception:
             # wandb not yet initialized (e.g., dry-run tests) — log locally
             logger.info(f"[LLM] WandB unavailable, metrics: {log_payload}")
 
-        logger.info(
+        print(
             f"[LLM] Injection complete in {injection_time:.1f}s: "
             f"injected={retained_count}, acceptance={acceptance_rate:.0%}, "
-            f"retained={retained_rate:.0%}, total={self.total_injected}"
+            f"retained={retained_rate:.0%}, total={self.total_injected}",
+            flush=True
         )
 
         return (rng, train_state)

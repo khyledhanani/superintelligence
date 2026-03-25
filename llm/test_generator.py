@@ -873,9 +873,10 @@ def save_results(
 
         ax = axes[row, col]
         gt = gen_trajectories[i] if gen_trajectories and i < len(gen_trajectories) else None
+        force_accepted = bool(result.diversity_issues)
 
         # Build title with regret + diversity + solve rate
-        title = f"Accepted {i + 1}"
+        title = f"Force-Accepted {i + 1}" if force_accepted else f"Accepted {i + 1}"
         if gt:
             gi = compute_regret(gt)
             solve_str = f"solve={gt['solve_rate']:.0%}" if "solve_rate" in gt else ""
@@ -890,7 +891,8 @@ def save_results(
             positions=gt["positions"] if gt else None,
             dones=gt["dones"] if gt else None,
             color='green', title=title,
-            title_color='darkgreen', title_bold=True,
+            title_color='darkorange' if force_accepted else 'darkgreen',
+            title_bold=True,
         )
 
     # Add legend
@@ -910,7 +912,13 @@ def save_results(
         if has_both:
             legend_elements.append(Line2D([0], [0], color='orange', lw=2, label='Rejected (both)'))
     if n_gens > 0:
-        legend_elements.append(Line2D([0], [0], color='green', lw=2, label='Accepted'))
+        has_force = any(r.diversity_issues for _, r in successful)
+        has_clean = any(not r.diversity_issues for _, r in successful)
+        if has_clean:
+            legend_elements.append(Line2D([0], [0], color='green', lw=2, label='Accepted'))
+        if has_force:
+            legend_elements.append(Line2D([0], [0], color='green', lw=2, alpha=0.6,
+                                          label='Force-Accepted', linestyle='--'))
     fig.legend(handles=legend_elements, loc='lower center', ncol=len(legend_elements),
                fontsize=9, frameon=True, bbox_to_anchor=(0.5, -0.01))
 
@@ -949,14 +957,18 @@ def save_results(
             else:
                 all_colors.append('gold')
             all_markers.append('X')
-    # Accepted generated (green)
+    # Accepted generated (green, or green+red-edge for force-accepted)
+    all_force_accepted = []  # track which embedding indices are force-accepted
     if gen_trajectories:
         for i, gt in enumerate(gen_trajectories):
             if gt is not None:
                 all_trajs.append(gt)
-                all_labels.append(f"Accepted {i+1}")
+                force = bool(successful[i][1].diversity_issues) if i < len(successful) else False
+                label = f"Force-Accepted {i+1}" if force else f"Accepted {i+1}"
+                all_labels.append(label)
                 all_colors.append('green')
                 all_markers.append('*')
+                all_force_accepted.append(force)
 
     if len(all_trajs) >= 3:
         try:
@@ -1004,13 +1016,27 @@ def save_results(
                 init="random",
             ).fit_transform(dist_matrix)
 
+            # Build per-point edge colors: red edge for force-accepted
+            n_before_accepted = n_ref_in_emb + sum(1 for rc in all_rejected if rc.trajectory is not None and "dones" in rc.trajectory)
+            edge_colors = []
+            for i in range(n):
+                if i >= n_before_accepted and all_markers[i] == '*':
+                    fa_idx = i - n_before_accepted
+                    if fa_idx < len(all_force_accepted) and all_force_accepted[fa_idx]:
+                        edge_colors.append('red')
+                    else:
+                        edge_colors.append('black')
+                else:
+                    edge_colors.append('black')
+
             fig_emb, ax_emb = plt.subplots(1, 1, figsize=(7, 6))
             for i in range(n):
                 ax_emb.scatter(
                     embedding[i, 0], embedding[i, 1],
                     c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
                     marker=all_markers[i], zorder=5,
-                    edgecolors='black', linewidths=0.5,
+                    edgecolors=edge_colors[i],
+                    linewidths=2.0 if edge_colors[i] == 'red' else 0.5,
                 )
                 ax_emb.annotate(
                     all_labels[i], (embedding[i, 0], embedding[i, 1]),
@@ -1072,8 +1098,15 @@ def save_results(
                 emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='orange',
                                          markersize=8, markeredgecolor='black', label='Rej (both)'))
             if n_gens > 0:
-                emb_legend.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='green',
-                                         markersize=10, markeredgecolor='black', label='Accepted'))
+                has_force_emb = any(all_force_accepted)
+                has_clean_emb = any(not f for f in all_force_accepted)
+                if has_clean_emb:
+                    emb_legend.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='green',
+                                             markersize=10, markeredgecolor='black', label='Accepted'))
+                if has_force_emb:
+                    emb_legend.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='green',
+                                             markersize=10, markeredgecolor='red',
+                                             markeredgewidth=2, label='Force-Accepted'))
             ax_emb.legend(handles=emb_legend, loc='best', fontsize=8, framealpha=0.9)
 
             emb_path = os.path.join(run_dir, "diversity_embedding.png")
