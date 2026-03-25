@@ -1107,6 +1107,21 @@ class MazeGenerator:
             result.rejected_candidates = prev_rejected
 
             if not result.success:
+                # Regeneration failed structurally — fall back to the last
+                # valid candidate and force-accept it
+                if prev_rejected:
+                    last_valid = prev_rejected[-1]
+                    logger.info(
+                        "Regeneration failed, force-accepting last valid candidate"
+                    )
+                    result.success = True
+                    result.grid = last_valid.grid
+                    # Re-parse the level from the grid
+                    level, _ = self._parse_level(last_valid.grid)
+                    result.level = level
+                    result.gate_metrics = last_valid.gate_summary
+                    result.diversity_attempts = diversity_attempt + 1
+                    result.diversity_issues = last_valid.issues
                 break
 
         result.latency_ms = (time.time() - start) * 1000
