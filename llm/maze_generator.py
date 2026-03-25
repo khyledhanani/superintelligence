@@ -382,6 +382,9 @@ class MazeGenerator:
         Each call is a fresh session; multi-turn context is flattened.
         User prompt is piped via stdin to handle long prompts.
 
+        Uses stream-json output to work around CLI bug where --output-format json
+        returns empty result field (CLI v2.1.83+, issues #7124/#1920).
+
         Returns:
             (content, thinking) tuple. thinking is always None (CLI doesn't
             expose reasoning traces separately).
@@ -400,7 +403,8 @@ class MazeGenerator:
 
         cmd = [
             "claude", "-p", "-",  # read prompt from stdin
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",
             "--max-turns", "1",
         ]
         if system:
@@ -427,19 +431,45 @@ class MazeGenerator:
                     logger.error(f"stderr: {proc.stderr[:500]}")
                 return None, None
 
-            data = json.loads(proc.stdout)
-            content = data.get("result", "")
+            # Parse stream-json output: extract text from assistant messages,
+            # fall back to result field for older CLI versions.
+            content_parts = []
+            total_input = 0
+            total_output = 0
+            for line in proc.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if event.get("type") == "assistant":
+                    msg = event.get("message", {})
+                    for block in msg.get("content", []):
+                        if block.get("type") == "text":
+                            content_parts.append(block["text"])
+                    usage = msg.get("usage", {})
+                    total_input += usage.get("input_tokens", 0)
+                    total_output += usage.get("output_tokens", 0)
+                elif event.get("type") == "result":
+                    # Fallback for older CLI versions where result field works
+                    result_text = event.get("result", "")
+                    if result_text and not content_parts:
+                        content_parts.append(result_text)
+                    usage = event.get("usage", {})
+                    if not total_input:
+                        total_input = usage.get("input_tokens", 0)
+                    if not total_output:
+                        total_output = usage.get("output_tokens", 0)
+
+            content = "\n".join(content_parts).strip()
             if not content:
-                logger.error("claude CLI returned empty result")
+                logger.error("claude CLI returned no content in stream")
                 return None, None
 
-            # Log token usage if available
-            usage = data.get("usage", {})
-            if usage:
-                logger.info(
-                    f"Claude CLI tokens: {usage.get('input_tokens', '?')} in, "
-                    f"{usage.get('output_tokens', '?')} out"
-                )
+            if total_input or total_output:
+                logger.info(f"Claude CLI tokens: {total_input} in, {total_output} out")
 
             return content, None
         except subprocess.TimeoutExpired:
@@ -861,7 +891,19 @@ class MazeGenerator:
                 result.diversity_attempts = diversity_attempt + 1
                 break
 
-            # Classify failure reason(s)
+            if diversity_attempt >= max_diversity_retries:
+                logger.info(
+                    f"Diversity gate failed after {max_diversity_retries + 1} attempts, "
+                    f"accepting anyway"
+                )
+                result.gate_metrics = gate_result.summary
+                result.gate_pair_metrics = gate_result.pair_metrics
+                result.diversity_attempts = diversity_attempt + 1
+                result.diversity_issues = gate_result.issues
+                break
+
+            # Save rejected candidate (not saved for the last attempt that gets
+            # accepted anyway — avoids duplicate in rejected + accepted)
             _failed_difficulty = False
             _failed_diversity = False
             for iss in gate_result.issues:
@@ -869,8 +911,6 @@ class MazeGenerator:
                     _failed_diversity = True
                 else:
                     _failed_difficulty = True
-
-            # Save rejected candidate (grid + trajectory + gate info)
             result.rejected_candidates.append(RejectedCandidate(
                 grid=result.grid,
                 gate_summary=dict(gate_result.summary),
@@ -885,17 +925,6 @@ class MazeGenerator:
                              "all_returns")
                 },
             ))
-
-            if diversity_attempt >= max_diversity_retries:
-                logger.info(
-                    f"Diversity gate failed after {max_diversity_retries + 1} attempts, "
-                    f"accepting anyway"
-                )
-                result.gate_metrics = gate_result.summary
-                result.gate_pair_metrics = gate_result.pair_metrics
-                result.diversity_attempts = diversity_attempt + 1
-                result.diversity_issues = gate_result.issues
-                break
 
             # Build diversity feedback and regenerate
             logger.info(f"Diversity issues: {gate_result.issues}")
