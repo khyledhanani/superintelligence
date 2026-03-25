@@ -1,7 +1,11 @@
-"""TD error distribution divergence — task-agnostic experiential diversity.
+"""Normalized TD error distribution divergence — task-agnostic experiential diversity.
 
 Compares the distribution of TD errors (δ_t = r_t + γV(s_{t+1}) - V(s_t))
 between two trajectories using Earth Mover's Distance (Wasserstein-1).
+
+TD errors are normalized by their total absolute sum before EMD computation.
+This separates learning signal *shape* (what kind of learning) from *magnitude*
+(how much learning), since SFL learnability already captures magnitude.
 
 This is the most task-agnostic pairwise diversity metric:
 - Uses only values, rewards, and dones (any actor-critic has these)
@@ -63,10 +67,11 @@ def td_error_divergence(
     dones_b: np.ndarray,
     gamma: float = 1.0,
     n_bins: int = 50,
+    normalize: bool = True,
 ) -> Dict:
     """Compute distributional divergence of TD errors between two trajectories.
 
-    Uses Wasserstein-1 (Earth Mover's Distance) on the TD error distributions.
+    Uses Wasserstein-1 (Earth Mover's Distance) on TD error distributions.
 
     Args:
         traj_a: Trajectory dict with 'values', 'rewards' keys
@@ -75,28 +80,40 @@ def td_error_divergence(
         dones_b: Done flags for trajectory B
         gamma: Discount factor
         n_bins: Number of histogram bins (for visualization only; EMD uses raw samples)
+        normalize: If True, divide TD errors by total absolute sum before EMD
+            (isolates learning signal shape from magnitude). If False, use raw
+            TD errors (magnitude-sensitive).
 
     Returns:
         Dict with:
-            emd: float — Earth Mover's Distance between TD error distributions
-            td_errors_a: (ep_len_a,) TD errors for trajectory A
-            td_errors_b: (ep_len_b,) TD errors for trajectory B
-            mean_a, std_a: summary stats for A
-            mean_b, std_b: summary stats for B
-            histogram_a, histogram_b: (n_bins,) normalized histograms (for plotting)
+            emd: float — EMD between TD error distributions
+            td_errors_a: (ep_len_a,) raw TD errors for trajectory A
+            td_errors_b: (ep_len_b,) raw TD errors for trajectory B
+            mean_a, std_a: summary stats for A (raw)
+            mean_b, std_b: summary stats for B (raw)
+            histogram_a, histogram_b: (n_bins,) histograms
             bin_edges: (n_bins+1,) shared bin edges
     """
     td_a = compute_td_errors(traj_a["values"], traj_a["rewards"], dones_a, gamma)
     td_b = compute_td_errors(traj_b["values"], traj_b["rewards"], dones_b, gamma)
 
+    # Optionally normalize TD errors by total absolute sum
+    if normalize:
+        _EPS = 1e-8
+        total_a = max(float(np.sum(np.abs(td_a))), _EPS) if len(td_a) > 0 else _EPS
+        total_b = max(float(np.sum(np.abs(td_b))), _EPS) if len(td_b) > 0 else _EPS
+        emd_td_a = td_a / total_a
+        emd_td_b = td_b / total_b
+    else:
+        emd_td_a = td_a
+        emd_td_b = td_b
+
     # Earth Mover's Distance on sorted samples (Wasserstein-1 for 1D)
-    # W_1 = integral |F_a(x) - F_b(x)| dx, computed via sorted sample means
-    if len(td_a) == 0 or len(td_b) == 0:
+    if len(emd_td_a) == 0 or len(emd_td_b) == 0:
         emd = 0.0
     else:
-        sorted_a = np.sort(td_a)
-        sorted_b = np.sort(td_b)
-        # Interpolate both to same number of quantile points
+        sorted_a = np.sort(emd_td_a)
+        sorted_b = np.sort(emd_td_b)
         n_points = max(len(sorted_a), len(sorted_b), 200)
         quantiles = np.linspace(0, 1, n_points)
         qa = np.quantile(sorted_a, quantiles)
@@ -104,10 +121,10 @@ def td_error_divergence(
         emd = float(np.mean(np.abs(qa - qb)))
 
     # Shared histogram for visualization
-    all_td = np.concatenate([td_a, td_b]) if (len(td_a) > 0 and len(td_b) > 0) else np.array([0.0])
-    bin_edges = np.linspace(all_td.min() - 0.01, all_td.max() + 0.01, n_bins + 1)
-    hist_a = np.histogram(td_a, bins=bin_edges, density=True)[0] if len(td_a) > 0 else np.zeros(n_bins)
-    hist_b = np.histogram(td_b, bins=bin_edges, density=True)[0] if len(td_b) > 0 else np.zeros(n_bins)
+    all_emd_td = np.concatenate([emd_td_a, emd_td_b]) if (len(emd_td_a) > 0 and len(emd_td_b) > 0) else np.array([0.0])
+    bin_edges = np.linspace(all_emd_td.min() - 0.001, all_emd_td.max() + 0.001, n_bins + 1)
+    hist_a = np.histogram(emd_td_a, bins=bin_edges, density=True)[0] if len(emd_td_a) > 0 else np.zeros(n_bins)
+    hist_b = np.histogram(emd_td_b, bins=bin_edges, density=True)[0] if len(emd_td_b) > 0 else np.zeros(n_bins)
 
     return {
         "emd": emd,

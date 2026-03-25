@@ -95,15 +95,19 @@ def select_references(
     size: int,
     n: int = 3,
     strategy: str = "top_regret",
+    difficulty_metric: str = "regret",
 ) -> list:
     """Select reference mazes from the buffer.
 
     Args:
         tokens: (capacity, 52) token array
-        scores: (capacity,) score array
+        scores: (capacity,) score array (regret)
         size: number of active levels
         n: number of references to select
-        strategy: "top_regret", "random", or "diverse"
+        strategy: "top_regret", "random"
+        difficulty_metric: "regret" (higher=harder) or "sfl" (mid-range=harder).
+            For "sfl", score is converted to learnability p*(1-p) using
+            a regret-to-solve-rate heuristic.
 
     Returns:
         List of (index, tokens, score) tuples
@@ -111,16 +115,22 @@ def select_references(
     active_tokens = tokens[:size]
     active_scores = scores[:size]
 
+    # Convert scores to difficulty ranking based on metric
+    if difficulty_metric == "sfl":
+        # Heuristic: map regret to approximate solve rate, then compute learnability
+        # High regret (~1.0+) ≈ solvable but hard (p~0.5), low regret (~0) ≈ easy (p~1.0)
+        # Negative regret ≈ unsolvable (p~0.0)
+        max_regret = max(float(np.max(active_scores)), 1e-8)
+        approx_solve_rate = np.clip(1.0 - active_scores / max_regret, 0, 1)
+        difficulty_scores = approx_solve_rate * (1.0 - approx_solve_rate)  # SFL: p*(1-p)
+    else:
+        difficulty_scores = active_scores
+
     if strategy == "top_regret":
-        # Top n by score (regret)
-        top_indices = np.argsort(active_scores)[::-1][:n]
+        # Top n by difficulty score
+        top_indices = np.argsort(difficulty_scores)[::-1][:n]
     elif strategy == "random":
         top_indices = np.random.choice(size, min(n, size), replace=False)
-    elif strategy == "diverse":
-        # Spread across score range: pick from quartiles
-        sorted_idx = np.argsort(active_scores)
-        step = max(1, len(sorted_idx) // n)
-        top_indices = sorted_idx[::step][:n]
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -137,13 +147,16 @@ def select_references_diverse(
     evaluator,
     n: int = 3,
     pool_size: int = 20,
-    metric: str = "td_error_emd",
+    metric: str = "normalized_td_error_emd",
+    buffer_td_errors_path: str = None,
+    min_difficulty_mask: np.ndarray = None,
 ) -> list:
     """Select maximally diverse references using pairwise trajectory metrics.
 
-    Picks a candidate pool (top by regret), runs agent rollouts, computes
-    pairwise diversity, and greedily selects N references that maximize
-    the minimum pairwise distance.
+    If precomputed buffer TD errors are available and metric is
+    normalized_td_error_emd, selects from ALL buffer levels using the
+    precomputed data (no rollouts needed for selection). Otherwise falls
+    back to rollout-based selection on a candidate pool.
 
     Args:
         tokens: (capacity, 52) token array
@@ -151,15 +164,147 @@ def select_references_diverse(
         size: number of active levels
         evaluator: AgentEvaluator instance (already loaded)
         n: number of references to select
-        pool_size: candidate pool size (top by regret)
-        metric: pairwise metric to maximize. One of:
-            "td_error_emd" — Earth Mover's Distance between TD error distributions
-            "experience_divergence" — KL divergence between mode transition matrices
-            "position_dtw" — spatial path DTW distance
+        pool_size: candidate pool size (fallback only)
+        metric: pairwise metric to maximize
+        buffer_td_errors_path: path to precomputed buffer TD errors .npz
+        min_difficulty_mask: (size,) bool mask — True for levels that pass
+            the difficulty filter. None = no filter (all levels eligible).
 
     Returns:
         List of (index, tokens, score) tuples
     """
+    active_scores = scores[:size]
+
+    # Fast path: use precomputed TD errors to select from all buffer levels
+    if (buffer_td_errors_path and os.path.exists(buffer_td_errors_path)
+            and metric in ("normalized_td_error_emd", "td_error_emd")):
+        return _select_diverse_from_precomputed(
+            tokens, active_scores, size, n, buffer_td_errors_path,
+            min_difficulty_mask=min_difficulty_mask,
+            normalize=(metric == "normalized_td_error_emd"),
+        )
+
+    # Fallback: rollout-based selection on a candidate pool
+    return _select_diverse_from_rollouts(
+        tokens, active_scores, size, evaluator, n, pool_size, metric,
+    )
+
+
+def _select_diverse_from_precomputed(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    n: int,
+    buffer_td_errors_path: str,
+    min_difficulty_mask: np.ndarray = None,
+    normalize: bool = True,
+) -> list:
+    """Select N maximally diverse references from all buffer levels using precomputed TD errors."""
+    import time
+    t0 = time.time()
+
+    buf_data = np.load(buffer_td_errors_path)
+    buf_td_padded = buf_data["td_errors"]    # (N_precomputed, max_len)
+    buf_ep_lens = buf_data["ep_lens"]         # (N_precomputed,)
+    buf_indices = buf_data["indices"]          # (N_precomputed,) buffer indices
+    n_precomputed = len(buf_ep_lens)
+
+    # Only use levels that are within the active buffer range
+    valid_mask = buf_indices < size
+    # Filter out degenerate short episodes — they have fundamentally different
+    # TD error profiles (few data points) and dominate greedy max-min selection
+    MIN_EP_LEN = 40
+    valid_mask &= buf_ep_lens >= MIN_EP_LEN
+    # Apply difficulty filter if provided
+    if min_difficulty_mask is not None:
+        for i in range(n_precomputed):
+            if valid_mask[i]:
+                buf_idx = buf_indices[i]
+                if not min_difficulty_mask[buf_idx]:
+                    valid_mask[i] = False
+    valid_positions = np.where(valid_mask)[0]
+    n_valid = len(valid_positions)
+    n_short = int(np.sum((buf_indices < size) & (buf_ep_lens < MIN_EP_LEN)))
+    filter_parts = [f"ep_len>={MIN_EP_LEN}"]
+    if min_difficulty_mask is not None:
+        filter_parts.append("difficulty-filtered")
+    filter_label = f" ({', '.join(filter_parts)})"
+    short_msg = f" ({n_short} short episodes excluded)" if n_short > 0 else ""
+    logger.info(f"Diverse selection: {n_valid} levels from precomputed TD errors{filter_label}{short_msg}")
+
+    # Precompute quantile representations for fast EMD
+    n_quant = 200
+    quantiles = np.linspace(0, 1, n_quant)
+    quant_matrix = np.zeros((n_valid, n_quant))
+    for i, pos in enumerate(valid_positions):
+        td = buf_td_padded[pos, :buf_ep_lens[pos]].copy()
+        if normalize:
+            total = max(float(np.sum(np.abs(td))), 1e-8)
+            td = td / total
+        quant_matrix[i] = np.quantile(np.sort(td), quantiles)
+
+    # Vectorized pairwise distance matrix in row-chunks to limit memory
+    # Full broadcast (N, N, 200) would be ~24 GB for N=4000; chunking keeps it ~few hundred MB
+    dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+    chunk_size = max(1, min(500, n_valid))
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        # (chunk, 1, 200) - (1, N, 200) -> (chunk, N, 200) -> mean -> (chunk, N)
+        dist_matrix[start:end] = np.mean(
+            np.abs(quant_matrix[start:end, np.newaxis, :] - quant_matrix[np.newaxis, :, :]),
+            axis=2,
+        )
+
+    # Start with the globally most distant pair
+    np.fill_diagonal(dist_matrix, 0)
+    flat_idx = np.argmax(dist_matrix)
+    best_i, best_j = np.unravel_index(flat_idx, dist_matrix.shape)
+    selected = [int(best_i), int(best_j)]
+
+    # Greedy: add level that maximizes min distance to selected set
+    # Track min-distance-to-selected for all candidates (vectorized)
+    min_dist_to_selected = np.minimum(dist_matrix[best_i], dist_matrix[best_j])
+    min_dist_to_selected[best_i] = -1
+    min_dist_to_selected[best_j] = -1
+
+    while len(selected) < n and len(selected) < n_valid:
+        best_next = int(np.argmax(min_dist_to_selected))
+        if min_dist_to_selected[best_next] <= 0:
+            break
+        selected.append(best_next)
+        # Update min distances with the newly selected level
+        min_dist_to_selected = np.minimum(min_dist_to_selected, dist_matrix[best_next])
+        min_dist_to_selected[best_next] = -1
+
+    elapsed = time.time() - t0
+
+    # Log selection
+    refs = []
+    for i, s in enumerate(selected):
+        buf_pos = valid_positions[s]
+        idx = int(buf_indices[buf_pos])
+        regret = float(active_scores[idx])
+        min_d = float(min(dist_matrix[s, o] for o in selected if o != s))
+        logger.info(
+            f"  Diverse ref {i+1}: buffer idx={idx}, "
+            f"regret={regret:.4f}, min_dist={min_d:.4f}"
+        )
+        refs.append((idx, tokens[idx], regret))
+
+    logger.info(f"Diverse selection complete in {elapsed:.1f}s")
+    return refs
+
+
+def _select_diverse_from_rollouts(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    evaluator,
+    n: int,
+    pool_size: int,
+    metric: str,
+) -> list:
+    """Fallback: select diverse references via agent rollouts on a candidate pool."""
     from metrics.pairwise.td_error_distribution import td_error_divergence
     from metrics.pairwise.mode_transition import (
         mode_transition_divergence,
@@ -167,12 +312,13 @@ def select_references_diverse(
     )
     from metrics.pairwise.pos_dtw import position_trace_dtw
 
-    active_scores = scores[:size]
     pool_k = min(pool_size, size)
 
-    # Candidate pool: top by regret
-    pool_indices = np.argsort(active_scores)[::-1][:pool_k]
-    logger.info(f"Diverse selection: pool of {pool_k} candidates, metric={metric}")
+    # Candidate pool: stratified across the full score range
+    sorted_idx = np.argsort(active_scores)
+    step = max(1, size // pool_k)
+    pool_indices = sorted_idx[::step][:pool_k]
+    logger.info(f"Diverse selection (rollout fallback): pool of {len(pool_indices)} candidates, metric={metric}")
 
     # Roll out agent on candidate pool
     pool_levels = [tokens_to_level_obj(tokens[i]) for i in pool_indices]
@@ -193,7 +339,7 @@ def select_references_diverse(
     for i in range(pool_k):
         for j in range(i + 1, pool_k):
             ti, tj = pool_trajectories[i], pool_trajectories[j]
-            if metric == "td_error_emd":
+            if metric == "normalized_td_error_emd":
                 result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
                 d = result["emd"]
             elif metric == "experience_divergence":
@@ -215,7 +361,6 @@ def select_references_diverse(
             dist[j, i] = d
 
     # Greedy selection: maximize minimum pairwise distance
-    # Start with the pair that has the highest distance
     best_pair = np.unravel_index(np.argmax(dist), dist.shape)
     selected = [best_pair[0], best_pair[1]]
 
@@ -225,7 +370,6 @@ def select_references_diverse(
         for candidate in range(pool_k):
             if candidate in selected:
                 continue
-            # Min distance from candidate to any already-selected
             min_d = min(dist[candidate, s] for s in selected)
             if min_d > best_min_dist:
                 best_min_dist = min_d
@@ -393,6 +537,26 @@ def build_references_with_metrics(
                     metric_key="value_error",
                 ))
 
+            # Normalized TD error (fraction of total learning at each step)
+            if _enabled(pm, "normalized_td_error"):
+                from metrics.pairwise.td_error_distribution import compute_td_errors
+                td_errs = compute_td_errors(traj["values"], traj["rewards"], traj["dones"])
+                if len(td_errs) > 0:
+                    total = max(float(np.sum(np.abs(td_errs))), 1e-8)
+                    norm_td = td_errs / total
+                    ds_norm_td = downsample(norm_td, downsample_points)
+                    metrics.append(MetricEntry(
+                        name="Normalized TD Error",
+                        value=format_vector(ds_norm_td),
+                        description=(
+                            f"Fraction of total learning signal at each step "
+                            f"(δ_t/Σ|δ|). Spikes = steps where most learning happens "
+                            f"(ep_len={len(td_errs)}, total |δ|={total:.4f})"
+                        ),
+                        higher_is="larger fraction of learning concentrated at this step",
+                        metric_key="normalized_td_error",
+                    ))
+
             # Position vector
             if _enabled(pm, "position_vector"):
                 from metrics.utils import truncate_at_done
@@ -494,9 +658,9 @@ def build_references_with_metrics(
                 pairwise_metrics.append(PairwiseMetricEntry(
                     maze_a_label=references[i].label,
                     maze_b_label=references[j].label,
-                    name="TD Error EMD",
+                    name="Normalized TD Error EMD",
                     value=td_result["emd"],
-                    description="Earth Mover's Distance between TD error distributions (higher = more different learning signals)",
+                    description="Normalized EMD between TD error distributions — shape only, magnitude handled by SFL (higher = more different learning signals)",
                     metric_key="td_error",
                 ))
 
@@ -627,7 +791,11 @@ def save_results(
     run_dir: str,
     ref_trajectories: list = None,
     gen_trajectories: list = None,
-    embedding_metric: str = "td_error_emd",
+    embedding_metric: str = "normalized_td_error_emd",
+    buffer_td_errors_path: str = None,
+    buffer_embed_samples: int = 200,
+    buffer_scores: np.ndarray = None,
+    difficulty_metric: str = "regret",
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
 
@@ -976,9 +1144,12 @@ def save_results(
 
             def _pairwise_distance(t1, t2, metric):
                 """Compute pairwise distance between two trajectories."""
-                if metric == "td_error_emd":
+                if metric in ("normalized_td_error_emd", "td_error_emd"):
                     from metrics.pairwise.td_error_distribution import td_error_divergence
-                    return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
+                    return td_error_divergence(
+                        t1, t1["dones"], t2, t2["dones"],
+                        normalize=(metric == "normalized_td_error_emd"),
+                    )["emd"]
                 elif metric == "experience_divergence":
                     from metrics.pairwise.mode_transition import mode_transition_divergence
                     return mode_transition_divergence(
@@ -995,21 +1166,110 @@ def save_results(
                     return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
 
             _emb_label = {
+                "normalized_td_error_emd": "Normalized TD Error EMD",
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
             }.get(_emb_metric, _emb_metric)
+            _emb_normalize = (_emb_metric == "normalized_td_error_emd")
 
-            n = len(all_trajs)
-            dist_matrix = np.zeros((n, n))
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = _pairwise_distance(all_trajs[i], all_trajs[j], _emb_metric)
-                    dist_matrix[i, j] = d
-                    dist_matrix[j, i] = d
+            # Load precomputed buffer TD errors if available
+            buf_quant_matrix = None  # (n_buf, 200) quantile matrix
+            n_buf = 0
+            _N_QUANT = 200
+            _quantiles = np.linspace(0, 1, _N_QUANT)
+            if (buffer_td_errors_path and os.path.exists(buffer_td_errors_path)
+                    and _emb_metric in ("normalized_td_error_emd", "td_error_emd")
+                    and buffer_embed_samples != 0):
+                buf_data = np.load(buffer_td_errors_path)
+                buf_td_padded = buf_data["td_errors"]   # (N, max_len)
+                buf_ep_lens = buf_data["ep_lens"]        # (N,)
+                n_total_buf = len(buf_ep_lens)
+                # Subsample unless -1 (all)
+                if buffer_embed_samples == -1:
+                    max_buf = n_total_buf
+                else:
+                    max_buf = buffer_embed_samples
+                if n_total_buf > max_buf:
+                    np.random.seed(42)
+                    buf_sample_idx = np.sort(np.random.choice(n_total_buf, max_buf, replace=False))
+                else:
+                    buf_sample_idx = np.arange(n_total_buf)
+                n_buf = len(buf_sample_idx)
+                # Build quantile matrix for buffer levels
+                buf_quant_matrix = np.zeros((n_buf, _N_QUANT))
+                for i, idx in enumerate(buf_sample_idx):
+                    td = buf_td_padded[idx, :buf_ep_lens[idx]]
+                    if _emb_normalize:
+                        total = max(float(np.sum(np.abs(td))), 1e-8)
+                        td = td / total
+                    buf_quant_matrix[i] = np.quantile(np.sort(td), _quantiles)
+                # Build difficulty mask for buffer dots coloring
+                buf_difficulty_pass = None
+                buf_data_indices = buf_data["indices"] if "indices" in buf_data.files else None
+                if buffer_scores is not None and buf_data_indices is not None:
+                    buf_sampled_scores = buffer_scores[buf_data_indices[buf_sample_idx]]
+                    if difficulty_metric == "sfl":
+                        max_r = max(float(np.max(buffer_scores)), 1e-8)
+                        approx_p = np.clip(1.0 - buf_sampled_scores / max_r, 0, 1)
+                        diff_scores = approx_p * (1.0 - approx_p)
+                        all_p = np.clip(1.0 - buffer_scores / max_r, 0, 1)
+                        mean_diff = float(np.mean(all_p * (1.0 - all_p)))
+                    else:
+                        diff_scores = buf_sampled_scores
+                        mean_diff = float(np.mean(buffer_scores))
+                    buf_difficulty_pass = diff_scores >= mean_diff
+                    n_pass = int(np.sum(buf_difficulty_pass))
+                    logger.info(f"Buffer embedding: {n_pass}/{n_buf} dots pass difficulty filter")
+                logger.info(f"Loaded {n_buf} buffer TD error profiles for embedding (from {n_total_buf} total)")
+
+            # Build quantile matrix for foreground trajectories
+            fg_quant_matrix = None
+            if _emb_metric in ("normalized_td_error_emd", "td_error_emd"):
+                from metrics.pairwise.td_error_distribution import compute_td_errors as _compute_td
+                n_fg = len(all_trajs)
+                fg_quant_matrix = np.zeros((n_fg, _N_QUANT))
+                for i, t in enumerate(all_trajs):
+                    td = _compute_td(t["values"], t["rewards"], t["dones"], gamma=1.0)
+                    if _emb_normalize:
+                        total = max(float(np.sum(np.abs(td))), 1e-8)
+                        td = td / total
+                    fg_quant_matrix[i] = np.quantile(np.sort(td), _quantiles)
+
+            n_fg = len(all_trajs)
+            n_total = n_fg + n_buf
+
+            def _chunked_pairwise_emd(quant_mat):
+                """Compute pairwise EMD matrix from quantile matrix, chunked to limit memory."""
+                n = len(quant_mat)
+                dm = np.zeros((n, n), dtype=np.float32)
+                chunk = max(1, min(500, n))
+                for start in range(0, n, chunk):
+                    end = min(start + chunk, n)
+                    dm[start:end] = np.mean(
+                        np.abs(quant_mat[start:end, np.newaxis, :] - quant_mat[np.newaxis, :, :]),
+                        axis=2,
+                    )
+                return dm
+
+            if fg_quant_matrix is not None and n_buf > 0:
+                # Vectorized: combine foreground + buffer quantile matrices
+                all_quant = np.vstack([fg_quant_matrix, buf_quant_matrix])  # (n_total, 200)
+                dist_matrix = _chunked_pairwise_emd(all_quant)
+            elif fg_quant_matrix is not None:
+                # No buffer — vectorize foreground only
+                dist_matrix = _chunked_pairwise_emd(fg_quant_matrix)
+            else:
+                # Non-EMD metric — loop-based foreground distances
+                dist_matrix = np.zeros((n_total, n_total))
+                for i in range(n_fg):
+                    for j in range(i + 1, n_fg):
+                        d = _pairwise_distance(all_trajs[i], all_trajs[j], _emb_metric)
+                        dist_matrix[i, j] = d
+                        dist_matrix[j, i] = d
 
             # t-SNE on precomputed distance matrix
-            perplexity = min(5, n - 1)
+            perplexity = min(30 if n_buf > 0 else 5, n_total - 1)
             embedding = TSNE(
                 n_components=2, metric="precomputed",
                 perplexity=perplexity, random_state=42,
@@ -1019,7 +1279,7 @@ def save_results(
             # Build per-point edge colors: red edge for force-accepted
             n_before_accepted = n_ref_in_emb + sum(1 for rc in all_rejected if rc.trajectory is not None and "dones" in rc.trajectory)
             edge_colors = []
-            for i in range(n):
+            for i in range(n_fg):
                 if i >= n_before_accepted and all_markers[i] == '*':
                     fa_idx = i - n_before_accepted
                     if fa_idx < len(all_force_accepted) and all_force_accepted[fa_idx]:
@@ -1029,8 +1289,36 @@ def save_results(
                 else:
                     edge_colors.append('black')
 
-            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(7, 6))
-            for i in range(n):
+            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(8, 7) if n_buf > 0 else (7, 6))
+
+            # Plot buffer background dots first (behind everything)
+            if n_buf > 0:
+                buf_emb = embedding[n_fg:]
+                if buf_difficulty_pass is not None:
+                    # Two colors: blue = passes difficulty filter, yellow = filtered out
+                    pass_mask = buf_difficulty_pass
+                    fail_mask = ~pass_mask
+                    if np.any(fail_mask):
+                        ax_emb.scatter(
+                            buf_emb[fail_mask, 0], buf_emb[fail_mask, 1],
+                            c='khaki', s=10, marker='o', zorder=1,
+                            alpha=0.4, edgecolors='none',
+                        )
+                    if np.any(pass_mask):
+                        ax_emb.scatter(
+                            buf_emb[pass_mask, 0], buf_emb[pass_mask, 1],
+                            c='lightsteelblue', s=12, marker='o', zorder=2,
+                            alpha=0.5, edgecolors='none',
+                        )
+                else:
+                    ax_emb.scatter(
+                        buf_emb[:, 0], buf_emb[:, 1],
+                        c='lightsteelblue', s=12, marker='o', zorder=1,
+                        alpha=0.5, edgecolors='none',
+                    )
+
+            # Plot foreground points
+            for i in range(n_fg):
                 ax_emb.scatter(
                     embedding[i, 0], embedding[i, 1],
                     c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
@@ -1059,9 +1347,9 @@ def save_results(
                     fontsize=7, color='black', fontweight='bold',
                 )
 
-            # Draw edges with distance labels for nearest pairs
-            for i in range(n):
-                for j in range(i + 1, n):
+            # Draw edges between foreground points only (not buffer)
+            for i in range(n_fg):
+                for j in range(i + 1, n_fg):
                     ax_emb.plot(
                         [embedding[i, 0], embedding[j, 0]],
                         [embedding[i, 1], embedding[j, 1]],
@@ -1078,12 +1366,24 @@ def save_results(
 
             # Legend
             from matplotlib.lines import Line2D
-            emb_legend = [
+            emb_legend = []
+            if n_buf > 0:
+                if buf_difficulty_pass is not None:
+                    n_pass = int(np.sum(buf_difficulty_pass))
+                    n_fail = n_buf - n_pass
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='lightsteelblue',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer pass ({n_pass})'))
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='khaki',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer fail ({n_fail})'))
+                else:
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='lightsteelblue',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer ({n_buf})'))
+            emb_legend.extend([
                 Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
                        markersize=8, markeredgecolor='black', label='Reference'),
                 Line2D([0], [0], marker='D', color='w', markerfacecolor='black',
                        markersize=8, markeredgecolor='white', label='Ref Centroid'),
-            ]
+            ])
             # Only add legend entries for failure types present
             has_diff = any(rc.failed_difficulty and not rc.failed_diversity for rc in all_rejected)
             has_div = any(rc.failed_diversity and not rc.failed_difficulty for rc in all_rejected)
@@ -1135,22 +1435,45 @@ def run_test(args):
 
     # Load agent early if needed for diverse selection or metrics
     evaluator = None
-    if args.inject_metrics or args.strategy == "diverse":
+    if args.inject_metrics or args.strategy in ("diverse", "hybrid"):
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
         evaluator = AgentEvaluator(args.agent_dir, num_steps=args.num_steps)
 
     # Select reference mazes
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
-    if args.strategy == "diverse" and evaluator is not None:
+    if args.strategy in ("diverse", "hybrid") and evaluator is not None:
+        # Build difficulty mask for hybrid strategy
+        difficulty_mask = None
+        if args.strategy == "hybrid":
+            active_scores = scores[:size]
+            if args.difficulty_metric == "sfl":
+                max_regret = max(float(np.max(active_scores)), 1e-8)
+                approx_p = np.clip(1.0 - active_scores / max_regret, 0, 1)
+                difficulty_scores = approx_p * (1.0 - approx_p)
+            else:
+                difficulty_scores = active_scores
+            mean_diff = float(np.mean(difficulty_scores))
+            difficulty_mask = difficulty_scores >= mean_diff
+            n_pass = int(np.sum(difficulty_mask))
+            logger.info(
+                f"Hybrid filter ({args.difficulty_metric}): "
+                f"{n_pass}/{size} levels above mean ({mean_diff:.4f})"
+            )
         ref_data = select_references_diverse(
             tokens, scores, size, evaluator,
             n=args.num_refs,
             pool_size=args.diverse_pool_size,
             metric=args.diverse_metric,
+            buffer_td_errors_path=args.buffer_td_errors,
+            min_difficulty_mask=difficulty_mask,
         )
     else:
-        ref_data = select_references(tokens, scores, size, n=args.num_refs, strategy=args.strategy)
+        ref_data = select_references(
+            tokens, scores, size, n=args.num_refs,
+            strategy=args.strategy,
+            difficulty_metric=args.difficulty_metric,
+        )
 
     # Roll out agent on selected reference levels to get trajectory data
     ref_trajectories = None
@@ -1388,6 +1711,10 @@ def run_test(args):
         ref_trajectories=ref_trajectories,
         gen_trajectories=gen_trajectories,
         embedding_metric=args.embedding_metric,
+        buffer_td_errors_path=args.buffer_td_errors,
+        buffer_embed_samples=args.buffer_embed_samples,
+        buffer_scores=scores[:size],
+        difficulty_metric=args.difficulty_metric,
     )
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    - maze_XXX.txt files (ASCII grids)")
@@ -1449,13 +1776,13 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse"],
+    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse", "hybrid"],
                         default=cfg.get("strategy"),
-                        help="Reference selection strategy")
+                        help="Reference selection strategy (hybrid = above-mean difficulty + max diversity)")
     parser.add_argument("--diverse-metric",
-                        choices=["td_error_emd", "experience_divergence", "position_dtw"],
-                        default=cfg.get("diverse_metric", "td_error_emd"),
-                        help="Pairwise metric for diverse strategy")
+                        choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw"],
+                        default=cfg.get("diverse_metric", cfg.get("gate", {}).get("diversity_metric", "td_error_emd")),
+                        help="Pairwise metric for diverse/hybrid selection (defaults to gate diversity_metric)")
     parser.add_argument("--diverse-pool-size", type=int,
                         default=cfg.get("diverse_pool_size", 20),
                         help="Candidate pool size for diverse strategy")
@@ -1546,13 +1873,18 @@ def main():
                         default=gate_cfg.get("min_diversity", cfg.get("min_diversity")),
                         help="Min mean pairwise diversity vs references (null = disabled)")
     parser.add_argument("--diversity-metric",
-                        choices=["td_error_emd", "experience_divergence", "position_dtw", "cenie"],
-                        default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "td_error_emd")),
-                        help="Diversity metric: pairwise (td_error_emd, experience_divergence, position_dtw) or buffer-wide (cenie)")
+                        choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", "cenie"],
+                        default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "normalized_td_error_emd")),
+                        help="Diversity metric: pairwise (normalized_td_error_emd, experience_divergence, position_dtw) or buffer-wide (cenie)")
     parser.add_argument("--embedding-metric",
-                        choices=["td_error_emd"],
-                        default=cfg.get("embedding_metric", "td_error_emd"),
+                        choices=["td_error_emd", "normalized_td_error_emd"],
+                        default=cfg.get("embedding_metric", "normalized_td_error_emd"),
                         help="Pairwise metric for t-SNE diversity embedding plot")
+    parser.add_argument("--buffer-td-errors", default=cfg.get("buffer_td_errors"),
+                        help="Path to precomputed buffer TD errors .npz (from precompute_buffer_embeddings.py)")
+    parser.add_argument("--buffer-embed-samples", type=int,
+                        default=cfg.get("buffer_embed_samples", 200),
+                        help="Buffer levels to include in embedding (0=none, -1=all, default=200)")
 
     # Mode
     parser.add_argument("--dry-run", action="store_true",

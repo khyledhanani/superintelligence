@@ -39,12 +39,12 @@ class DiversityThresholds:
     (skips computation and feedback).
 
     difficulty_metric: "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
-    diversity_metric: "td_error_emd", "experience_divergence", "position_dtw", or "cenie"
+    diversity_metric: "normalized_td_error_emd", "experience_divergence", "position_dtw", or "cenie"
     """
     difficulty_threshold: Optional[float] = None  # Min difficulty score to accept
     difficulty_metric: str = "regret"             # "regret" or "sfl"
     min_diversity: Optional[float] = 0.04         # pairwise diversity vs references
-    diversity_metric: str = "td_error_emd"        # "td_error_emd", "experience_divergence", "position_dtw"
+    diversity_metric: str = "normalized_td_error_emd"  # "normalized_td_error_emd", "experience_divergence", "position_dtw"
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ def _compute_pairwise_diversity(
     Args:
         candidate_trajectory: Candidate trajectory dict
         reference_trajectory: Reference trajectory dict
-        metric: One of "td_error_emd", "experience_divergence", "position_dtw"
+        metric: One of "normalized_td_error_emd", "experience_divergence", "position_dtw"
         baseline_stats: For experience_divergence, mode classification thresholds
 
     Returns:
@@ -111,9 +111,12 @@ def _compute_pairwise_diversity(
     cand = candidate_trajectory
     ref = reference_trajectory
 
-    if metric == "td_error_emd":
+    if metric in ("normalized_td_error_emd", "td_error_emd"):
         from metrics.pairwise.td_error_distribution import td_error_divergence
-        result = td_error_divergence(cand, cand["dones"], ref, ref["dones"])
+        result = td_error_divergence(
+            cand, cand["dones"], ref, ref["dones"],
+            normalize=(metric == "normalized_td_error_emd"),
+        )
         return result["emd"]
 
     elif metric == "experience_divergence":
@@ -275,6 +278,7 @@ def evaluate_candidate(
         min_dist = min(distances)
         if min_dist < thresholds.min_diversity:
             metric_name = {
+                "normalized_td_error_emd": "Normalized TD Error EMD",
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
