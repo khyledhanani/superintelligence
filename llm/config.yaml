@@ -69,7 +69,7 @@ gate:
   difficulty_metric: regret     # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
                                 #   regret: rejects too-easy mazes (threshold ~0.6, buffer max 0.475)
                                 #   sfl: rejects too-easy AND too-hard mazes (threshold ~0.1, max at p=0.5 is 0.25)
-  min_diversity: 0.02           # Min distance to closest reference (calibrated: buffer median=0.02, 90th pctile=0.04)
+  min_diversity: 0.015          # Min distance to closest reference
   diversity_metric: td_error_emd  # "td_error_emd", "experience_divergence", "position_dtw", or "cenie"
 
 # --- Visualization ---

@@ -1146,6 +1146,10 @@ class MazeGenerator:
     ) -> List[GenerationResult]:
         """Generate multiple mazes with metric feedback loop.
 
+        Each accepted maze is added to the reference set so subsequent
+        generations are diverse from both the buffer AND previously
+        generated mazes in this batch.
+
         Args:
             n: Number of mazes to generate
             (other args same as generate_with_feedback())
@@ -1153,14 +1157,19 @@ class MazeGenerator:
         Returns:
             List of GenerationResult objects
         """
+        # Copy reference lists so we can grow them without mutating the originals
+        ref_trajs = list(reference_trajectories) if reference_trajectories else []
+        ref_labels = list(reference_labels) if reference_labels else []
+        refs = list(references) if references else []
+
         results = []
         for i in range(n):
-            logger.info(f"Generating maze {i+1}/{n} (with feedback)...")
+            logger.info(f"Generating maze {i+1}/{n} (with feedback, {len(ref_labels)} references)...")
             result = self.generate_with_feedback(
                 agent_evaluator=agent_evaluator,
-                reference_trajectories=reference_trajectories,
-                reference_labels=reference_labels,
-                references=references,
+                reference_trajectories=ref_trajs,
+                reference_labels=ref_labels,
+                references=refs,
                 pairwise_metrics=pairwise_metrics,
                 global_metrics=global_metrics,
                 instruction=instruction,
@@ -1172,6 +1181,38 @@ class MazeGenerator:
                 cenie_model=cenie_model,
             )
             results.append(result)
+
+            # Add accepted maze to reference set for subsequent generations
+            if result.success and result.level is not None:
+                gen_label = f"Gen {i + 1}"
+                logger.info(f"Adding {gen_label} to reference set for next generation")
+
+                # Run agent to get trajectory for the new reference
+                gen_traj = agent_evaluator.evaluate_level_multi_rollout(
+                    result.level, n_rollouts=n_rollouts,
+                )
+                ref_trajs.append(gen_traj)
+                ref_labels.append(gen_label)
+
+                # Build a minimal ReferenceMaze for the prompt
+                gen_ref = ReferenceMaze(
+                    grid=result.grid,
+                    label=gen_label,
+                    metrics=[MetricEntry(
+                        name="Scalar Regret",
+                        value=result.gate_metrics.get("regret", 0.0) if result.gate_metrics else 0.0,
+                        description="Previously generated maze",
+                        metric_key="scalar_regret",
+                    )],
+                )
+                # Add path overlay if possible
+                try:
+                    from metrics.utils import truncate_at_done
+                    ep_pos = truncate_at_done(gen_traj["positions"], gen_traj["dones"])
+                    gen_ref.path_overlay = overlay_path_on_grid(result.grid, ep_pos)
+                except Exception:
+                    pass
+                refs.append(gen_ref)
 
         successes = sum(1 for r in results if r.success)
         logger.info(f"Feedback batch complete: {successes}/{n} successful")
