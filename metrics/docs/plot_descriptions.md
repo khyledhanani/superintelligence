@@ -57,18 +57,18 @@ Same column layout as Figure 4.
 
 ---
 
-## Figure 6: TD Error Distribution Deep-Dive
+## Figure 6: Normalized TD Error Distribution Deep-Dive
 
 **File:** `plots_deepdive_td_error.png`
 
-Ranked by Earth Mover's Distance between TD error distributions — the most task-agnostic diversity metric (uses only values, rewards, dones).
+Ranked by Normalized Earth Mover's Distance between TD error distributions — the most task-agnostic diversity metric (uses only values, rewards, dones). TD errors are normalized by their total absolute sum before comparison, isolating learning signal *shape* from *magnitude* (since SFL learnability handles magnitude).
 
 Seven columns:
 - **Col 1-2:** Maze grids with agent paths.
 - **Col 3:** TD error time series (δ_t = r_t + γV(s_{t+1}) - V(s_t)) for both levels overlaid. Dashed line at 0.
-- **Col 4:** TD error histograms (overlaid density plots) with EMD value in title.
-- **Col 5:** Empirical cumulative distribution functions (ECDFs). The area between the two curves IS the EMD.
+- **Col 4:** Normalized TD error histograms (overlaid density plots) with EMD value in title.
+- **Col 5:** Empirical cumulative distribution functions (ECDFs) of normalized TD errors. The area between the two curves IS the EMD.
 - **Col 6:** Absolute TD error |δ_t| over time — learning magnitude regardless of sign.
 - **Col 7:** TD error sign balance — horizontal bars showing what fraction of steps have positive (underestimate) vs negative (overestimate) TD errors.
 
-**What to look for:** The most similar pair should have overlapping histograms and CDFs (low EMD). The most different pair should show clearly separated distributions. The time series (col 3) shows *when* the learning signal differs; the histogram (col 4) collapses that into *what kind* of learning signals differ. The sign balance (col 7) reveals whether one maze consistently under/overestimates while the other doesn't.
+**What to look for:** The most similar pair should have overlapping normalized histograms and CDFs (low EMD). The most different pair should show clearly separated distributions. The time series (col 3) shows *when* the learning signal differs; the histogram (col 4) collapses that into *what shape* of learning signals differ. The sign balance (col 7) reveals whether one maze consistently under/overestimates while the other doesn't.

@@ -195,6 +195,58 @@ The `--strategy diverse` reference selection uses precomputed TD errors (`buffer
 
 
 
+---
+
+## LSTM Embedding as Diversity Metric
+
+### Motivation
+
+TD error EMD collapses each timestep to a single scalar (how wrong the value prediction was) and then collapses the time series to a distribution. It cannot distinguish *why* the agent was surprised — a dead end vs an unexpected shortcut can produce identical TD error distributions.
+
+The LSTM hidden state (256-dim) is the agent's full compressed representation at each step. It encodes spatial memory, navigation history, and learned expectations. Two mazes that produce different embedding trajectories are genuinely different *from the agent's perspective*, capturing the "why" that TD error loses.
+
+### Implementation: `metrics/pairwise/embedding_divergence.py`
+
+**Per-dimension quantile EMD:** For each of the 257 dimensions (256 LSTM + 1 action) independently:
+1. Extract per-step values for the episode → (ep_len,) vector
+2. Compute 200-point quantile representation
+3. Compute Wasserstein-1 (EMD) between two trajectories' quantile vectors
+
+Final distance = mean EMD across all 256 dimensions.
+
+This reuses the same quantile-EMD machinery as TD error EMD but applies it to each LSTM dimension separately.
+
+### Preliminary results
+
+- **More dynamic range:** Embedding EMD distances are ~0.14 between diverse mazes (vs ~0.02-0.03 for TD error EMD). The buffer is less of a compressed blob.
+- **Richer signal:** 257 dimensions (256 LSTM + 1 action) vs 1 scalar per timestep. Captures what the agent *knows* and *does*, not just how wrong its predictions are. Same state-action pair that CENIE uses.
+- **Gate and selection work:** Wired into decision_gate.py, diverse/kmedoids selection, and embedding plots as `diversity_metric: embedding`.
+
+### Scaling problem
+
+The per-dimension quantile approach creates a (200 × 257) = 51,400-dim representation per level. For the 4000-level buffer:
+- Pairwise distance matrix = 8M pairs × 51,400 dims = **257x slower** than TD error EMD
+- TD error EMD buffer: ~15s → Embedding EMD buffer: **~1 hour**
+- Plus t-SNE/MDS fitting on 4000×4000 is already slow
+
+### Efficiency ideas (not yet implemented)
+
+1. **Mean embedding** — Average the 256-dim LSTM state over the episode. Each level → single 256-dim vector. Pairwise = one matrix multiply. Seconds for 4000 levels. Loses temporal structure but keeps the "what does the agent know" signal.
+
+2. **PCA reduction** — PCA the 256 LSTM dims down to 10-20 before computing quantiles. Representation becomes (200 × 20) = 4,000-dim instead of 51,200. ~13x speedup. Preserves temporal structure.
+
+3. **Final-state embedding** — Use only the last LSTM hidden state before done. Captures the agent's "conclusion" about the maze. 256-dim per level, trivial pairwise. But loses the journey.
+
+4. **Subsample buffer for plots** — Plot 200-500 buffer dots instead of 4000. The embedding plot is for visualization, not gating — fewer dots may be fine. Gate still uses all levels for selection.
+
+5. **Hybrid: mean + final** — Concatenate mean embedding (256) + final embedding (256) = 512-dim. Captures both average experience and final understanding. Still fast (512-dim pairwise).
+
+### Recommendation
+
+Start with **mean embedding** (option 1) for buffer-wide visualization and selection. It's the fastest path to seeing whether the 256-dim space has more structure than TD error. If it does, invest in PCA reduction (option 2) to recover temporal information without the 256x cost.
+
+---
+
 # /-----/ Need to remove hybrid strategy minimum episode length filter
 # /-----/ Need to wire up SFL to diverse/hybrid level selection strategies
 # /-----/ Currently we filter by stale regret but fresh TD error

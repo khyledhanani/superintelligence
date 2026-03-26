@@ -26,7 +26,7 @@ All metrics truncate trajectories at the first `done=True` flag to compare only 
 | Regret DTW | `pairwise/regret_dtw.py` | values, rewards, dones | `float` distance | Difficulty profile similarity | Available, not in prompt |
 | Action Distance | `pairwise/action_dtw_binary.py` | actions, dones | `float` distance | Behavioral divergence | Available, not in prompt |
 | Mode Transition Divergence | `pairwise/mode_transition.py` | values, rewards, dones, entropy | `float` KL | Experiential diversity | New (default: off) |
-| TD Error Distribution EMD | `pairwise/td_error_distribution.py` | values, rewards, dones | `float` EMD | Learning signal diversity | **Active gate** (diversity_metric: td_error_emd) |
+| Normalized TD Error EMD | `pairwise/td_error_distribution.py` | values, rewards, dones | `float` EMD | Learning signal shape diversity | **Active gate** (diversity_metric: normalized_td_error_emd) |
 
 ## Detailed Descriptions
 
@@ -110,16 +110,17 @@ Classifies each step into 5 experience modes, computes symmetric KL divergence b
 - **Limitation:** The 5-mode taxonomy embeds assumptions about what "confident" and "recovering" mean. May not generalize to all RL domains. KL divergence is unbounded, making threshold setting non-intuitive. Not fully task-agnostic.
 - **Config:** `pairwise_metrics.mode_transition: false` (not yet enabled by default)
 
-### TD Error Distribution EMD
-Earth Mover's Distance (Wasserstein-1) between the distributions of TD errors `δ_t = r_t + γV(s_{t+1}) - V(s_t)`.
+### Normalized TD Error EMD
+Earth Mover's Distance (Wasserstein-1) between **normalized** distributions of TD errors `δ_t = r_t + γV(s_{t+1}) - V(s_t)`. Each trajectory's TD errors are divided by their total absolute sum before comparison, isolating learning signal *shape* from *magnitude*.
 
-- **Use:** Default pairwise diversity gate. Uses only values, rewards, and dones — any actor-critic has these. TD error is the raw learning signal; different distributions mean different gradient directions (in aggregate).
-- **Key property:** No thresholds, no mode taxonomy, no architecture knowledge. Purely distributional comparison.
-- **EMD interpretation:** The "cost" to reshape one histogram into the other. Bounded, interpretable, well-defined even for very different episode lengths.
+- **Use:** Default pairwise diversity gate. Uses only values, rewards, and dones — any actor-critic has these. TD error is the raw learning signal; different normalized distributions mean different gradient *directions* (in aggregate).
+- **Why normalize?** SFL learnability already captures learning magnitude (how much). The diversity gate only needs to capture learning shape (what kind). Without normalization, two levels with identical signal shapes but different magnitudes would falsely appear diverse.
+- **Key property:** No thresholds, no mode taxonomy, no architecture knowledge. Purely distributional comparison, scale-free.
+- **EMD interpretation:** The "cost" to reshape one normalized histogram into the other. Bounded, interpretable, well-defined even for very different episode lengths.
 - **Gate behavior:** Uses min-distance to closest reference (not mean). A candidate must be dissimilar from *every* reference to pass.
-- **Key correlations:** r=0.301 with position DTW, r=0.687 with action DTW, r=0.614 with mode divergence, r=0.659 with CENIE novelty.
-- **Limitation:** Collapses temporal structure entirely — a maze where the agent is confused early then recovers vs one that starts confident then gets lost would score identically if the overall δ distributions match. Typical EMD values are small (mean=0.023) so threshold sensitivity needs care.
-- **Config:** `gate.diversity_metric: td_error_emd`, `gate.min_diversity: 0.02`
+- **Key correlations:** r=0.301 with position DTW, r=0.687 with action DTW, r=0.614 with mode divergence, r=0.659 with CENIE novelty (correlations from pre-normalization; may shift slightly).
+- **Limitation:** Collapses temporal structure entirely — a maze where the agent is confused early then recovers vs one that starts confident then gets lost would score identically if the overall δ distributions match.
+- **Config:** `gate.diversity_metric: normalized_td_error_emd`, `gate.min_diversity: 0.015`
 
 ### CENIE Novelty
 Negative mean log-likelihood of LSTM hidden state + action pairs under a GMM fitted on the training buffer.
@@ -130,27 +131,27 @@ Based on "Improving Environment Novelty Quantification for Effective Unsupervise
 - **Key property:** Not pairwise — compares candidate against a GMM fitted on 50 buffer level trajectories. No blind spots from reference subsampling.
 - **Features:** LSTM hidden state (256D, the agent's belief representation) + action (1D) = 257D per timestep. Per the paper, MiniGrid uses LSTM hidden states because of partial observability.
 - **GMM fitting:** Diagonal covariance, silhouette-based K selection (2-10 components), fitted on concatenated state-action pairs from buffer trajectories.
-- **Correlation with TD Error EMD:** Pearson r=0.659 (moderate), Spearman r=0.353 (weak rank). They share signal but disagree on edge cases — CENIE captures coverage gaps that pairwise EMD can't see.
-- **Limitation:** Threshold is in NLL scale (typical range: -250 to -110 for buffer levels), not intuitive. Requires LSTM hidden states from agent rollouts (architecture-coupled). Not suitable for pairwise embedding — use TD Error EMD for visualization.
+- **Correlation with Normalized TD Error EMD:** Pearson r=0.659 (moderate), Spearman r=0.353 (weak rank). They share signal but disagree on edge cases — CENIE captures coverage gaps that pairwise EMD can't see.
+- **Limitation:** Threshold is in NLL scale (typical range: -250 to -110 for buffer levels), not intuitive. Requires LSTM hidden states from agent rollouts (architecture-coupled). Not suitable for pairwise embedding — use Normalized TD Error EMD for visualization.
 - **Config:** `gate.diversity_metric: cenie`, `gate.min_diversity: -200`
 
 ## Correlation Structure (16 buffer levels, 120 pairs, adaptive mode thresholds)
 
 ```
-              Pos DTW   Action DTW   Regret DTW   Mode Div   Value Err   TD EMD
+              Pos DTW   Action DTW   Regret DTW   Mode Div   Value Err   Norm TD EMD
 Pos DTW        1.000      0.333        0.163       0.113       —         0.301
 Action DTW     0.333      1.000        0.699       0.614       —         0.687
 Regret DTW     0.163      0.699        1.000       0.890       —         0.290
 Mode Div       0.113      0.614        0.890       1.000      -0.078     0.614
 Value Error      —          —            —        -0.078      1.000      0.310
-TD EMD         0.301      0.687        0.290       0.614      0.310      1.000
+Norm TD EMD         0.301      0.687        0.290       0.614      0.310      1.000
 ```
 
 **Key takeaways:**
 - **Position DTW is weakly correlated with all experiential metrics** (r=0.11-0.30). Spatial path diversity ≠ learning diversity.
-- **TD error EMD is partially independent from everything.** Its strongest correlation is with action DTW (r=0.687) — different actions tend to produce different TD errors. But it's only r=0.614 with mode divergence, meaning they capture distinct aspects of experience.
+- **Normalized TD error EMD is partially independent from everything.** Its strongest correlation is with action DTW (r=0.687) — different actions tend to produce different TD errors. But it's only r=0.614 with mode divergence, meaning they capture distinct aspects of experience.
 - **Mode divergence and value error are now nearly uncorrelated** (r=-0.078) with adaptive thresholds. The old r=0.885 was an artifact of fixed thresholds that artificially aligned the metrics.
-- **No single metric captures everything.** The ideal gate would combine scalar regret (difficulty floor) with TD error EMD (learning signal diversity) — two orthogonal, task-agnostic signals.
+- **No single metric captures everything.** The ideal gate combines SFL learnability (difficulty/magnitude) with normalized TD error EMD (learning signal shape diversity) — two orthogonal, task-agnostic signals.
 
 ## Recommendations
 
@@ -158,7 +159,7 @@ TD EMD         0.301      0.687        0.290       0.614      0.310      1.000
 |---------|--------|-----|
 | Gate: reject easy mazes | Scalar regret (difficulty_metric: regret) | Direct, proven |
 | Gate: reject easy AND hard mazes | SFL learnability (difficulty_metric: sfl) | Filters both extremes, targets learning frontier |
-| Gate: reject redundant mazes (vs refs) | TD error EMD (min-distance) | Task-agnostic, no thresholds/modes, captures learning signal diversity |
+| Gate: reject redundant mazes (vs refs) | Normalized TD error EMD (min-distance) | Task-agnostic, no thresholds/modes, captures learning signal shape (magnitude handled by SFL) |
 | Gate: reject redundant mazes (vs buffer) | CENIE novelty | Scores against full buffer via GMM density, no reference subsampling blind spots |
 | LLM prompt: agent behavior | Path overlay + entropy + action sequence | Rich context for maze design |
 | LLM prompt: difficulty | Value error profile or per-step regret | Shows where agent struggles |
