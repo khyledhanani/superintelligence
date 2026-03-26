@@ -167,6 +167,40 @@ Norm TD EMD         0.301      0.687        0.290       0.614      0.310      1.
 | Analysis/visualization | All metrics | Different metrics reveal different aspects; correlation structure is informative |
 | Drop from gating | Position DTW | r=0.11-0.30 with experiential metrics — wrong signal |
 
+## Reference Selection Strategies
+
+The `--strategy` flag controls how reference mazes are selected from the buffer for the LLM prompt and diversity gate.
+
+| Strategy | Algorithm | Best for |
+|----------|-----------|----------|
+| `top_regret` | Select N highest-regret levels from buffer | Maximizing difficulty of references |
+| `random` | Uniform random sample from buffer | Baseline / quick runs |
+| `diverse` | Greedy max-min on precomputed pairwise distance matrix | Maximizing spread — picks levels that are far apart from each other |
+| `kmedoids` | PAM (Partitioning Around Medoids) BUILD+SWAP on precomputed pairwise distance matrix | Finding cluster centers — picks levels that minimize within-cluster distance, representing typical buffer regions |
+| `hybrid` | Filter to above-mean difficulty, then apply `diverse` selection on filtered set | Difficulty-filtered diversity — avoids easy references |
+
+**Key distinction:** `diverse` (greedy max-min) maximizes spread and tends to pick outliers. `kmedoids` (PAM cluster medoids) finds representative centers. Use `diverse` when you want the LLM to see the full range of buffer experiences; use `kmedoids` when you want references that represent typical clusters.
+
+Both `diverse` and `kmedoids` require precomputed pairwise distances (`buffer_td_errors.npz` or `buffer_embeddings.npz`). If unavailable, they fall back to rollout-based selection.
+
+## Embedding Visualization
+
+The diversity embedding plot projects all foreground levels (references, rejected, accepted) and optionally buffer background levels into 2D using pairwise distances.
+
+Two embedding methods are generated:
+
+| Method | File | Properties |
+|--------|------|------------|
+| t-SNE | `diversity_embedding.png` | Preserves local neighborhoods only. Global distances are distorted. Edge annotations show actual metric values (not t-SNE distances). |
+| MDS | `diversity_embedding_mds.png` | Multidimensional Scaling — preserves actual pairwise distances. Layout directly reflects metric distances. |
+
+**Diagnostic features:**
+- Foreground pairwise distances are logged for inspection.
+- Edges from rejected/accepted levels to their closest reference are drawn and annotated with actual EMD/metric values.
+- t-SNE subtitle warns that "distances on edges are actual metric values" since t-SNE distorts global distances.
+
+**Config:** `embedding_metric` selects the pairwise metric used (`td_error_emd`, `normalized_td_error_emd`, or `embedding`). `buffer_embed_samples` controls how many buffer levels appear in the background (`-1` = all, default).
+
 ## Source
 
 - Standalone metrics: `metrics/standalone/`
@@ -175,3 +209,4 @@ Norm TD EMD         0.301      0.687        0.290       0.614      0.310      1.
 - Shared utilities: `metrics/utils.py`
 - Configuration: `llm/config.yaml` (`prompt_metrics`, `pairwise_metrics`, `gate` sections)
 - Visualization: `metrics/scripts/plot_metrics_demo.py` → `metrics/plots/`
+- Buffer cluster plot: `llm/plot_buffer_clusters.py` → `buffer_clusters.png`

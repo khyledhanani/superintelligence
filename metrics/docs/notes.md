@@ -64,10 +64,12 @@ This is near-zero. Spatial path diversity and experiential diversity are essenti
 
 The experience mode classifier uses two thresholds:
 
-- `error_threshold = 0.3` — |V(s_t) - G_t| above this = "wrong"
-- `entropy_threshold = 0.3` — H(π) above this = "uncertain"
+- `error_threshold` — |V(s_t) - G_t| above this = "wrong"
+- `entropy_threshold` — H(π) above this = "uncertain"
 
-These are currently hardcoded. They may need tuning for different agents or training stages. An agent early in training has high error everywhere (all steps classified as "wrong"), while a well-trained agent has low error everywhere (all "correct"). The thresholds should ideally be set relative to the agent's typical error range.
+**Adaptive (production):** When `baseline_stats` is provided (computed from reference trajectories), thresholds are set to `mean + 1 std` of |error| and entropy respectively. This means ~16% of steps exceed the threshold, automatically scaling with agent capability and training stage. An early-training agent with high error everywhere gets a higher threshold; a well-trained agent gets a tighter one.
+
+**Fallback:** When `baseline_stats` is not provided, thresholds default to 0.3 for both (the original hardcoded values).
 
 **Classification priority:** Uncertain > error-based modes. If entropy is high, the step is classified as uncertain regardless of error magnitude.
 
@@ -114,7 +116,7 @@ All metrics truncate at the **first** `done=True` flag:
 From the correlation analysis:
 
 - **Regret DTW ≈ Mode Divergence** (r=0.890) — mode divergence captures the same signal without DTW's alignment assumptions
-- **Value Error ≈ Mode Divergence** (r=0.885) — mode classification is derived from value error, so high correlation is expected
+- **Value Error ⊥ Mode Divergence** (r=-0.078 with adaptive thresholds) — the old r=0.885 was an artifact of fixed thresholds that artificially aligned the metrics. With adaptive thresholds, they are nearly uncorrelated
 - **Action DTW partially captures Mode Divergence** (r=0.614) — different actions sometimes (but not always) imply different experiences
 - **Position DTW is independent** (r=0.113) — spatial and experiential diversity are orthogonal axes
 
@@ -185,13 +187,25 @@ This means CENIE's advantage over pairwise metrics (which subsample ~6 reference
 
 ---
 
-## Diverse Reference Selection
+## Reference Selection Strategies
 
-The `--strategy diverse` reference selection uses precomputed TD errors (`buffer_td_errors.npz`) to greedily select N maximally-spread references from all 4000 buffer levels in ~0.3s (no agent rollouts needed for selection).
+Five strategies are available via `--strategy`:
+
+### `diverse` (greedy max-min)
+Uses precomputed pairwise distances (`buffer_td_errors.npz` or `buffer_embeddings.npz`) to greedily select N maximally-spread references from all 4000 buffer levels in ~0.3s (no agent rollouts needed for selection). Starts with the global maximum-distance pair, then iteratively adds the level farthest from the current set. Tends to pick outliers.
+
+### `kmedoids` (PAM cluster medoids)
+Uses the same precomputed pairwise distance matrix but applies the PAM (Partitioning Around Medoids) BUILD+SWAP algorithm. Finds K cluster centers that minimize within-cluster distance. Unlike greedy max-min, this picks *representative* levels (cluster centers) rather than maximally-spread outliers. Better when you want references that cover typical buffer behavior.
+
+### `hybrid` (difficulty-filtered + diverse)
+Filters buffer to above-mean difficulty levels, then applies greedy max-min on the filtered set. Ensures references are both challenging and diverse.
+
+### `top_regret` / `random`
+Simple baselines: highest-regret or uniform random selection.
 
 **Vectorized pairwise computation:** The full 4000×4000 distance matrix is computed via chunked numpy broadcasting on the (4000, 200) quantile matrix — ~15s for exact results (no sampling heuristics). The starting pair is the true global maximum. Memory is managed by processing 500-row chunks, keeping the intermediate tensor under ~800 MB.
 
-**Fallback:** If precomputed TD errors are unavailable, falls back to rollout-based selection on a stratified candidate pool (slower, less coverage).
+**Fallback:** If precomputed data is unavailable, `diverse` and `kmedoids` fall back to rollout-based selection on a stratified candidate pool (slower, less coverage).
 
 
 
@@ -216,11 +230,15 @@ Final distance = mean EMD across all 256 dimensions.
 
 This reuses the same quantile-EMD machinery as TD error EMD but applies it to each LSTM dimension separately.
 
-### Preliminary results
+### Status: Production
 
+Fully wired into the pipeline as `diversity_metric: embedding`:
+
+- **Gate:** decision_gate.py computes embedding divergence for accept/reject decisions.
+- **Reference selection:** Both `diverse` and `kmedoids` strategies support precomputed embedding distances via `buffer_embeddings.npz` (generated by `llm/precompute_buffer_embeddings.py`).
+- **Visualization:** t-SNE and MDS embedding plots use embedding distances when `embedding_metric: embedding`.
 - **More dynamic range:** Embedding EMD distances are ~0.14 between diverse mazes (vs ~0.02-0.03 for TD error EMD). The buffer is less of a compressed blob.
 - **Richer signal:** 257 dimensions (256 LSTM + 1 action) vs 1 scalar per timestep. Captures what the agent *knows* and *does*, not just how wrong its predictions are. Same state-action pair that CENIE uses.
-- **Gate and selection work:** Wired into decision_gate.py, diverse/kmedoids selection, and embedding plots as `diversity_metric: embedding`.
 
 ### Scaling problem
 
@@ -247,6 +265,20 @@ Start with **mean embedding** (option 1) for buffer-wide visualization and selec
 
 ---
 
+## Embedding Visualization: t-SNE vs MDS
+
+Both t-SNE and MDS embeddings are generated for each batch run:
+
+- **t-SNE** (`diversity_embedding.png`): Preserves local neighborhoods. Good for identifying clusters. Distorts global distances — two clusters that appear far apart may not be proportionally far in metric space.
+- **MDS** (`diversity_embedding_mds.png`): Preserves actual pairwise distances. Layout directly reflects metric values. Prefer this when interpreting global distance relationships.
+
+Both plots annotate edges from rejected/accepted levels to their closest reference with actual metric values (not projected distances), so edge labels are reliable in both views.
+
+**Config:** `buffer_embed_samples: -1` (default) shows all buffer levels in the background.
+
+---
+
+# Open items
 # /-----/ Need to remove hybrid strategy minimum episode length filter
 # /-----/ Need to wire up SFL to diverse/hybrid level selection strategies
 # /-----/ Currently we filter by stale regret but fresh TD error

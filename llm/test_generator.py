@@ -74,6 +74,43 @@ def load_buffer(path: str) -> dict:
     return info
 
 
+def _validate_buffer_difficulty(difficulty_metric: str, agent_dir: str):
+    """Validate that buffer scores match the configured difficulty metric.
+
+    Reads the agent's training config (config.json) to determine what scoring
+    function produced the buffer. Raises ValueError if mismatched or missing.
+    """
+    config_path = os.path.join(agent_dir, "config.json") if agent_dir else None
+    if not config_path or not os.path.exists(config_path):
+        raise ValueError(
+            f"Cannot validate buffer scoring: no config.json found at {agent_dir}. "
+            f"Ensure the agent checkpoint directory contains config.json."
+        )
+
+    import json
+    with open(config_path) as f:
+        train_cfg = json.load(f)
+    buffer_score_fn = train_cfg.get("score_function", "")
+    if not buffer_score_fn:
+        raise ValueError(
+            f"config.json at {config_path} has no 'score_function' field. "
+            f"Cannot verify buffer scores match difficulty_metric='{difficulty_metric}'."
+        )
+
+    # Map training config names to our difficulty_metric names
+    score_fn_to_metric = {"sfl": "sfl", "regret": "regret", "maxmc": "regret"}
+    buffer_metric = score_fn_to_metric.get(buffer_score_fn.lower(), buffer_score_fn.lower())
+
+    if difficulty_metric != buffer_metric:
+        raise ValueError(
+            f"Buffer scores use '{buffer_score_fn}' (from {config_path}) "
+            f"but config has difficulty_metric='{difficulty_metric}'. "
+            f"Set difficulty_metric: {buffer_metric} in config.yaml "
+            f"or use a buffer that matches."
+        )
+    logger.info(f"Buffer score function: {buffer_score_fn} (matches difficulty_metric: {difficulty_metric})")
+
+
 def tokens_to_ascii(tokens: np.ndarray) -> str:
     """Convert a 52-token sequence to ASCII maze grid via Level.to_str()."""
     tokens_jax = jnp.array(tokens, dtype=jnp.int32)
@@ -2054,6 +2091,9 @@ def run_test(args):
     size = int(buf["size"])
     tokens = buf["tokens"]
     scores = buf["scores"]
+
+    # Validate buffer scores match configured difficulty metric
+    _validate_buffer_difficulty(args.difficulty_metric, args.agent_dir)
 
     # Load agent early if needed for diverse selection or metrics
     evaluator = None
