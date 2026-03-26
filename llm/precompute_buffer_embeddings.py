@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from vae.vae_level_utils import tokens_to_level
 from llm.agent_evaluator import AgentEvaluator
 from metrics.pairwise.td_error_distribution import compute_td_errors
+from metrics.pairwise.embedding_divergence import compute_mean_embedding
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
                     stream=sys.stdout)
@@ -78,6 +79,7 @@ def main():
     logger.info(f"Rolling out agent on {n_levels} levels (batch_size={args.batch_size})...")
     all_td_errors = []  # list of 1D arrays (variable length)
     all_ep_lens = []
+    all_mean_embeddings = []  # list of (257,) mean state-action vectors
     t_start = time.time()
 
     for batch_start in range(0, n_levels, args.batch_size):
@@ -99,6 +101,12 @@ def main():
             all_td_errors.append(td)
             all_ep_lens.append(len(td))
 
+            # Compute mean LSTM state-action embedding (257-dim)
+            me = compute_mean_embedding(
+                traj["hstates"], traj["dones"], actions=traj["actions"],
+            )
+            all_mean_embeddings.append(me)
+
         elapsed = time.time() - t_start
         done = batch_end
         rate = done / elapsed if elapsed > 0 else 0
@@ -115,19 +123,24 @@ def main():
     for i, td in enumerate(all_td_errors):
         td_padded[i, :len(td)] = td
 
+    # Pack mean embeddings: (N, 257)
+    mean_emb_matrix = np.array(all_mean_embeddings, dtype=np.float32)  # (N, 257)
+
     # Save
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     np.savez_compressed(
         args.output,
-        td_errors=td_padded,       # (N, max_ep_len) padded TD errors
-        ep_lens=ep_lens,           # (N,) actual episode lengths
-        indices=indices,           # (N,) buffer indices used
-        scores=scores[indices],    # (N,) regret scores
+        td_errors=td_padded,         # (N, max_ep_len) padded TD errors
+        ep_lens=ep_lens,             # (N,) actual episode lengths
+        indices=indices,             # (N,) buffer indices used
+        scores=scores[indices],      # (N,) regret scores
         n_levels=n_levels,
+        mean_embeddings=mean_emb_matrix,  # (N, 257) mean LSTM state-action vectors
     )
     file_size = os.path.getsize(args.output) / 1024 / 1024
     logger.info(f"Saved {args.output} ({file_size:.1f} MB)")
     logger.info(f"  {n_levels} levels, max_ep_len={max_len}, mean_ep_len={np.mean(ep_lens):.0f}")
+    logger.info(f"  Mean embeddings: {mean_emb_matrix.shape}")
 
 
 if __name__ == "__main__":

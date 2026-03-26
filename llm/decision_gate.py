@@ -136,6 +136,11 @@ def _compute_pairwise_diversity(
         )
         return result["distance"]
 
+    elif metric == "embedding":
+        from metrics.pairwise.embedding_divergence import embedding_divergence
+        result = embedding_divergence(cand, cand["dones"], ref, ref["dones"])
+        return result["distance"]
+
     else:
         raise ValueError(f"Unknown diversity metric: {metric}")
 
@@ -282,6 +287,7 @@ def evaluate_candidate(
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
+                "embedding": "LSTM Embedding L2",
             }.get(thresholds.diversity_metric, thresholds.diversity_metric)
             closest = min(result.pair_metrics, key=lambda p: p.diversity_distance)
             issues.append(
