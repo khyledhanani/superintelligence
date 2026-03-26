@@ -1,8 +1,9 @@
 #!/bin/bash
 # VAE interpolation mutation experiment
 #
-# Full pipeline: generate eligible pool → create merged buffers at each
-# injection % → resume training from 10k checkpoint for 10k more updates.
+# Full pipeline: fetch data from GCS → generate eligible pool → create merged
+# buffers at each injection % → resume training from 10k checkpoint for 10k
+# more updates.
 #
 # Usage: bash experiments/gpu_scripts/run_vae_interp.sh [target_eligible] [inject_pcts] [seeds...]
 # Example: bash experiments/gpu_scripts/run_vae_interp.sh 1000 5,10,15,20,25 0 1 2
@@ -15,18 +16,35 @@ INJECT_PCTS=${1:-5,10,15,20,25}; shift || true
 SEEDS=("${@}")
 if [ ${#SEEDS[@]} -eq 0 ]; then SEEDS=(0 1 2); fi
 
-AGENT_CKPT="/cs/student/project_msc/2025/csml/rhautier/llm-exp-ued/checkpoint_10k"
-BUFFER_NPZ="/cs/student/project_msc/2025/csml/rhautier/llm-exp-ued/buffer/buffer_dump_10000.npz"
-SEEDS_DIR="/cs/student/project_msc/2025/csml/rhautier/llm-exp-ued/seeds_10k_gated"
-VAE_CKPT="/cs/student/msc/csml/2025/rhautier/Documents/jaxued/jaxued/vae/runs/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/checkpoints/checkpoint_500000.pkl"
-VAE_CONFIG="/cs/student/msc/csml/2025/rhautier/Documents/jaxued/jaxued/vae/runs/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/config.yaml"
-BASE_OUTPUT="/cs/student/project_msc/2025/csml/rhautier/llm-exp-ued/results"
-GCS_BUCKET="ucl-ued-project-bucket"
-GCS_PREFIX="llm-exp/injection"
 PY=/cs/student/msc/csml/2025/rhautier/miniforge3/envs/jaxued_env/bin/python
 SCRIPT=/cs/student/msc/csml/2025/rhautier/Documents/jaxued/jaxued/examples/maze_plr.py
-TRAIN_UPDATES=10000
+REPO_ROOT=/cs/student/msc/csml/2025/rhautier/Documents/jaxued/jaxued
 
+GCS_BUCKET="ucl-ued-project-bucket"
+GCS_PROJECT="ucl-ued-project"
+GCS_PREFIX="llm-exp/injection"
+LOCAL_DATA="/tmp/injection_data"
+TRAIN_UPDATES=10000
+WANDB_GROUP="vaeinterp_t${TARGET_ELIGIBLE}"
+
+VAE_CKPT="${REPO_ROOT}/vae/runs/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/checkpoints/checkpoint_500000.pkl"
+VAE_CONFIG="${REPO_ROOT}/vae/runs/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/config.yaml"
+
+# --- Step 0: Fetch data from GCS ---
+echo "=== Fetching data from GCS ==="
+$PY "${REPO_ROOT}/experiments/fetch_gcs_data.py" \
+    --gcs_bucket "$GCS_BUCKET" \
+    --gcs_project "$GCS_PROJECT" \
+    --local_dir "$LOCAL_DATA" \
+    --checkpoint_step 39 \
+    --buffer_update 10000
+
+AGENT_CKPT="${LOCAL_DATA}/checkpoint"
+BUFFER_NPZ="${LOCAL_DATA}/buffer/buffer_dump_10000.npz"
+SEEDS_DIR="${LOCAL_DATA}/seeds"
+BASE_OUTPUT="${LOCAL_DATA}/results"
+
+echo ""
 echo "=== VAE Interpolation Mutation ==="
 echo "  target_eligible=$TARGET_ELIGIBLE  inject_pcts=$INJECT_PCTS"
 echo "  seeds=${SEEDS[*]}  train_updates=$TRAIN_UPDATES"
@@ -39,7 +57,7 @@ for SEED in "${SEEDS[@]}"; do
     if [ ! -f "$OUTPUT_DIR/experiment_log.json" ]; then
         echo ""
         echo "--- [Step 1] Generating mutations: seed=$SEED ---"
-        $PY experiments/run_injection_experiment.py \
+        $PY "${REPO_ROOT}/experiments/run_injection_experiment.py" \
             --agent_checkpoint_dir "$AGENT_CKPT" \
             --buffer_npz "$BUFFER_NPZ" \
             --seeds_dir "$SEEDS_DIR" \
@@ -67,13 +85,14 @@ for SEED in "${SEEDS[@]}"; do
         echo ""
         echo "--- [Step 2] Training: $TRAIN_RUN ---"
         $PY $SCRIPT \
-            --maze_height 13 --maze_width 13 --n_walls 25 \
+            --n_walls 25 \
             --use_accel \
             --num_updates "$TRAIN_UPDATES" \
             --preload_buffer_npz "$PCT_FILE" \
             --resume_checkpoint_dir "$AGENT_CKPT" \
             --seed "$SEED" \
             --run_name "$TRAIN_RUN" \
+            --wandb_group "$WANDB_GROUP" \
             --project JAXUED_LLM_INJECTION \
             --gcs_bucket "$GCS_BUCKET" \
             --gcs_prefix "llm-exp/training/$TRAIN_RUN" \
