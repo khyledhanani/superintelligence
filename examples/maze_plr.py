@@ -684,6 +684,10 @@ def main(config=None, project="JAXUED_TEST"):
                 log_dict["cmaes/mean_z_norm"] = float(np.array(stats["cmaes/mean_z_norm"])[dr_mask].mean())
                 log_dict["cmaes/sigma_resets"] = float(np.array(stats["cmaes/sigma_reset"])[dr_mask].sum())
                 log_dict["cmaes/periodic_resets"] = float(np.array(stats["cmaes/periodic_reset"])[dr_mask].sum())
+                if "cmaes/score_decay_active" in stats:
+                    log_dict["cmaes/score_decay_active"] = float(np.array(stats["cmaes/score_decay_active"])[dr_mask].mean())
+                    log_dict["cmaes/buffer_score_mean"] = float(np.array(stats["cmaes/buffer_score_mean"])[dr_mask].mean())
+                    log_dict["cmaes/buffer_score_max"] = float(np.array(stats["cmaes/buffer_score_max"])[dr_mask].mean())
 
         wandb.log(log_dict)
     
@@ -1596,7 +1600,7 @@ def main(config=None, project="JAXUED_TEST"):
         else:
             branch = level_sampler.sample_replay_decision(train_state.sampler, rng_replay).astype(int)
         
-        return jax.lax.switch(
+        (rng, train_state), metrics = jax.lax.switch(
             branch,
             [
                 on_new_levels,
@@ -1605,7 +1609,38 @@ def main(config=None, project="JAXUED_TEST"):
             ],
             rng, train_state
         )
-    
+
+        # Score decay: multiply all buffer scores by decay factor when CMA-ES is NOT active.
+        # For one-shot (cmaes_stop_after): decays after CMA-ES stops permanently.
+        # For cycling (cmaes_phase_on/off): decays during the off/interp phases of each cycle.
+        _score_decay = config.get("cmaes_score_decay", 0.0)
+        if _score_decay > 0:
+            total_upd = train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
+            _stop = config.get("cmaes_stop_after", 0)
+            _phase_on = config.get("cmaes_phase_on", 0)
+            _phase_off = config.get("cmaes_phase_off", 0)
+            if _phase_on > 0 and _phase_off > 0:
+                # Cycling mode: decay during off+interp phases
+                _phase_interp = config.get("cmaes_phase_interp", 0)
+                _cycle = _phase_on + _phase_interp + _phase_off
+                _pos = total_upd % _cycle
+                cmaes_active = _pos < _phase_on
+                decay_active = ~cmaes_active
+            elif _stop > 0:
+                # One-shot mode: decay after CMA-ES stops
+                decay_active = total_upd >= _stop
+            else:
+                decay_active = jnp.bool_(False)
+            decayed_scores = train_state.sampler["scores"] * _score_decay
+            new_scores = jnp.where(decay_active, decayed_scores, train_state.sampler["scores"])
+            new_sampler = {**train_state.sampler, "scores": new_scores}
+            train_state = train_state.replace(sampler=new_sampler)
+            metrics["cmaes/score_decay_active"] = decay_active.astype(jnp.float32)
+            metrics["cmaes/buffer_score_mean"] = new_scores.mean()
+            metrics["cmaes/buffer_score_max"] = new_scores.max()
+
+        return (rng, train_state), metrics
+
     def eval(rng: chex.PRNGKey, train_state: TrainState):
         """
         This evaluates the current policy on the set of evaluation levels specified by config["eval_levels"].
@@ -2327,6 +2362,30 @@ if __name__=="__main__":
     group.add_argument("--cmaes_delayed_start", action=argparse.BooleanOptionalAction, default=False,
                        help="Start with standard ACCEL (random levels), switch to CMA-ES+PCA once buffer is full. "
                             "KL filtering and PCA are computed from buffer levels at that point.")
+    group.add_argument("--cmaes_stop_after", type=int, default=0,
+                       help="Stop CMA-ES after this many total updates, switch to random/interp. (0 = disabled)")
+    group.add_argument("--cmaes_interp_until", type=int, default=0,
+                       help="After CMA-ES stops, use interpolation until this update, then random. "
+                            "Requires --cmaes_stop_after. (0 = disabled)")
+    group.add_argument("--cmaes_interp_fraction", type=float, default=0.0,
+                       help="Fraction of steps using interpolation instead of CMA-ES (0-1). (0 = disabled)")
+    group.add_argument("--cmaes_interp_source", type=str, default="buffer",
+                       choices=["buffer", "data"],
+                       help="Source for interpolation pairs: 'buffer' (PLR buffer) or 'data' (external dataset)")
+    group.add_argument("--cmaes_interp_data", type=str, default=None,
+                       help="Path to .npy token file for data-source interpolation")
+    group.add_argument("--cmaes_reset_to_buffer_mean", action=argparse.BooleanOptionalAction, default=False,
+                       help="On CMA-ES reset, set mean to latent centroid of buffer levels instead of zeros")
+    group.add_argument("--cmaes_score_decay", type=float, default=0.0,
+                       help="Per-step decay factor for all buffer scores when CMA-ES is inactive "
+                            "(e.g. 0.999). One-shot: applied after cmaes_stop_after. "
+                            "Cycling: applied during off/interp phases. (0 = disabled)")
+    group.add_argument("--cmaes_phase_on", type=int, default=0,
+                       help="CMA-ES active phase duration in cycling mode (0 = disabled)")
+    group.add_argument("--cmaes_phase_interp", type=int, default=0,
+                       help="Interpolation phase duration in cycling mode (0 = no interp phase)")
+    group.add_argument("--cmaes_phase_off", type=int, default=0,
+                       help="ACCEL-only phase duration in cycling mode (0 = disabled)")
     group.add_argument("--cmaes_pca_start_after", type=int, default=0,
                        help="Number of updates before switching from free CMA-ES to PCA-guided CMA-ES. "
                             "Before this point, CMA-ES searches the full KL-filtered space. "
