@@ -38,6 +38,7 @@ class LLMInjectionConfig:
     # Diversity gate (Phase 2: enabled by default; locked decisions from CONTEXT.md)
     gate_enabled: bool = True               # --llm_gate
     difficulty_threshold: float = 0.6       # --llm_difficulty_threshold
+    difficulty_metric: str = "sfl"         # --llm_difficulty_metric ("sfl" or "regret")
     difficulty_gate_mode: str = "fixed"     # --llm_difficulty_gate_mode
     #   "fixed": use difficulty_threshold as absolute floor
     #   "buffer_mean": threshold = mean score across entire buffer
@@ -50,6 +51,7 @@ class LLMInjectionConfig:
     #   "disabled": no diversity gate
     diversity_metric: str = "td_error_emd"  # --llm_diversity_metric
     max_diversity_retries: int = 2          # --llm_max_diversity_retries
+    max_seed_retries: int = 3              # --llm_max_seed_retries (fresh LLM calls if gate rejects)
     n_rollouts_gate: int = 100              # --llm_n_rollouts (rollouts per candidate)
 
     # Mutation amplification
@@ -98,11 +100,13 @@ class LLMInjectionConfig:
             n_reference_mazes=config.get("llm_n_references", 5),
             gate_enabled=config.get("llm_gate", True),
             difficulty_threshold=config.get("llm_difficulty_threshold", 0.6),
+            difficulty_metric=config.get("llm_difficulty_metric", "sfl"),
             difficulty_gate_mode=config.get("llm_difficulty_gate_mode", "fixed"),
             min_diversity=config.get("llm_min_diversity", 0.02),
             diversity_gate_mode=config.get("llm_diversity_gate_mode", "fixed"),
             diversity_metric=config.get("llm_diversity_metric", "td_error_emd"),
             max_diversity_retries=config.get("llm_max_diversity_retries", 2),
+            max_seed_retries=config.get("llm_max_seed_retries", 3),
             n_rollouts_gate=config.get("llm_n_rollouts", 100),
             amplification_enabled=config.get("llm_amplification", True),
             mutations_per_seed=config.get("llm_mutations_per_seed", 30),

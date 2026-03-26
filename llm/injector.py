@@ -370,24 +370,28 @@ class LLMInjectionManager:
 
         thresholds = DiversityThresholds(
             difficulty_threshold=effective_threshold,
+            difficulty_metric=self.config.difficulty_metric,
             min_diversity=effective_diversity,
             diversity_metric=self.config.diversity_metric,
         )
 
         # ---------------------------------------------------------------
-        # Step 4: Generate n_raw candidate mazes via LLM
+        # Step 4: Generate candidate mazes via LLM until n_raw accepted
         # ---------------------------------------------------------------
-        seeds_generated = self.config.n_raw
+        target_seeds = self.config.n_raw
+        max_total_attempts = target_seeds * self.config.max_seed_retries  # safety cap
         valid_levels = []
         seed_sfl_scores = []  # actual SFL scores per accepted seed (for competitive mode)
         gate_accepted = 0
         gate_rejected = 0
+        seeds_attempted = 0
         diversity_scores = []
         difficulty_scores = []
 
-        for i in range(seeds_generated):
+        while len(valid_levels) < target_seeds and seeds_attempted < max_total_attempts:
+            seeds_attempted += 1
+            i = len(valid_levels)  # current target slot
             if gate_active:
-                # Gated path: generate_with_feedback handles rollout+gate+retry internally
                 result = self.generator.generate_with_feedback(
                     agent_evaluator=self.agent_evaluator,
                     reference_trajectories=ref_trajectories,
@@ -401,13 +405,13 @@ class LLMInjectionManager:
                 if not result.success:
                     error_detail = "; ".join(result.errors) if result.errors else "unknown error"
                     print(
-                        f"[LLM] generate_with_feedback() failed on maze {i+1}/{seeds_generated}: "
-                        f"{error_detail}. Skipping this maze.",
+                        f"[LLM] Seed {i+1}/{target_seeds} (attempt {seeds_attempted}/{max_total_attempts}): "
+                        f"generation failed ({error_detail})",
                         flush=True,
                     )
                     gate_rejected += 1
                     continue
-                # Check if gate ultimately accepted (no unresolved diversity issues)
+                # Check if gate ultimately accepted
                 gate_metrics = result.gate_metrics or {}
                 was_accepted = not result.diversity_issues
                 if was_accepted:
@@ -416,16 +420,28 @@ class LLMInjectionManager:
                     diversity_scores.append(float(gate_metrics.get("mean_diversity", 0.0)))
                     difficulty_scores.append(float(gate_metrics.get("regret", 0.0)))
                     seed_sfl_scores.append(float(gate_metrics.get("learnability", 0.0)))
+                    print(
+                        f"[LLM] Seed {len(valid_levels)}/{target_seeds} accepted "
+                        f"(attempt {seeds_attempted}, "
+                        f"sfl={gate_metrics.get('learnability', 0):.4f}, "
+                        f"div={gate_metrics.get('mean_diversity', 0):.4f})",
+                        flush=True,
+                    )
                 else:
                     gate_rejected += 1
-                    logger.info(f"[LLM] Seed {i+1} gate rejected: {result.diversity_issues}")
+                    issues_str = "; ".join(result.diversity_issues) if result.diversity_issues else "unknown"
+                    print(
+                        f"[LLM] Seed {i+1}/{target_seeds} (attempt {seeds_attempted}/{max_total_attempts}): "
+                        f"gate rejected ({issues_str})",
+                        flush=True,
+                    )
             else:
                 # Ungated path (Phase 1 fallback): generate + validate_llm_level
                 result = self.generator.generate(references=references, global_metrics=global_metrics)
                 if not result.success:
                     error_detail = "; ".join(result.errors) if result.errors else "unknown error"
                     print(
-                        f"[LLM] MazeGenerator.generate() failed on maze {i+1}/{seeds_generated}: "
+                        f"[LLM] MazeGenerator.generate() failed on maze {i+1}/{target_seeds}: "
                         f"{error_detail}. Skipping this maze.",
                         flush=True,
                     )
@@ -440,11 +456,14 @@ class LLMInjectionManager:
                     logger.info(f"[LLM] Seed {i+1} rejected: {reason}")
 
         seeds_valid = len(valid_levels)
-        logger.info(f"[LLM] Seeds: {seeds_valid}/{seeds_generated} accepted "
-                    f"(gate_accepted={gate_accepted}, gate_rejected={gate_rejected})")
+        print(
+            f"[LLM] Seeds: {seeds_valid}/{target_seeds} accepted "
+            f"({seeds_attempted} attempts, {gate_rejected} rejected)",
+            flush=True,
+        )
 
         # Track batch events where all seeds were rejected
-        if gate_accepted == 0 and seeds_generated > 0:
+        if gate_accepted == 0 and seeds_attempted > 0:
             self.batch_all_rejected_count += 1
 
         # ---------------------------------------------------------------
@@ -468,6 +487,15 @@ class LLMInjectionManager:
                     h = LevelCache.compute_hash(level)
                 accepted_hashes.append(h)
 
+            # Auto-visualize accepted seeds as a grid PNG
+            if self.level_cache is not None:
+                try:
+                    from scripts.visualize_llm_levels import visualize_single_step
+                    wall_maps = [np.asarray(lv.wall_map, dtype=bool) for lv in valid_levels]
+                    visualize_single_step(str(self.level_cache.run_dir), wall_maps, current_step)
+                except Exception as e:
+                    logger.warning(f"[LLM] Visualization failed: {e}")
+
         # ---------------------------------------------------------------
         # Step 5: Mutation amplification (collected separately from seeds)
         # ---------------------------------------------------------------
@@ -476,19 +504,13 @@ class LLMInjectionManager:
         mutation_levels = []
 
         if self.config.amplification_enabled and valid_levels:
-            total_so_far = len(valid_levels)
             max_mutation_rounds = 10  # safety cap to avoid infinite loop
             for seed_level in valid_levels:
-                if total_so_far + len(mutation_levels) >= self.config.max_inject_per_event:
-                    break
-
                 target = self.config.mutations_per_seed
                 seed_mutations = []
 
                 for round_idx in range(max_mutation_rounds):
                     if len(seed_mutations) >= target:
-                        break
-                    if total_so_far + len(mutation_levels) + len(seed_mutations) >= self.config.max_inject_per_event:
                         break
 
                     # Generate a batch of mutations
@@ -612,7 +634,7 @@ class LLMInjectionManager:
         self.total_attempted += total_levels_to_inject
         injection_time = time.time() - injection_start
 
-        acceptance_rate = seeds_valid / seeds_generated if seeds_generated > 0 else 0.0
+        acceptance_rate = seeds_valid / seeds_attempted if seeds_attempted > 0 else 0.0
         mutation_survival_rate = (
             mutations_solvable / mutations_generated
             if mutations_generated > 0 else 0.0
@@ -622,7 +644,8 @@ class LLMInjectionManager:
             "llm/injected_count": retained_count,
             "llm/retained_seeds": retained_seeds,
             "llm/retained_mutations": retained_mutations,
-            "llm/seeds_generated": seeds_generated,
+            "llm/seeds_target": target_seeds,
+            "llm/seeds_attempted": seeds_attempted,
             "llm/seeds_valid": seeds_valid,
             "llm/mutations_generated": mutations_generated,
             "llm/mutations_solvable": mutations_solvable,
@@ -634,7 +657,7 @@ class LLMInjectionManager:
             # Gate-specific metrics (GATE-03)
             "llm/diversity_score_mean": float(np.mean(diversity_scores)) if diversity_scores else 0.0,
             "llm/difficulty_score_mean": float(np.mean(difficulty_scores)) if difficulty_scores else 0.0,
-            "llm/gate_rejection_rate": gate_rejected / seeds_generated if seeds_generated > 0 else 0.0,
+            "llm/gate_rejection_rate": gate_rejected / seeds_attempted if seeds_attempted > 0 else 0.0,
             "llm/batch_all_rejected_count": self.batch_all_rejected_count,
             "llm/effective_difficulty_threshold": effective_threshold if effective_threshold is not None else 0.0,
             "llm/effective_diversity_threshold": effective_diversity if effective_diversity is not None else 0.0,

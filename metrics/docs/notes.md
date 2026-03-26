@@ -122,18 +122,24 @@ In the current system, mode transition divergence makes regret DTW redundant. If
 
 ---
 
-## TD Error EMD Properties
+## Normalized TD Error EMD Properties
 
-TD error distribution EMD uses Wasserstein-1 distance computed via quantile matching:
-- Interpolate both sorted TD error arrays to 200 quantile points
+Normalized TD error distribution EMD uses Wasserstein-1 distance computed via quantile matching on **normalized** TD errors. Each trajectory's TD errors are divided by their total absolute sum before comparison, separating learning signal *shape* from *magnitude*.
+
+**Why normalize?** SFL learnability already captures *how much* learning happens (magnitude). The diversity gate only needs to capture *what kind* of learning (shape/direction). Without normalization, two levels with identical learning signal shapes but different magnitudes would score as diverse — a false positive, since SFL is already filtering by magnitude.
+
+**Computation:**
+- Compute raw TD errors per trajectory
+- Normalize: `td_norm = td / sum(|td|)` (with epsilon floor to avoid division by zero)
+- Sort normalized TD errors → quantile function
+- Interpolate both to 200 quantile points
 - EMD = mean absolute difference between corresponding quantiles
-- This is equivalent to the area between the two ECDFs
 
-**Typical range in our buffer:** 0.009-0.072, mean ~0.023. The small absolute values reflect that TD errors themselves are small (the agent's value function is reasonably well-calibrated). Threshold sensitivity needs care — a gate at 0.05 would reject ~30% of pairs.
+**Typical range:** Values will differ from the old unnormalized metric (previously 0.009-0.072). The normalized metric is scale-free — thresholds need recalibration.
 
-**Terminal step handling:** At the last step of an episode, V(s_{t+1}) = 0 (no next state), so `δ_T = r_T - V(s_T)`. If the agent solved the maze, r_T is a large positive reward and the TD error spikes. This terminal spike is informative (it captures whether the agent expected to solve) but can dominate short episodes.
+**Terminal step handling:** At the last step of an episode, V(s_{t+1}) = 0 (no next state), so `δ_T = r_T - V(s_T)`. If the agent solved the maze, r_T is a large positive reward and the TD error spikes. Normalization reduces the dominance of this spike on short episodes since it's divided by the total.
 
-**Task-agnosticism:** TD error EMD requires only `(values, rewards, dones)` — the minimal interface any actor-critic provides. No observation access, no network internals, no entropy, no positions. This is the strongest task-agnostic guarantee of any pairwise metric in the system.
+**Task-agnosticism:** Normalized TD error EMD requires only `(values, rewards, dones)` — the minimal interface any actor-critic provides. No observation access, no network internals, no entropy, no positions. This is the strongest task-agnostic guarantee of any pairwise metric in the system.
 
 **Temporal blind spot:** EMD compares distributions, not sequences. Two mazes where the agent is confused early vs confused late produce identical EMD if the overall δ distributions match. This is a real limitation — gradient updates happen in order, so temporal profile affects learning. For temporal sensitivity, use Regret DTW (r=0.290 correlation with EMD, captures temporal shape).
 
@@ -147,7 +153,7 @@ CENIE fits a diagonal-covariance GMM on LSTM hidden state + action pairs (257D) 
 
 **NLL score interpretation:** Novelty = `-mean(log p(x_t | GMM))`. More negative = more familiar (high density). Less negative / positive = more novel (low density). Buffer levels typically score -250 to -110. A good gate threshold is around -200 (rejects the most familiar ~50% of experiences).
 
-**Not pairwise:** CENIE scores a trajectory against a density model, not against another trajectory. It cannot be used for the t-SNE diversity embedding (which requires pairwise distances). The embedding always uses TD Error EMD regardless of gate metric.
+**Not pairwise:** CENIE scores a trajectory against a density model, not against another trajectory. It cannot be used for the t-SNE diversity embedding (which requires pairwise distances). The embedding always uses Normalized TD Error EMD regardless of gate metric.
 
 **Architecture coupling:** Uses LSTM hidden states — tied to the agent's architecture. If the agent changes (different hidden dim, no LSTM), the GMM must be refitted and thresholds recalibrated.
 
@@ -171,8 +177,24 @@ This means CENIE's advantage over pairwise metrics (which subsample ~6 reference
 | Regret DTW | Pairwise | O(T1·T2) | ~1s total | Impractical |
 | Action DTW | Pairwise | O(T1·T2) | ~1s total | Impractical |
 | Mode Divergence | Pairwise | O(T) classify + O(1) KL | <1s total | ~minutes |
-| TD Error EMD | Pairwise | O(T) compute + O(T log T) sort | <1s total | ~minutes |
+| Norm TD Error EMD | Pairwise | O(T) compute + O(T log T) sort | <1s total | ~minutes |
 | Value Error | Standalone | O(T) per maze | <1s total | ~seconds |
 | CENIE Novelty | Standalone | O(T·K) score (K=GMM components) | <1s total | ~seconds + GMM fit |
 
 **Pairwise metrics** scale as O(N²). **Standalone metrics** (Value Error, CENIE) scale as O(N). CENIE has a one-time GMM fitting cost (~3s for 50 levels / 4000 samples) but O(1) per candidate after that — this is its key scaling advantage over pairwise metrics for large buffers.
+
+---
+
+## Diverse Reference Selection
+
+The `--strategy diverse` reference selection uses precomputed TD errors (`buffer_td_errors.npz`) to greedily select N maximally-spread references from all 4000 buffer levels in ~0.3s (no agent rollouts needed for selection).
+
+**Vectorized pairwise computation:** The full 4000×4000 distance matrix is computed via chunked numpy broadcasting on the (4000, 200) quantile matrix — ~15s for exact results (no sampling heuristics). The starting pair is the true global maximum. Memory is managed by processing 500-row chunks, keeping the intermediate tensor under ~800 MB.
+
+**Fallback:** If precomputed TD errors are unavailable, falls back to rollout-based selection on a stratified candidate pool (slower, less coverage).
+
+
+
+# /-----/ Need to remove hybrid strategy minimum episode length filter
+# /-----/ Need to wire up SFL to diverse/hybrid level selection strategies
+# /-----/ Currently we filter by stale regret but fresh TD error

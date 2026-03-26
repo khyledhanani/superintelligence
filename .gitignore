@@ -176,4 +176,4 @@ vae/model/*.pkl
 gcs_artifacts/
 
 # LLM-generated maze levels
-llm/generated_levels/
+llm/generated_levels/.planning/

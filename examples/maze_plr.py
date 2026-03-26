@@ -1491,7 +1491,10 @@ if __name__=="__main__":
     llm_group.add_argument("--llm_gate", action=argparse.BooleanOptionalAction, default=True,
                            help="Enable decision gate (difficulty+diversity filter) for LLM mazes")
     llm_group.add_argument("--llm_difficulty_threshold", type=float, default=0.6,
-                           help="Minimum difficulty score (regret) for gate acceptance")
+                           help="Minimum difficulty score for gate acceptance")
+    llm_group.add_argument("--llm_difficulty_metric", type=str, default="sfl",
+                           choices=["sfl", "regret"],
+                           help="Difficulty metric: sfl=p*(1-p) learnability, regret=MaxMC regret")
     llm_group.add_argument("--llm_difficulty_gate_mode", type=str, default="fixed",
                            choices=["fixed", "buffer_mean", "reference_mean", "competitive"],
                            help="How LLM difficulty threshold is set: fixed=absolute, "
@@ -1508,7 +1511,9 @@ if __name__=="__main__":
                            choices=["td_error_emd", "experience_divergence", "position_dtw"],
                            help="Diversity metric for decision gate")
     llm_group.add_argument("--llm_max_diversity_retries", type=int, default=2,
-                           help="Max LLM retries when gate rejects a maze")
+                           help="Max LLM retries when diversity gate rejects (feedback loop)")
+    llm_group.add_argument("--llm_max_seed_retries", type=int, default=3,
+                           help="Max fresh LLM calls per seed slot when gate rejects (difficulty or diversity)")
     llm_group.add_argument("--llm_n_rollouts", type=int, default=100,
                            help="Number of agent rollouts per candidate for gate evaluation")
 

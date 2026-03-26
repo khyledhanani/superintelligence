@@ -1,16 +1,14 @@
 #!/bin/bash
-# ACCEL+LLM Injection Experiment
-# Run this script on a GPU node (albacore, smew, or canada).
-# Set SEED below — one seed per machine for parallel execution.
+# ACCEL+LLM Injection — Claude Sonnet via OpenRouter
+# Includes: seed retries, normalized TD EMD, auto-visualization
 #
-# === Seed (set per machine: 0, 1, or 2) ===
 SEED=0
-#
-# === Ablation parameters (change these for ablation experiments) ===
-INJECT_START=5000       # --llm_inject_start_step
-INJECT_INTERVAL=5000    # --llm_inject_interval
-BATCH_SIZE=20           # --llm_batch_size (min accepted seeds)
-MUTATIONS=50            # --llm_mutations_per_seed
+
+# === Ablation parameters ===
+INJECT_START=5000
+INJECT_INTERVAL=5000
+BATCH_SIZE=20           # min accepted seeds
+MUTATIONS=50            # mutations per seed
 MAX_SEED_RETRIES=5      # cap = BATCH_SIZE * MAX_SEED_RETRIES = 100
 
 set -e
@@ -18,9 +16,6 @@ set -e
 # Force conda CUDA libs (system CUDA 13.1 cuSOLVER is incompatible)
 export LD_LIBRARY_PATH=/cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env/lib:${LD_LIBRARY_PATH:-}
 PYTHON=/cs/student/project_msc/2025/csml/gmaralla/miniconda3/envs/jax_env/bin/python
-
-# OpenRouter API key — set in environment or .env file in repo root
-# export OPENROUTER_API_KEY="sk-or-..."
 
 COMMON="--project JAXUED_LLM \
         --num_updates 50000 --eval_freq 250 \
@@ -31,11 +26,11 @@ export WANDB_DIR=/tmp/wandb
 export JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache
 mkdir -p /tmp/jax_cache
 
-echo "=== [$(date)] Seed $SEED starting ==="
+echo "=== [$(date)] Seed $SEED (Sonnet via OpenRouter) starting ==="
 
 $PYTHON examples/maze_plr.py $COMMON \
   --use_accel --use_llm \
-  --llm_provider openrouter --llm_model openai/gpt-5.4 --llm_config llm/config.yaml \
+  --llm_provider openrouter --llm_model anthropic/claude-sonnet-4-6 --llm_config llm/config.yaml \
   --llm_inject_start_step ${INJECT_START} \
   --llm_inject_interval ${INJECT_INTERVAL} \
   --llm_batch_size ${BATCH_SIZE} \
@@ -45,7 +40,7 @@ $PYTHON examples/maze_plr.py $COMMON \
   --llm_difficulty_gate_mode buffer_mean \
   --llm_diversity_gate_mode buffer_median \
   --seed $SEED \
-  --run_name "accel-llm-gpt-v4" \
-  2>&1 | tee /tmp/llm_injection_seed${SEED}.log
+  --run_name "accel-llm-sonnet-v4" \
+  2>&1 | tee /tmp/llm_sonnet_v3_seed${SEED}.log
 
 echo "=== [$(date)] Seed $SEED complete ==="

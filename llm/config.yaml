@@ -28,7 +28,7 @@ validate_solvable: true     # BFS solvability check on generated mazes
 # --- Reference Mazes ---
 buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
 num_refs: 6                 # Number of reference mazes from buffer
-strategy: top_regret        # "top_regret", "random", or "diverse"
+strategy: hybrid            # "top_regret", "random", "diverse", or "hybrid" (above-mean difficulty + max diversity)
 
 # --- Metric Injection ---
 # Controls which metrics are computed from agent rollouts and shown to the LLM.
@@ -46,13 +46,14 @@ prompt_metrics:
   path_overlay: true        # ASCII visualization of agent trajectory on the grid
   position_vector: true    # Agent (x,y) per step — lets LLM link regret/entropy spikes to grid locations
   value_error: true        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
+  normalized_td_error: false # Normalized TD error per step — fraction of total learning signal at each timestep
   learnability: false       # SFL learnability p*(1-p) from multi-rollout solve rate (requires n_rollouts > 1)
 
 # Pairwise metrics injected into the LLM prompt (between all reference pairs).
 pairwise_metrics:
   position_dtw: false        # Spatial path similarity between two trajectories
   mode_transition: true    # Experience mode transition divergence (experiential diversity)
-  td_error: true           # TD error distribution EMD (task-agnostic learning signal diversity)
+  td_error: true           # Normalized TD error distribution EMD (task-agnostic learning signal shape diversity)
 
 # --- Agent & Feedback Loop ---
 agent_dir: gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198
@@ -69,11 +70,13 @@ gate:
   difficulty_metric: sfl        # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
                                 #   regret: rejects too-easy mazes (threshold ~0.6, buffer max 0.475)
                                 #   sfl: rejects too-easy AND too-hard mazes (threshold ~0.1, max at p=0.5 is 0.25)
-  min_diversity: 0.015          # Min distance to closest reference
-  diversity_metric: td_error_emd  # "td_error_emd", "experience_divergence", "position_dtw", or "cenie"
+  min_diversity: 0.03           # Min distance to closest reference
+  diversity_metric: normalized_td_error_emd  # "td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", or "cenie"
 
 # --- Visualization ---
-embedding_metric: td_error_emd    # Pairwise metric for t-SNE diversity embedding plot ("td_error_emd")
+embedding_metric: td_error_emd    # Pairwise metric for t-SNE diversity embedding plot ("td_error_emd" or "normalized_td_error_emd")
+buffer_td_errors: gcs_artifacts/buffer/buffer_td_errors.npz  # Precomputed buffer TD errors for embedding background (run precompute_buffer_embeddings.py)
+buffer_embed_samples: 200   # Buffer levels in embedding plot (0=none, -1=all, default=200)
 
 # --- Metric Display ---
 downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt
