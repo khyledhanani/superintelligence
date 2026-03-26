@@ -57,6 +57,30 @@ class TrainState(BaseTrainState):
     mutation_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
 
 # region PPO helper functions
+def compute_td_errors(
+    gamma: float,
+    last_value: chex.Array,
+    values: chex.Array,
+    rewards: chex.Array,
+    dones: chex.Array,
+) -> chex.Array:
+    """Compute per-step TD errors: δ_t = r_t + γ·V(s_{t+1})·(1-done) - V(s_t).
+
+    Args:
+        gamma: Discount factor
+        last_value: Shape (NUM_ENVS,) — value estimate at final step
+        values: Shape (NUM_STEPS, NUM_ENVS)
+        rewards: Shape (NUM_STEPS, NUM_ENVS)
+        dones: Shape (NUM_STEPS, NUM_ENVS)
+
+    Returns:
+        TD errors of shape (NUM_STEPS, NUM_ENVS)
+    """
+    # next_values[t] = values[t+1] for t < T-1, last_value for t = T-1
+    next_values = jnp.concatenate([values[1:], last_value[None, :]], axis=0)
+    td_errors = rewards + gamma * next_values * (1 - dones) - values
+    return td_errors
+
 def compute_gae(
     gamma: float,
     lambd: float,
@@ -109,9 +133,9 @@ def sample_trajectories_rnn(
 
     Args:
 
-        rng (chex.PRNGKey): Singleton 
-        env (UnderspecifiedEnv): 
-        env_params (EnvParams): 
+        rng (chex.PRNGKey): Singleton
+        env (UnderspecifiedEnv):
+        env_params (EnvParams):
         train_state (TrainState): Singleton
         init_hstate (chex.ArrayTree): This is the init RNN hidden state, has to have shape (NUM_ENVS, ...)
         init_obs (Observation): The initial observation, shape (NUM_ENVS, ...)
@@ -120,7 +144,9 @@ def sample_trajectories_rnn(
         max_episode_length (int): The maximum episode length, i.e., the number of steps to do the rollouts for.
 
     Returns:
-        Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict, chex.Array]]: (rng, train_state, hstate, last_obs, last_env_state, last_value), traj, where traj is (obs, action, reward, done, log_prob, value, info, agent_pos). agent_pos has shape (NUM_STEPS, NUM_ENVS, 2). The first element in the tuple consists of arrays that have shapes (NUM_ENVS, ...) (except `rng` and and `train_state` which are singleton). The second element in the tuple is of shape (NUM_STEPS, NUM_ENVS, ...), and it contains the trajectory.
+        (rng, train_state, hstate, last_obs, last_env_state, last_value), traj
+        where traj is (obs, action, reward, done, log_prob, value, info, agent_pos, hstate_h).
+        hstate_h is the LSTM output hidden state of shape (NUM_STEPS, NUM_ENVS, 256).
     """
     def sample_step(carry, _):
         rng, train_state, hstate, obs, env_state, last_done = carry
@@ -139,12 +165,15 @@ def sample_trajectories_rnn(
             log_prob.squeeze(0),
         )
 
+        # Extract LSTM output hidden state (carry_h, not carry_c)
+        hstate_h = hstate[1]  # (num_envs, 256)
+
         next_obs, env_state, reward, done, info = jax.vmap(
             env.step, in_axes=(0, 0, 0, None)
         )(jax.random.split(rng_step, num_envs), env_state, action, env_params)
 
         carry = (rng, train_state, hstate, next_obs, env_state, done)
-        return carry, (obs, action, reward, done, log_prob, value, info, agent_pos)
+        return carry, (obs, action, reward, done, log_prob, value, info, agent_pos, hstate_h)
 
     (rng, train_state, hstate, last_obs, last_env_state, last_done), traj = jax.lax.scan(
         sample_step,
@@ -395,7 +424,10 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
             os.remove(tmp_path)
         print(f"[GCS] Config saved to {overall_save_dir}/config.json")
     else:
-        overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config['seed']))
+        if config.get("output_dir"):
+            overall_save_dir = os.path.join(config["output_dir"], "checkpoints")
+        else:
+            overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config['seed']))
         os.makedirs(overall_save_dir, exist_ok=True)
         with open(os.path.join(overall_save_dir, 'config.json'), 'w+') as f:
             f.write(json.dumps(dict(config), indent=2))
@@ -493,6 +525,7 @@ def main(config=None, project="JAXUED_TEST"):
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
     wandb.define_metric("diversity/*", step_metric="num_updates")
+    wandb.define_metric("td_error/*", step_metric="num_updates")
     if config.get("use_llm"):
         wandb.define_metric("llm/*", step_metric="num_updates")
 
@@ -590,6 +623,14 @@ def main(config=None, project="JAXUED_TEST"):
                 log_dict["cmaes/sigma"] = float(np.array(stats["cmaes/sigma"])[dr_mask].mean())
                 log_dict["cmaes/pop_spread"] = float(np.array(stats["cmaes/pop_spread"])[dr_mask].mean())
                 log_dict["cmaes/mean_z_norm"] = float(np.array(stats["cmaes/mean_z_norm"])[dr_mask].mean())
+
+        # TD error stats (averaged over eval_freq training steps)
+        if "td_error/mean" in stats:
+            td_mean = np.array(stats["td_error/mean"])
+            log_dict["td_error/mean"] = float(td_mean.mean())
+            log_dict["td_error/std"] = float(np.array(stats["td_error/std"]).mean())
+            log_dict["td_error/abs_mean"] = float(np.array(stats["td_error/abs_mean"]).mean())
+            log_dict["td_error/max"] = float(np.array(stats["td_error/max"]).mean())
 
         wandb.log(log_dict)
 
@@ -729,7 +770,7 @@ def main(config=None, project="JAXUED_TEST"):
             # Rollout
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
+                (obs, actions, rewards, dones, log_probs, values, info, agent_positions, hstates),
             ) = sample_trajectories_rnn(
                 rng,
                 env,
@@ -782,10 +823,17 @@ def main(config=None, project="JAXUED_TEST"):
             # Validity check for generated levels (CMA-ES or random)
             is_valid = jax.vmap(lambda l: l.is_well_formatted())(new_levels)
 
+            # TD error stats for this batch of rollouts
+            td_errors = compute_td_errors(config["gamma"], last_value, values, rewards, dones)
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid.mean() * 100,
+                "td_error/mean": td_errors.mean(),
+                "td_error/std": td_errors.std(),
+                "td_error/abs_mean": jnp.abs(td_errors).mean(),
+                "td_error/max": jnp.abs(td_errors).max(),
             }
 
             # CMA-ES monitoring metrics
@@ -821,7 +869,7 @@ def main(config=None, project="JAXUED_TEST"):
             init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), levels, env_params)
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
+                (obs, actions, rewards, dones, log_probs, values, info, agent_positions, hstates),
             ) = sample_trajectories_rnn(
                 rng,
                 env,
@@ -855,10 +903,17 @@ def main(config=None, project="JAXUED_TEST"):
                 update_grad=True,
             )
                             
+            # TD error stats for replay rollouts
+            td_errors = compute_td_errors(config["gamma"], last_value, values, rewards, dones)
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": jnp.float32(0.0),  # no new levels generated
+                "td_error/mean": td_errors.mean(),
+                "td_error/std": td_errors.std(),
+                "td_error/abs_mean": jnp.abs(td_errors).mean(),
+                "td_error/max": jnp.abs(td_errors).max(),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -893,7 +948,7 @@ def main(config=None, project="JAXUED_TEST"):
             # rollout
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info, agent_positions),
+                (obs, actions, rewards, dones, log_probs, values, info, agent_positions, hstates),
             ) = sample_trajectories_rnn(
                 rng,
                 env,
@@ -930,10 +985,17 @@ def main(config=None, project="JAXUED_TEST"):
             # Validity check for mutated levels
             is_valid_mut = jax.vmap(lambda l: l.is_well_formatted())(child_levels)
 
+            # TD error stats for mutation rollouts
+            td_errors = compute_td_errors(config["gamma"], last_value, values, rewards, dones)
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid_mut.mean() * 100,
+                "td_error/mean": td_errors.mean(),
+                "td_error/std": td_errors.std(),
+                "td_error/abs_mean": jnp.abs(td_errors).mean(),
+                "td_error/max": jnp.abs(td_errors).max(),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -1088,14 +1150,17 @@ def main(config=None, project="JAXUED_TEST"):
             "update_num": update_num,
         }
 
-        dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+        if config.get("output_dir"):
+            dump_dir = os.path.join(config["output_dir"], "buffer_dumps")
+        else:
+            dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
         os.makedirs(dump_dir, exist_ok=True)
-        tag = f"_{update_num}k" if update_num > 0 else "_final"
+        tag = f"_{update_num}" if update_num > 0 else "_final"
         tokens_path = os.path.join(dump_dir, f"buffer_tokens{tag}.npy")
         dump_path = os.path.join(dump_dir, f"buffer_dump{tag}.npz")
         np.save(tokens_path, np.asarray(tokens))
         np.savez_compressed(dump_path, **dump_data)
-        print(f"[Buffer dump @ {update_num}k] {size} levels -> {tokens_path}")
+        print(f"[Buffer dump @ {update_num}] {size} levels -> {tokens_path}")
 
         if config.get("gcs_bucket"):
             gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
@@ -1142,6 +1207,73 @@ def main(config=None, project="JAXUED_TEST"):
                 inject_steps.append(cs)
         print(f"[LLM] Injection schedule ({len(inject_steps)} events): {inject_steps}")
 
+    # --- Pairwise diversity computation (runs outside JIT at diversity_log_interval) ---
+    def compute_buffer_diversity(train_state, eval_step):
+        """Subsample buffer levels, roll out agent, compute pairwise TD error EMD."""
+        from metrics.pairwise.td_error_distribution import td_error_divergence
+
+        updates_so_far = (eval_step + 1) * config["eval_freq"]
+        interval = config.get("diversity_log_interval", 0)
+        if interval <= 0 or updates_so_far % interval != 0:
+            return
+
+        sampler = train_state.sampler
+        buf_size = int(np.asarray(sampler["size"]))
+        n_sample = min(config.get("diversity_sample_size", 20), buf_size)
+        if n_sample < 2:
+            return
+
+        # Subsample indices
+        rng_div = jax.random.PRNGKey(eval_step)
+        indices = jax.random.choice(rng_div, buf_size, shape=(n_sample,), replace=False)
+        indices = np.asarray(indices)
+
+        # Extract levels and roll out
+        levels_pytree = sampler["levels"]
+        sample_levels = [jax.tree_util.tree_map(lambda x: x[i], levels_pytree) for i in indices]
+        batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *sample_levels)
+
+        # Roll out agent on subsampled buffer levels (need values + rewards for TD error)
+        rng_traj = jax.random.PRNGKey(eval_step + 2000)
+        init_obs, init_env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
+            jax.random.split(rng_traj, n_sample), batched, env_params
+        )
+        (_, _, _, _, _, last_val), (_, act_t, rew_t, done_t, _, val_t, _, _, hstate_t) = sample_trajectories_rnn(
+            rng_traj, env, env_params, train_state,
+            ActorCritic.initialize_carry((n_sample,)),
+            init_obs, init_env_state, n_sample, config["num_steps"],
+        )
+
+        val_np = np.asarray(val_t)    # (T, n_sample)
+        rew_np = np.asarray(rew_t)    # (T, n_sample)
+        dones_np = np.asarray(done_t) # (T, n_sample)
+
+        # Pairwise TD error EMD
+        emd_values = []
+        for i in range(n_sample):
+            for j in range(i + 1, n_sample):
+                result = td_error_divergence(
+                    {"values": val_np[:, i], "rewards": rew_np[:, i]},
+                    dones_np[:, i],
+                    {"values": val_np[:, j], "rewards": rew_np[:, j]},
+                    dones_np[:, j],
+                )
+                emd_values.append(result["emd"])
+
+        if emd_values:
+            emd_arr = np.array(emd_values)
+            div_log = {
+                "num_updates": updates_so_far,
+                "diversity/td_emd_mean": float(emd_arr.mean()),
+                "diversity/td_emd_std": float(emd_arr.std()),
+                "diversity/td_emd_min": float(emd_arr.min()),
+                "diversity/td_emd_max": float(emd_arr.max()),
+                "diversity/buffer_size": buf_size,
+            }
+            wandb.log(div_log)
+            print(f"[Diversity @ {updates_so_far}] TD-EMD: mean={emd_arr.mean():.4f}, "
+                  f"std={emd_arr.std():.4f}, n_pairs={len(emd_values)}")
+
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
@@ -1151,6 +1283,9 @@ def main(config=None, project="JAXUED_TEST"):
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
+
+        # Pairwise diversity logging
+        compute_buffer_diversity(runner_state[1], eval_step)
 
         # LLM injection hook
         if llm_injector is not None:
@@ -1163,7 +1298,7 @@ def main(config=None, project="JAXUED_TEST"):
         # Periodic buffer dump at configured intervals
         updates_so_far = (eval_step + 1) * config["eval_freq"]
         if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
-            dump_buffer(runner_state[1], updates_so_far // 1000)
+            dump_buffer(runner_state[1], updates_so_far)
 
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]
@@ -1383,8 +1518,12 @@ if __name__=="__main__":
     parser.add_argument("--mode", type=str, default='train')
     parser.add_argument("--checkpoint_directory", type=str, default=None)
     parser.add_argument("--checkpoint_to_eval", type=int, default=-1)
+    # === OUTPUT ===
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Co-locate checkpoints + buffer dumps under one directory. "
+                             "Creates output_dir/checkpoints/ and output_dir/buffer_dumps/")
     # === CHECKPOINTING ===
-    parser.add_argument("--checkpoint_save_interval", type=int, default=2)
+    parser.add_argument("--checkpoint_save_interval", type=int, default=1)
     parser.add_argument("--max_number_of_checkpoints", type=int, default=60)
     # === EVAL ===
     parser.add_argument("--eval_freq", type=int, default=250)
@@ -1451,7 +1590,7 @@ if __name__=="__main__":
                        help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
     group.add_argument("--gcs_prefix", type=str, default="accel",
                        help="Prefix path within GCS bucket")
-    group.add_argument("--buffer_dump_interval", type=int, default=10000,
+    group.add_argument("--buffer_dump_interval", type=int, default=250,
                        help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
     group.add_argument("--skip_post_eval", action="store_true", default=False,
                        help="Skip post-training buffer evaluation, rendering, and PCA (run evaluate_buffer.py separately)")
