@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 # VAE + CMA-ES imports (conditional on --use_cmaes flag)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vae'))
 from vae_model import CluttrVAE
-from vae_level_utils import decode_latent_to_levels, level_to_tokens
+from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_level
 from cmaes_manager import CMAESManager
 
 from llm.injection_config import LLMInjectionConfig
@@ -511,7 +511,8 @@ def main(config=None, project="JAXUED_TEST"):
         print(f"  {k}: {v}")
     print("=" * 60)
 
-    run = wandb.init(config=config, project=project, group=config["run_name"], tags=tags)
+    wb_group = config.get("wandb_group") or config["run_name"]
+    run = wandb.init(config=config, project=project, group=wb_group, tags=tags)
     config = wandb.config
     
     wandb.define_metric("num_updates")
@@ -1637,6 +1638,8 @@ if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", type=str, default="JAXUED_TEST")
     parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None,
+                        help="Wandb run group (defaults to run_name if not set)")
     parser.add_argument("--seed", type=int, default=0)
     # === Train vs Eval ===
     parser.add_argument("--mode", type=str, default='train')
