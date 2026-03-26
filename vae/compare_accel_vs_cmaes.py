@@ -1024,9 +1024,135 @@ for run_name, cfg in CONDITIONS.items():
         print(f"    {cfg['label']}: {np.mean(seed_turnovers):.1%} +/- {np.std(seed_turnovers):.1%}")
 
 
-# ── 9. Summary Table ─────────────────────────────────────────────────────
+# ── 9. Curriculum vs Random Latent Baselines (CLUTR-style) ───────────────
 print("\n" + "=" * 60)
-print("9. Summary Table")
+print("9. Curriculum vs Random Latent Baselines")
+print("=" * 60)
+
+from vae_level_utils import repair_tokens
+
+def decode_latents_to_tokens(vae_model, params, z_batch, batch_size=512):
+    """Decode latent vectors to token sequences."""
+    all_tokens = []
+    for i in range(0, len(z_batch), batch_size):
+        z_b = jnp.array(z_batch[i:i + batch_size])
+        logits = vae_model.apply({"params": params}, z_b, method=vae_model.decode)
+        tokens = jnp.argmax(logits, axis=-1)  # (batch, seq_len)
+        # Repair each sequence
+        tokens = jax.vmap(repair_tokens)(tokens)
+        all_tokens.append(np.asarray(tokens))
+    return np.concatenate(all_tokens, axis=0)
+
+def count_walls(tokens_batch):
+    """Count active walls per level from token sequences."""
+    wall_slots = tokens_batch[:, :50]  # first 50 tokens are wall indices
+    return (wall_slots != 0).sum(axis=1)
+
+# Number of levels to sample from baselines (match typical buffer size)
+n_baseline_samples = 2000
+
+# (a) Domain Randomization on latent space: z ~ N(0, I)
+rng_dr = jax.random.PRNGKey(42)
+z_dr = np.asarray(jax.random.normal(rng_dr, (n_baseline_samples, 64)))
+tokens_dr = decode_latents_to_tokens(vae, vae_params, z_dr)
+walls_dr = count_walls(tokens_dr)
+print(f"  DR on latent space: {n_baseline_samples} samples, mean walls={walls_dr.mean():.1f}")
+
+# (b) CMA-ES buffer levels (final dump, all conditions)
+# (c) ACCEL buffer levels (final dump)
+curriculum_data = {}
+for run_name, cfg in CONDITIONS.items():
+    all_walls = []
+    for seed in SEEDS:
+        dumps = all_data[run_name][seed]["dumps"]
+        final_key = "final" if "final" in dumps else (sorted(dumps.keys())[-1] if dumps else None)
+        if final_key and final_key in dumps:
+            d = dumps[final_key]
+            size = int(d.get("size", len(d["tokens"])))
+            tokens = d["tokens"][:size]
+            all_walls.append(count_walls(tokens))
+    if all_walls:
+        curriculum_data[run_name] = np.concatenate(all_walls)
+        print(f"  {cfg['label']}: {len(curriculum_data[run_name])} levels, "
+              f"mean walls={curriculum_data[run_name].mean():.1f}")
+
+# Plot: side-by-side histograms of wall counts
+n_panels = 1 + len(curriculum_data)  # DR + each condition
+fig, axes_cur = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5), sharey=True)
+
+# DR baseline
+axes_cur[0].hist(walls_dr, bins=np.arange(0, 52) - 0.5, color="gray", alpha=0.8, edgecolor="white")
+axes_cur[0].set_title("Domain Randomization\n(z ~ N(0,I))", fontweight="bold")
+axes_cur[0].set_xlabel("Number of Walls")
+axes_cur[0].set_ylabel("Count")
+axes_cur[0].axvline(walls_dr.mean(), color="red", ls="--", lw=1.5, label=f"mean={walls_dr.mean():.1f}")
+axes_cur[0].legend(fontsize=8)
+
+# Each condition's curriculum
+for i, (run_name, cfg) in enumerate(CONDITIONS.items()):
+    ax = axes_cur[i + 1]
+    if run_name in curriculum_data:
+        walls = curriculum_data[run_name]
+        ax.hist(walls, bins=np.arange(0, 52) - 0.5, color=cfg["color"], alpha=0.8, edgecolor="white")
+        ax.axvline(walls.mean(), color="red", ls="--", lw=1.5, label=f"mean={walls.mean():.1f}")
+        ax.legend(fontsize=8)
+    ax.set_title(f"{cfg['label']}\n(final buffer)", fontweight="bold")
+    ax.set_xlabel("Number of Walls")
+
+fig.suptitle("Curriculum Wall Count Distribution: Trained Search vs Random Latent Baseline",
+             fontsize=13, fontweight="bold", y=1.02)
+plt.tight_layout()
+savefig(fig, "09e_curriculum_vs_random_wall_counts.png")
+
+# Evolution over training: wall count histograms per timestep (3D-style heatmaps)
+for run_name, cfg in CONDITIONS.items():
+    fig_evo, axes_evo = plt.subplots(1, len(SEEDS), figsize=(6 * len(SEEDS), 5), sharey=True)
+    if len(SEEDS) == 1:
+        axes_evo = [axes_evo]
+
+    for s_idx, seed in enumerate(SEEDS):
+        ax = axes_evo[s_idx]
+        dumps = all_data[run_name][seed]["dumps"]
+        ts_keys = sorted(dumps.keys(),
+                         key=lambda x: int(x.replace("k", "").replace("final", "999")))
+
+        # Build 2D histogram: rows=timesteps, cols=wall count bins
+        wall_bins = np.arange(0, 52)
+        heatmap = np.zeros((len(ts_keys), len(wall_bins) - 1))
+        ts_labels = []
+
+        for t_idx, ts in enumerate(ts_keys):
+            d = dumps[ts]
+            size = int(d.get("size", len(d["tokens"])))
+            tokens = d["tokens"][:size]
+            walls = count_walls(tokens)
+            hist, _ = np.histogram(walls, bins=wall_bins)
+            # Normalize to frequency
+            heatmap[t_idx] = hist / hist.sum() if hist.sum() > 0 else hist
+            ts_labels.append(ts)
+
+        im = ax.imshow(heatmap, aspect="auto", origin="lower",
+                       extent=[0, 51, -0.5, len(ts_keys) - 0.5],
+                       cmap="viridis", interpolation="nearest")
+        ax.set_yticks(range(len(ts_keys)))
+        ax.set_yticklabels(ts_labels)
+        ax.set_xlabel("Number of Walls")
+        ax.set_title(f"Seed {seed}", fontweight="bold")
+        if s_idx == 0:
+            ax.set_ylabel("Buffer Timestep")
+
+    plt.colorbar(im, ax=axes_evo, label="Frequency", shrink=0.8)
+    fig_evo.suptitle(f"{cfg['label']} — Wall Count Evolution Over Training",
+                     fontsize=13, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    savefig(fig_evo, f"09f_wall_evolution_{run_name}.png")
+
+print("  Saved curriculum comparison and wall evolution plots")
+
+
+# ── 10. Summary Table ────────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("10. Summary Table")
 print("=" * 60)
 
 summary_rows = []

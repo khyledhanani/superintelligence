@@ -50,13 +50,22 @@ class CMAESManager:
         print(f"[CMAESManager] popsize={popsize}, latent_dim={latent_dim}, "
               f"num_dims={getattr(self.strategy, 'num_dims', 'N/A')}")
 
-    def initialize(self, rng):
-        """Initialize CMA-ES state. Returns a JAX pytree."""
+    def initialize(self, rng, mean=None):
+        """Initialize CMA-ES state. Returns a JAX pytree.
+
+        Args:
+            rng: PRNGKey.
+            mean: Optional initial mean vector (latent_dim,).
+                  If None, defaults to zeros (original behavior).
+        """
+        init_mean = mean if mean is not None else self.initial_mean
         if _NEW_API:
-            # DistributionBasedAlgorithm.init(self, key, mean, params) -> State
-            return self.strategy.init(rng, self.initial_mean, self.es_params)
+            return self.strategy.init(rng, init_mean, self.es_params)
         else:
-            return self.strategy.initialize(rng, self.es_params)
+            state = self.strategy.initialize(rng, self.es_params)
+            # Old API: manually override the mean in the returned state
+            state = state.replace(mean=init_mean)
+            return state
 
     def ask(self, rng, es_state):
         """Sample population from CMA-ES.
