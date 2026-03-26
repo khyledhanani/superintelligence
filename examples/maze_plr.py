@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 # VAE + CMA-ES imports (conditional on --use_cmaes flag)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vae'))
 from vae_model import CluttrVAE
-from vae_level_utils import decode_latent_to_levels, level_to_tokens
+from vae_level_utils import decode_latent_to_levels, level_to_tokens, tokens_to_level
 from cmaes_manager import CMAESManager
 
 from llm.injection_config import LLMInjectionConfig
@@ -632,6 +632,25 @@ def main(config=None, project="JAXUED_TEST"):
             log_dict["td_error/abs_mean"] = float(np.array(stats["td_error/abs_mean"]).mean())
             log_dict["td_error/max"] = float(np.array(stats["td_error/max"]).mean())
 
+        # Provenance-aware replay rate tracking
+        if _buffer_origins is not None and "replay_level_inds" in stats:
+            all_inds = np.array(stats["replay_level_inds"])  # (eval_freq, num_train_envs)
+            valid_mask = all_inds >= 0  # -1 = DR or mutation step (no replay)
+            valid_inds = all_inds[valid_mask].flatten()
+            if len(valid_inds) > 0:
+                # Count replays by origin type
+                replayed_origins = _buffer_origins[valid_inds]
+                n_total = len(valid_inds)
+                n_organic = int((replayed_origins == 0).sum())
+                n_injected = int((replayed_origins > 0).sum())
+                log_dict["provenance/replay_total"] = n_total
+                log_dict["provenance/replay_organic"] = n_organic
+                log_dict["provenance/replay_injected"] = n_injected
+                log_dict["provenance/replay_injected_pct"] = n_injected / max(n_total, 1)
+                # How many unique injected slots were replayed
+                unique_injected = len(set(valid_inds[replayed_origins > 0]))
+                log_dict["provenance/replay_unique_injected"] = unique_injected
+
         wandb.log(log_dict)
 
     # Setup the environment
@@ -834,6 +853,7 @@ def main(config=None, project="JAXUED_TEST"):
                 "td_error/std": td_errors.std(),
                 "td_error/abs_mean": jnp.abs(td_errors).mean(),
                 "td_error/max": jnp.abs(td_errors).max(),
+                "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),  # no replay this step
             }
 
             # CMA-ES monitoring metrics
@@ -914,6 +934,7 @@ def main(config=None, project="JAXUED_TEST"):
                 "td_error/std": td_errors.std(),
                 "td_error/abs_mean": jnp.abs(td_errors).mean(),
                 "td_error/max": jnp.abs(td_errors).max(),
+                "replay_level_inds": level_inds,  # (num_train_envs,) for provenance tracking
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -996,6 +1017,7 @@ def main(config=None, project="JAXUED_TEST"):
                 "td_error/std": td_errors.std(),
                 "td_error/abs_mean": jnp.abs(td_errors).mean(),
                 "td_error/max": jnp.abs(td_errors).max(),
+                "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),  # mutation step, parent was previous replay
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -1130,10 +1152,83 @@ def main(config=None, project="JAXUED_TEST"):
     rng_init, rng_train = jax.random.split(rng)
     
     train_state = create_train_state(rng_init)
+
+    # --- Resume agent params from checkpoint ---
+    if config.get("resume_checkpoint_dir"):
+        resume_dir = config["resume_checkpoint_dir"]
+        print(f"[Resume] Loading agent params from {resume_dir}...")
+        from cross_evaluate import load_agent as _load_agent
+        _resume_ts, _, _, _ = _load_agent(resume_dir)
+        if _resume_ts is not None:
+            train_state = train_state.replace(params=_resume_ts.params)
+            print(f"[Resume] Restored agent params from {resume_dir}")
+        else:
+            print(f"[Resume] WARNING: Failed to load params from {resume_dir}, starting fresh")
+
+    # --- Provenance tracking (numpy, outside JAX) ---
+    # origins: 0=organic, 1=LLM seed, 2=LLM mutation
+    # origin_ids: uint64 hash per level for matching across dumps
+    _buffer_origins = None      # np.ndarray (capacity,) int32
+    _buffer_origin_ids = None   # np.ndarray (capacity,) uint64
+
+    # --- Preload buffer from merged .npz ---
+    if config.get("preload_buffer_npz"):
+        import hashlib as _hl
+        preload_path = config["preload_buffer_npz"]
+        print(f"[Preload] Loading buffer from {preload_path}...")
+        preload = np.load(preload_path, allow_pickle=True)
+        pre_tokens = preload["tokens"]
+        pre_scores = preload["scores"]
+        pre_size = int(preload["size"])
+
+        # Reconstruct Level objects from tokens
+        pre_levels_list = [tokens_to_level(jnp.array(pre_tokens[i])) for i in range(pre_size)]
+        pre_levels_batched = Level.stack(pre_levels_list)
+
+        # Overwrite sampler fields
+        sampler = train_state.sampler
+        capacity = sampler["scores"].shape[0]
+        new_levels = jax.tree_util.tree_map(
+            lambda orig, loaded: orig.at[:pre_size].set(loaded),
+            sampler["levels"], pre_levels_batched,
+        )
+        new_scores = sampler["scores"].at[:pre_size].set(jnp.array(pre_scores[:pre_size], dtype=jnp.float32))
+        if "timestamps" in preload:
+            new_timestamps = sampler["timestamps"].at[:pre_size].set(
+                jnp.array(preload["timestamps"][:pre_size], dtype=jnp.int32))
+        else:
+            new_timestamps = sampler["timestamps"]
+
+        new_sampler = {**sampler, "levels": new_levels, "scores": new_scores,
+                       "timestamps": new_timestamps, "size": pre_size}
+        train_state = train_state.replace(sampler=new_sampler)
+
+        # Load provenance arrays
+        _buffer_origins = np.zeros(capacity, dtype=np.int32)
+        _buffer_origin_ids = np.zeros(capacity, dtype=np.uint64)
+        if "origins" in preload:
+            n = min(len(preload["origins"]), capacity)
+            _buffer_origins[:n] = preload["origins"][:n]
+        if "origin_ids" in preload:
+            n = min(len(preload["origin_ids"]), capacity)
+            _buffer_origin_ids[:n] = preload["origin_ids"][:n]
+
+        n_injected = int((_buffer_origins[:pre_size] > 0).sum())
+        print(f"[Preload] Loaded {pre_size} levels ({n_injected} injected, "
+              f"{pre_size - n_injected} organic)")
+
     runner_state = (rng_train, train_state)
-    
+
     def dump_buffer(train_state, update_num):
-        """Save PLR buffer as .npy (VAE token format) + .npz (full metadata). Uploads to GCS."""
+        """Save PLR buffer as .npy (VAE token format) + .npz (full metadata).
+
+        If provenance tracking is active (_buffer_origin_ids is set), computes
+        which injected levels are still present by matching token hashes, and
+        saves origins/origin_ids + survival stats alongside the dump.
+        """
+        import hashlib as _hl
+        nonlocal _buffer_origins, _buffer_origin_ids
+
         sampler = train_state.sampler
         size = int(sampler["size"])
         if size == 0:
@@ -1141,14 +1236,43 @@ def main(config=None, project="JAXUED_TEST"):
 
         buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
         tokens = jax.vmap(level_to_tokens)(buffer_levels)
+        tokens_np = np.asarray(tokens)
 
         dump_data = {
-            "tokens": np.asarray(tokens),
+            "tokens": tokens_np,
             "scores": np.asarray(sampler["scores"][:size]),
             "timestamps": np.asarray(sampler["timestamps"][:size]),
             "size": size,
             "update_num": update_num,
         }
+
+        # --- Provenance: match current buffer against injected origin_ids ---
+        if _buffer_origin_ids is not None:
+            # Compute current token hashes
+            current_hashes = np.array([
+                int(_hl.md5(tokens_np[i].tobytes()).hexdigest()[:16], 16)
+                for i in range(size)
+            ], dtype=np.uint64)
+
+            # Match: which current slots have an origin_id that was injected?
+            injected_ids = set(_buffer_origin_ids[_buffer_origins > 0])
+            current_origins = np.zeros(size, dtype=np.int32)
+            current_origin_ids = current_hashes.copy()
+            for i in range(size):
+                if current_hashes[i] in injected_ids:
+                    current_origins[i] = _buffer_origins[
+                        np.where(_buffer_origin_ids == current_hashes[i])[0][0]
+                    ] if current_hashes[i] in set(_buffer_origin_ids) else 0
+
+            n_survived = int((current_origins > 0).sum())
+            n_original = int((_buffer_origins[:size] > 0).sum()) if _buffer_origins is not None else 0
+
+            dump_data["origins"] = current_origins
+            dump_data["origin_ids"] = current_origin_ids
+            dump_data["n_injected_survived"] = n_survived
+            dump_data["n_injected_original"] = n_original
+
+            print(f"  [Provenance] {n_survived}/{n_original} injected levels still in buffer")
 
         if config.get("output_dir"):
             dump_dir = os.path.join(config["output_dir"], "buffer_dumps")
@@ -1160,7 +1284,7 @@ def main(config=None, project="JAXUED_TEST"):
         dump_path = os.path.join(dump_dir, f"buffer_dump{tag}.npz")
         np.save(tokens_path, np.asarray(tokens))
         np.savez_compressed(dump_path, **dump_data)
-        print(f"[Buffer dump @ {update_num}] {size} levels -> {tokens_path}")
+        print(f"[Buffer dump @ {update_num}] {size} levels -> {dump_path}")
 
         if config.get("gcs_bucket"):
             gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
@@ -1523,7 +1647,7 @@ if __name__=="__main__":
                         help="Co-locate checkpoints + buffer dumps under one directory. "
                              "Creates output_dir/checkpoints/ and output_dir/buffer_dumps/")
     # === CHECKPOINTING ===
-    parser.add_argument("--checkpoint_save_interval", type=int, default=1)
+    parser.add_argument("--checkpoint_save_interval", type=int, default=2)
     parser.add_argument("--max_number_of_checkpoints", type=int, default=60)
     # === EVAL ===
     parser.add_argument("--eval_freq", type=int, default=250)
@@ -1590,8 +1714,14 @@ if __name__=="__main__":
                        help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
     group.add_argument("--gcs_prefix", type=str, default="accel",
                        help="Prefix path within GCS bucket")
-    group.add_argument("--buffer_dump_interval", type=int, default=250,
+    group.add_argument("--buffer_dump_interval", type=int, default=10000,
                        help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
+    group.add_argument("--preload_buffer_npz", type=str, default=None,
+                       help="Path to a merged_buffer .npz to preload into the PLR sampler at init. "
+                            "Supports provenance tracking via 'origins' and 'origin_ids' arrays.")
+    group.add_argument("--resume_checkpoint_dir", type=str, default=None,
+                       help="Path to a checkpoint directory to restore agent params from "
+                            "(for resuming training, not eval). Loads params only, not sampler.")
     group.add_argument("--skip_post_eval", action="store_true", default=False,
                        help="Skip post-training buffer evaluation, rendering, and PCA (run evaluate_buffer.py separately)")
     # === DIVERSITY METRICS CONFIG ===

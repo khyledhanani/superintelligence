@@ -402,8 +402,24 @@ class MazeGenerator:
                 parts.append(f"[Your previous response]\n{m['content']}")
         user_prompt = "\n\n".join(parts)
 
+        # Find claude binary: PATH first, then VSCode extension native binary
+        import shutil, glob as _glob
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            candidates = _glob.glob(os.path.expanduser(
+                "~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude"
+            )) + _glob.glob(os.path.expanduser(
+                "~/.vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude"
+            ))
+            if candidates:
+                claude_bin = sorted(candidates)[-1]  # latest version
+        if not claude_bin:
+            raise FileNotFoundError(
+                "claude CLI not found in PATH or VSCode extensions."
+            )
+
         cmd = [
-            "claude", "-p", "-",  # read prompt from stdin
+            claude_bin, "-p", "-",  # read prompt from stdin
             "--output-format", "stream-json",
             "--verbose",
             "--max-turns", "1",
