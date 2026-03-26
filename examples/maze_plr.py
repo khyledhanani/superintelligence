@@ -300,6 +300,66 @@ def evaluate_rnn(
 
     return states, rewards, episode_lengths
 
+
+def rollout_for_embeddings(
+    rng: chex.PRNGKey,
+    env: UnderspecifiedEnv,
+    env_params: EnvParams,
+    train_state: TrainState,
+    init_hstate: chex.ArrayTree,
+    init_obs: Observation,
+    init_env_state: EnvState,
+    max_episode_length: int,
+) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+    """Roll out the agent and return LSTM hidden states + actions for embedding computation.
+
+    Returns:
+        (carry_h, actions, dones, episode_lengths) where:
+          carry_h: (NUM_STEPS, NUM_LEVELS, 256)  — LSTM hidden state (h, not c)
+          actions:  (NUM_STEPS, NUM_LEVELS)
+          dones:    (NUM_STEPS, NUM_LEVELS)
+          episode_lengths: (NUM_LEVELS,)
+    """
+    num_levels = jax.tree_util.tree_flatten(init_obs)[0][0].shape[0]
+
+    def step(carry, _):
+        rng, hstate, obs, state, done, mask, episode_length = carry
+        rng, rng_action, rng_step = jax.random.split(rng, 3)
+
+        x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, done))
+        hstate, pi, _ = train_state.apply_fn(train_state.params, x, hstate)
+        action = pi.sample(seed=rng_action).squeeze(0)
+
+        # hstate is (carry_c, carry_h); we want carry_h
+        carry_h = hstate[1]  # (num_levels, 256)
+
+        obs, next_state, reward, done, _ = jax.vmap(
+            env.step, in_axes=(0, 0, 0, None)
+        )(jax.random.split(rng_step, num_levels), state, action, env_params)
+
+        next_mask = mask & ~done
+        episode_length += mask
+
+        return (rng, hstate, obs, next_state, done, next_mask, episode_length), (carry_h, action, done)
+
+    (_, _, _, _, _, _, episode_lengths), (carry_h_all, actions_all, dones_all) = jax.lax.scan(
+        step,
+        (
+            rng,
+            init_hstate,
+            init_obs,
+            init_env_state,
+            jnp.zeros(num_levels, dtype=bool),
+            jnp.ones(num_levels, dtype=bool),
+            jnp.zeros(num_levels, dtype=jnp.int32),
+        ),
+        None,
+        length=max_episode_length,
+    )
+
+    return carry_h_all, actions_all, dones_all, episode_lengths
+
+
 def update_actor_critic_rnn(
     rng: chex.PRNGKey,
     train_state: TrainState,
@@ -1839,6 +1899,46 @@ def main(config=None, project="JAXUED_TEST"):
 
     runner_state = (rng_train, train_state)
 
+    def _compute_buffer_embeddings(train_state, buffer_levels, size, batch_size=256):
+        """Roll out agent on each buffer level and compute mean state-action embeddings.
+
+        Returns:
+            np.ndarray of shape (size, 257), dtype float32.
+            Each row = mean of concat(carry_h[t], action[t]) over the first episode.
+        """
+        max_steps = env_params.max_steps_in_episode
+        all_embeddings = []
+
+        for batch_start in range(0, size, batch_size):
+            batch_end = min(batch_start + batch_size, size)
+            bs = batch_end - batch_start
+            batch_levels = jax.tree_util.tree_map(lambda x: x[batch_start:batch_end], buffer_levels)
+
+            rng_emb = jax.random.PRNGKey(batch_start)
+            rng_reset, rng_roll = jax.random.split(rng_emb)
+            init_obs, init_env_state = jax.vmap(eval_env.reset_to_level, (0, 0, None))(
+                jax.random.split(rng_reset, bs), batch_levels, env_params
+            )
+            carry_h, actions, dones, ep_lens = rollout_for_embeddings(
+                rng_roll, eval_env, env_params, train_state,
+                ActorCritic.initialize_carry((bs,)),
+                init_obs, init_env_state, max_steps,
+            )
+            # carry_h: (T, bs, 256), actions: (T, bs), dones: (T, bs)
+            carry_h = np.asarray(carry_h)
+            actions = np.asarray(actions)
+            dones = np.asarray(dones)
+
+            for i in range(bs):
+                done_idx = np.where(dones[:, i])[0]
+                ep_len = int(done_idx[0] + 1) if len(done_idx) > 0 else len(dones[:, i])
+                h = carry_h[:ep_len, i, :]           # (ep_len, 256)
+                a = actions[:ep_len, i, None]         # (ep_len, 1)
+                sa = np.concatenate([h, a], axis=1)   # (ep_len, 257)
+                all_embeddings.append(sa.mean(axis=0))
+
+        return np.stack(all_embeddings).astype(np.float32)  # (size, 257)
+
     def dump_buffer(train_state, update_num):
         """Save PLR buffer as .npy (VAE token format) + .npz (full metadata). Uploads to GCS."""
         sampler = train_state.sampler
@@ -1849,12 +1949,18 @@ def main(config=None, project="JAXUED_TEST"):
         buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
         tokens = jax.vmap(_l2t)(buffer_levels)
 
+        # Compute mean LSTM state-action embeddings
+        print(f"[Buffer dump] Computing mean embeddings for {size} levels...")
+        mean_embeddings = _compute_buffer_embeddings(train_state, buffer_levels, size)
+        print(f"[Buffer dump] mean_embeddings shape: {mean_embeddings.shape}")
+
         dump_data = {
             "tokens": np.asarray(tokens),
             "scores": np.asarray(sampler["scores"][:size]),
             "timestamps": np.asarray(sampler["timestamps"][:size]),
             "size": size,
             "update_num": update_num,
+            "mean_embeddings": mean_embeddings,
         }
 
         dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
