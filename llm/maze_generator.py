@@ -77,6 +77,7 @@ class GenerationConfig:
     min_walls: int = 0
     min_path_distance: int = 0
     validate_solvable: bool = True
+    dev: bool = False  # Dev mode: skip LLM, return random buffer mazes instantly
 
     # Provider defaults (used only as fallback when no config file is loaded)
     _PROVIDER_DEFAULTS = {
@@ -116,7 +117,7 @@ class RejectedCandidate:
     issues: List[str]                  # gate_result.issues
     trajectory: Optional[Dict] = None  # agent trajectory (positions, values, dones, etc.)
     failed_difficulty: bool = False    # Failed difficulty gate (regret or SFL)
-    failed_diversity: bool = False     # Failed diversity gate (td_error_emd etc.)
+    failed_diversity: bool = False     # Failed diversity gate (normalized_td_error_emd etc.)
 
 
 @dataclass
@@ -311,6 +312,16 @@ class MazeGenerator:
         result.latency_ms = (time.time() - start) * 1000
         return result
 
+    # Pool of valid 13x13 mazes for --dev mode (sampled from buffer)
+    _DEV_MAZES = [
+        "#.#.#.......#\n#.#.#.#####.#\n#.#...#.....#\n#.#####.###.#\n#.......#.#.#\n###.###.#.#.#\n#...#.#...#.#\n#.###.#####.#\n#.#.........#\n#.#.#######.#\nG.#.#.......#\n..#.........#\n..#########>.",
+        ".............\n.###########.\n.#.........#.\n.#.#######.#.\n.#.#.....#.#.\n.#.#.###.#.#.\n.#.#.#G#.#.#.\n.#.#.#.#.#.#.\n.#.#...#.#.#.\n.#.#####.#.#.\n.#.......#.#.\n.#########.#.\n>..........#.",
+        "..#..........\n#...##.#.#..#\n..#.#....##..\n.##..####...#\n......#..#.#.\n##.##.#.##...\n.....#...#.##\n.#.##.##.....\n..#..........\n###..####.##.\n..#.#....#...\n.##..#.#..##.\n....#..G..>..",
+        "#............\n#.#####.####.\n#.#...#....#.\n#.#.#.####.#.\n#...#......#.\n#.#########.#\n#.#.........#\n#.#.#######.#\n#.#.#.....#.#\n#.#.#.###.#.#\n#.#...#G#.#.#\n#.#####.#.#.#\n>.......#...#",
+        "..#.#........\n.##...####.#.\n......#....#.\n####.##.##.#.\n#.........##.\n#.#.####.#...\n#.#.#G...#.#.\n..#.#.##.#.#.\n.##.#..#...#.\n.#..##.#.####\n.#.#...#.#...\n.#...#.#...#.\n.#.###..>##..",
+        ">.........#..\n.########.#.#\n.#........#.#\n.#.######.#.#\n.#.#....#.#.#\n.#.#.##.#.#.#\n.#.#.##.#.#.#\n.#.#....#.#.#\n.#.######.#.#\n.#........#.#\n.########.#.#\n..........#.#\n.###########G",
+    ]
+
     def _call_llm(self, messages: List[Dict]) -> tuple:
         """Call the LLM API. Dispatches by provider.
 
@@ -318,6 +329,11 @@ class MazeGenerator:
             (content, thinking) tuple. content is None on failure.
             thinking is None for non-reasoning models or on failure.
         """
+        if self.config.dev:
+            import random
+            grid = random.choice(self._DEV_MAZES)
+            logger.info("[DEV] Returning fake maze (no LLM call)")
+            return grid, None
         if self.config.provider == "claude-code":
             return self._call_claude_code(messages)
         if self.config.provider == "openrouter":
@@ -1048,7 +1064,7 @@ class MazeGenerator:
             if thresholds.min_diversity is not None:
                 # Map diversity metric to its definition key
                 _div_metric_map = {
-                    "td_error_emd": "td_error",
+                    "normalized_td_error_emd": "td_error",
                     "experience_divergence": "mode_transition",
                     "position_dtw": "position_dtw",
                     "cenie": "cenie",
