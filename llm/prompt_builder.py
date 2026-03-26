@@ -260,13 +260,22 @@ METRIC_DEFINITIONS: Dict[str, tuple] = {
         "degrading) based on value error and policy entropy. Higher divergence = the agent "
         "goes through fundamentally different learning processes on the two mazes.",
     ),
+    "normalized_td_error": (
+        "Normalized TD Error",
+        "Normalized TD Error shows the fraction of total learning signal at each timestep: "
+        "δ_t / Σ|δ|, where δ_t = r_t + γV(s_{t+1}) - V(s_t). A spike of 0.15 means 15% "
+        "of all learning on this maze happens at that step (a critical decision point, trap, "
+        "or surprise). Flat profile = learning is spread evenly. Spiky profile = a few key "
+        "moments dominate what the agent learns. Use this to identify which steps matter most.",
+    ),
     "td_error": (
-        "TD Error EMD",
-        "TD Error EMD is the Earth Mover's Distance between the distributions of temporal "
-        "difference errors (δ_t = r_t + γV(s_{t+1}) - V(s_t)) on two mazes. TD error is "
-        "the raw learning signal — different distributions mean the agent receives different "
-        "gradient updates. Higher EMD = more different learning signals. This is the most "
-        "task-agnostic diversity metric.",
+        "Normalized TD Error EMD",
+        "Normalized TD Error EMD is the Earth Mover's Distance between the normalized "
+        "distributions of temporal difference errors (δ_t = r_t + γV(s_{t+1}) - V(s_t)) "
+        "on two mazes. TD errors are divided by their total absolute sum before comparison, "
+        "isolating the *shape* of the learning signal from its magnitude (since SFL "
+        "learnability already captures how much learning happens). Higher EMD = more "
+        "different learning signal shapes. This is the most task-agnostic diversity metric.",
     ),
     "cenie": (
         "CENIE Novelty",

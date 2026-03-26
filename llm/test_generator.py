@@ -175,18 +175,75 @@ def select_references_diverse(
     """
     active_scores = scores[:size]
 
-    # Fast path: use precomputed TD errors to select from all buffer levels
-    if (buffer_td_errors_path and os.path.exists(buffer_td_errors_path)
-            and metric in ("normalized_td_error_emd", "td_error_emd")):
-        return _select_diverse_from_precomputed(
-            tokens, active_scores, size, n, buffer_td_errors_path,
-            min_difficulty_mask=min_difficulty_mask,
-            normalize=(metric == "normalized_td_error_emd"),
-        )
+    # Fast path: use precomputed data to select from all buffer levels
+    if buffer_td_errors_path and os.path.exists(buffer_td_errors_path):
+        if metric in ("normalized_td_error_emd", "td_error_emd"):
+            return _select_diverse_from_precomputed(
+                tokens, active_scores, size, n, buffer_td_errors_path,
+                min_difficulty_mask=min_difficulty_mask,
+                normalize=(metric == "normalized_td_error_emd"),
+            )
+        if metric == "embedding":
+            return _select_diverse_from_precomputed_embedding(
+                tokens, active_scores, size, n, buffer_td_errors_path,
+                min_difficulty_mask=min_difficulty_mask,
+            )
 
     # Fallback: rollout-based selection on a candidate pool
     return _select_diverse_from_rollouts(
         tokens, active_scores, size, evaluator, n, pool_size, metric,
+    )
+
+
+def select_references_kmedoids(
+    tokens: np.ndarray,
+    scores: np.ndarray,
+    size: int,
+    n: int = 6,
+    metric: str = "normalized_td_error_emd",
+    buffer_td_errors_path: str = None,
+    min_difficulty_mask: np.ndarray = None,
+) -> list:
+    """Select representative references via k-medoids clustering.
+
+    Unlike greedy max-min (diverse), k-medoids finds cluster centers that
+    minimize total within-cluster distance — each reference represents a
+    different behavioral region of the buffer.
+
+    Requires precomputed TD errors. No agent rollouts needed for selection.
+
+    Args:
+        tokens: (capacity, 52) token array
+        scores: (capacity,) score array
+        size: number of active levels
+        n: number of references (= number of clusters)
+        metric: "td_error_emd" or "normalized_td_error_emd"
+        buffer_td_errors_path: path to precomputed buffer TD errors .npz
+        min_difficulty_mask: (size,) bool mask — True for eligible levels
+
+    Returns:
+        List of (index, tokens, score) tuples
+    """
+    if not buffer_td_errors_path or not os.path.exists(buffer_td_errors_path):
+        raise ValueError(
+            "k-medoids strategy requires precomputed data "
+            f"(buffer_td_errors_path={buffer_td_errors_path})"
+        )
+    if metric not in ("normalized_td_error_emd", "td_error_emd", "embedding"):
+        raise ValueError(
+            f"k-medoids strategy requires td_error_emd or embedding metric, got {metric}"
+        )
+
+    active_scores = scores[:size]
+    if metric == "embedding":
+        return _select_kmedoids_from_precomputed_embedding(
+            tokens, active_scores, size, n, buffer_td_errors_path,
+            min_difficulty_mask=min_difficulty_mask,
+        )
+    return _select_kmedoids_from_precomputed(
+        tokens, active_scores, size, n, buffer_td_errors_path,
+        min_difficulty_mask=min_difficulty_mask,
+        normalize=(metric == "normalized_td_error_emd"),
     )
 
 
@@ -295,6 +352,394 @@ def _select_diverse_from_precomputed(
     return refs
 
 
+def _select_diverse_from_precomputed_embedding(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    n: int,
+    buffer_td_errors_path: str,
+    min_difficulty_mask: np.ndarray = None,
+) -> list:
+    """Select N maximally diverse references using precomputed mean LSTM embeddings."""
+    import time
+    t0 = time.time()
+
+    buf_data = np.load(buffer_td_errors_path)
+    if "mean_embeddings" not in buf_data.files:
+        raise ValueError(
+            "Precomputed file missing 'mean_embeddings'. "
+            "Re-run: PYTHONPATH=src:. python3 llm/precompute_buffer_embeddings.py"
+        )
+
+    mean_emb = buf_data["mean_embeddings"]   # (N, 257)
+    buf_ep_lens = buf_data["ep_lens"]
+    buf_indices = buf_data["indices"]
+    n_precomputed = len(buf_ep_lens)
+
+    # Filter: active, min episode length, difficulty
+    valid_mask = buf_indices < size
+    MIN_EP_LEN = 40
+    valid_mask &= buf_ep_lens >= MIN_EP_LEN
+    if min_difficulty_mask is not None:
+        for i in range(n_precomputed):
+            if valid_mask[i]:
+                if not min_difficulty_mask[buf_indices[i]]:
+                    valid_mask[i] = False
+    valid_positions = np.where(valid_mask)[0]
+    n_valid = len(valid_positions)
+    logger.info(f"Diverse selection (embedding): {n_valid} candidate levels")
+
+    if n_valid <= n:
+        refs = []
+        for pos in valid_positions:
+            idx = int(buf_indices[pos])
+            refs.append((idx, tokens[idx], float(active_scores[idx])))
+        return refs
+
+    # Extract valid embeddings and compute L2 pairwise distance matrix
+    valid_emb = mean_emb[valid_positions]  # (n_valid, 257)
+    dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+    chunk_size = max(1, min(500, n_valid))
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        diff = valid_emb[start:end, np.newaxis, :] - valid_emb[np.newaxis, :, :]
+        dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    # Greedy max-min selection (same as _select_diverse_from_precomputed)
+    np.fill_diagonal(dist_matrix, 0)
+    flat_idx = np.argmax(dist_matrix)
+    best_i, best_j = np.unravel_index(flat_idx, dist_matrix.shape)
+    selected = [int(best_i), int(best_j)]
+
+    min_dist_to_selected = np.minimum(dist_matrix[best_i], dist_matrix[best_j])
+    min_dist_to_selected[best_i] = -1
+    min_dist_to_selected[best_j] = -1
+
+    while len(selected) < n and len(selected) < n_valid:
+        best_next = int(np.argmax(min_dist_to_selected))
+        if min_dist_to_selected[best_next] <= 0:
+            break
+        selected.append(best_next)
+        min_dist_to_selected = np.minimum(min_dist_to_selected, dist_matrix[best_next])
+        min_dist_to_selected[best_next] = -1
+
+    elapsed = time.time() - t0
+
+    refs = []
+    for i, s in enumerate(selected):
+        buf_pos = valid_positions[s]
+        idx = int(buf_indices[buf_pos])
+        regret = float(active_scores[idx])
+        min_d = float(min(dist_matrix[s, o] for o in selected if o != s))
+        logger.info(
+            f"  Diverse ref {i+1}: buffer idx={idx}, "
+            f"regret={regret:.4f}, min_dist={min_d:.4f}"
+        )
+        refs.append((idx, tokens[idx], regret))
+
+    logger.info(f"Diverse selection (embedding) complete in {elapsed:.1f}s")
+    return refs
+
+
+def _select_kmedoids_from_precomputed(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    n: int,
+    buffer_td_errors_path: str,
+    min_difficulty_mask: np.ndarray = None,
+    normalize: bool = True,
+) -> list:
+    """Select N representative references via k-medoids on precomputed TD errors.
+
+    Unlike greedy max-min (diverse), k-medoids finds cluster centers that
+    minimize total within-cluster distance — giving references that are
+    representative of different behavioral regions rather than maximally
+    spread outliers.
+
+    Uses the PAM (Partitioning Around Medoids) BUILD + SWAP algorithm.
+    """
+    import time
+    t0 = time.time()
+
+    buf_data = np.load(buffer_td_errors_path)
+    buf_td_padded = buf_data["td_errors"]
+    buf_ep_lens = buf_data["ep_lens"]
+    buf_indices = buf_data["indices"]
+    n_precomputed = len(buf_ep_lens)
+
+    # Same filtering as diverse selection
+    valid_mask = buf_indices < size
+    MIN_EP_LEN = 40
+    valid_mask &= buf_ep_lens >= MIN_EP_LEN
+    if min_difficulty_mask is not None:
+        for i in range(n_precomputed):
+            if valid_mask[i]:
+                buf_idx = buf_indices[i]
+                if not min_difficulty_mask[buf_idx]:
+                    valid_mask[i] = False
+    valid_positions = np.where(valid_mask)[0]
+    n_valid = len(valid_positions)
+
+    logger.info(f"K-medoids selection: {n_valid} candidate levels")
+
+    if n_valid <= n:
+        refs = []
+        for pos in valid_positions:
+            idx = int(buf_indices[pos])
+            refs.append((idx, tokens[idx], float(active_scores[idx])))
+        logger.info(f"K-medoids: only {n_valid} candidates, returning all")
+        return refs
+
+    # Precompute quantile representations
+    n_quant = 200
+    quantiles = np.linspace(0, 1, n_quant)
+    quant_matrix = np.zeros((n_valid, n_quant))
+    for i, pos in enumerate(valid_positions):
+        td = buf_td_padded[pos, :buf_ep_lens[pos]].copy()
+        if normalize:
+            total = max(float(np.sum(np.abs(td))), 1e-8)
+            td = td / total
+        quant_matrix[i] = np.quantile(np.sort(td), quantiles)
+
+    # Pairwise distance matrix (same chunked approach as diverse)
+    dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+    chunk_size = max(1, min(500, n_valid))
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        dist_matrix[start:end] = np.mean(
+            np.abs(quant_matrix[start:end, np.newaxis, :] - quant_matrix[np.newaxis, :, :]),
+            axis=2,
+        )
+
+    # --- PAM BUILD: greedy initialization ---
+    # Pick first medoid as the point minimizing total distance to all others
+    total_dist = dist_matrix.sum(axis=1)
+    medoids = [int(np.argmin(total_dist))]
+
+    # Pick remaining medoids greedily: each new medoid maximally reduces
+    # the total distance from non-medoid points to their nearest medoid
+    nearest_medoid_dist = dist_matrix[medoids[0]].copy()
+    for _ in range(1, n):
+        # For each candidate, compute how much it would reduce total cost
+        gains = np.zeros(n_valid)
+        for c in range(n_valid):
+            if c in medoids:
+                gains[c] = -1
+                continue
+            # Reduction: sum of max(0, current_nearest - dist_to_c) over all points
+            improvement = np.maximum(0, nearest_medoid_dist - dist_matrix[c])
+            gains[c] = improvement.sum()
+        best = int(np.argmax(gains))
+        medoids.append(best)
+        nearest_medoid_dist = np.minimum(nearest_medoid_dist, dist_matrix[best])
+
+    # --- PAM SWAP: iterative improvement ---
+    max_iter = 100
+    for iteration in range(max_iter):
+        # Assign each point to nearest medoid
+        medoid_dists = dist_matrix[medoids]  # (k, n_valid)
+        assignments = np.argmin(medoid_dists, axis=0)  # (n_valid,)
+        total_cost = sum(
+            dist_matrix[medoids[assignments[j]], j] for j in range(n_valid)
+        )
+
+        improved = False
+        for mi, m in enumerate(medoids):
+            # Try swapping medoid m with each non-medoid
+            cluster_members = np.where(assignments == mi)[0]
+            best_swap = None
+            best_delta = 0
+
+            for candidate in cluster_members:
+                if candidate == m:
+                    continue
+                # Compute cost change if we swap m -> candidate
+                delta = 0
+                for j in range(n_valid):
+                    old_d = dist_matrix[medoids[assignments[j]], j]
+                    # New distance: min of distances to all medoids with m replaced by candidate
+                    new_d = old_d
+                    if assignments[j] == mi:
+                        # This point was assigned to m; recalculate
+                        new_d = dist_matrix[candidate, j]
+                        for mk in range(len(medoids)):
+                            if mk != mi:
+                                new_d = min(new_d, dist_matrix[medoids[mk], j])
+                    else:
+                        # Check if candidate is closer
+                        new_d = min(old_d, dist_matrix[candidate, j])
+                    delta += new_d - old_d
+
+                if delta < best_delta:
+                    best_delta = delta
+                    best_swap = candidate
+
+            if best_swap is not None:
+                medoids[mi] = best_swap
+                improved = True
+                break  # Restart after any swap
+
+        if not improved:
+            logger.info(f"K-medoids converged after {iteration + 1} iterations")
+            break
+
+    elapsed = time.time() - t0
+
+    # Log and return
+    refs = []
+    for i, m in enumerate(medoids):
+        buf_pos = valid_positions[m]
+        idx = int(buf_indices[buf_pos])
+        regret = float(active_scores[idx])
+        min_d = float(min(dist_matrix[m, o] for o in medoids if o != m))
+        # Count cluster size
+        medoid_dists = dist_matrix[medoids]
+        assignments = np.argmin(medoid_dists, axis=0)
+        cluster_size = int(np.sum(assignments == i))
+        logger.info(
+            f"  K-medoid {i+1}: buffer idx={idx}, "
+            f"regret={regret:.4f}, min_dist={min_d:.4f}, "
+            f"cluster_size={cluster_size}/{n_valid}"
+        )
+        refs.append((idx, tokens[idx], regret))
+
+    logger.info(f"K-medoids selection complete in {elapsed:.1f}s")
+    return refs
+
+
+def _select_kmedoids_from_precomputed_embedding(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    n: int,
+    buffer_td_errors_path: str,
+    min_difficulty_mask: np.ndarray = None,
+) -> list:
+    """Select N representative references via k-medoids on precomputed mean LSTM embeddings."""
+    import time
+    t0 = time.time()
+
+    buf_data = np.load(buffer_td_errors_path)
+    if "mean_embeddings" not in buf_data.files:
+        raise ValueError(
+            "Precomputed file missing 'mean_embeddings'. "
+            "Re-run: PYTHONPATH=src:. python3 llm/precompute_buffer_embeddings.py"
+        )
+
+    mean_emb = buf_data["mean_embeddings"]   # (N, 257)
+    buf_ep_lens = buf_data["ep_lens"]
+    buf_indices = buf_data["indices"]
+    n_precomputed = len(buf_ep_lens)
+
+    # Filter
+    valid_mask = buf_indices < size
+    MIN_EP_LEN = 40
+    valid_mask &= buf_ep_lens >= MIN_EP_LEN
+    if min_difficulty_mask is not None:
+        for i in range(n_precomputed):
+            if valid_mask[i]:
+                if not min_difficulty_mask[buf_indices[i]]:
+                    valid_mask[i] = False
+    valid_positions = np.where(valid_mask)[0]
+    n_valid = len(valid_positions)
+    logger.info(f"K-medoids selection (embedding): {n_valid} candidate levels")
+
+    if n_valid <= n:
+        refs = []
+        for pos in valid_positions:
+            idx = int(buf_indices[pos])
+            refs.append((idx, tokens[idx], float(active_scores[idx])))
+        return refs
+
+    # L2 pairwise distance matrix
+    valid_emb = mean_emb[valid_positions]
+    dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+    chunk_size = max(1, min(500, n_valid))
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        diff = valid_emb[start:end, np.newaxis, :] - valid_emb[np.newaxis, :, :]
+        dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    # --- PAM BUILD ---
+    total_dist = dist_matrix.sum(axis=1)
+    medoids = [int(np.argmin(total_dist))]
+
+    nearest_medoid_dist = dist_matrix[medoids[0]].copy()
+    for _ in range(1, n):
+        gains = np.zeros(n_valid)
+        for c in range(n_valid):
+            if c in medoids:
+                gains[c] = -1
+                continue
+            improvement = np.maximum(0, nearest_medoid_dist - dist_matrix[c])
+            gains[c] = improvement.sum()
+        best = int(np.argmax(gains))
+        medoids.append(best)
+        nearest_medoid_dist = np.minimum(nearest_medoid_dist, dist_matrix[best])
+
+    # --- PAM SWAP ---
+    max_iter = 100
+    for iteration in range(max_iter):
+        medoid_dists = dist_matrix[medoids]
+        assignments = np.argmin(medoid_dists, axis=0)
+
+        improved = False
+        for mi, m in enumerate(medoids):
+            cluster_members = np.where(assignments == mi)[0]
+            best_swap = None
+            best_delta = 0
+
+            for candidate in cluster_members:
+                if candidate == m:
+                    continue
+                delta = 0
+                for j in range(n_valid):
+                    old_d = dist_matrix[medoids[assignments[j]], j]
+                    if assignments[j] == mi:
+                        new_d = dist_matrix[candidate, j]
+                        for mk in range(len(medoids)):
+                            if mk != mi:
+                                new_d = min(new_d, dist_matrix[medoids[mk], j])
+                    else:
+                        new_d = min(old_d, dist_matrix[candidate, j])
+                    delta += new_d - old_d
+
+                if delta < best_delta:
+                    best_delta = delta
+                    best_swap = candidate
+
+            if best_swap is not None:
+                medoids[mi] = best_swap
+                improved = True
+                break
+
+        if not improved:
+            logger.info(f"K-medoids (embedding) converged after {iteration + 1} iterations")
+            break
+
+    elapsed = time.time() - t0
+
+    refs = []
+    medoid_dists = dist_matrix[medoids]
+    assignments = np.argmin(medoid_dists, axis=0)
+    for i, m in enumerate(medoids):
+        buf_pos = valid_positions[m]
+        idx = int(buf_indices[buf_pos])
+        regret = float(active_scores[idx])
+        min_d = float(min(dist_matrix[m, o] for o in medoids if o != m))
+        cluster_size = int(np.sum(assignments == i))
+        logger.info(
+            f"  K-medoid {i+1}: buffer idx={idx}, "
+            f"regret={regret:.4f}, min_dist={min_d:.4f}, "
+            f"cluster_size={cluster_size}/{n_valid}"
+        )
+        refs.append((idx, tokens[idx], regret))
+
+    logger.info(f"K-medoids (embedding) selection complete in {elapsed:.1f}s")
+    return refs
+
+
 def _select_diverse_from_rollouts(
     tokens: np.ndarray,
     active_scores: np.ndarray,
@@ -354,6 +799,10 @@ def _select_diverse_from_rollouts(
                     ti["positions"], ti["dones"],
                     tj["positions"], tj["dones"],
                 )
+                d = result["distance"]
+            elif metric == "embedding":
+                from metrics.pairwise.embedding_divergence import embedding_divergence
+                result = embedding_divergence(ti, ti["dones"], tj, tj["dones"])
                 d = result["distance"]
             else:
                 raise ValueError(f"Unknown diverse metric: {metric}")
@@ -1161,6 +1610,11 @@ def save_results(
                     return position_trace_dtw(
                         t1["positions"], t1["dones"], t2["positions"], t2["dones"],
                     )["distance"]
+                elif metric == "embedding":
+                    from metrics.pairwise.embedding_divergence import embedding_divergence
+                    return embedding_divergence(
+                        t1, t1["dones"], t2, t2["dones"],
+                    )["distance"]
                 else:
                     from metrics.pairwise.td_error_distribution import td_error_divergence
                     return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
@@ -1170,19 +1624,24 @@ def save_results(
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
+                "embedding": "LSTM Embedding L2",
             }.get(_emb_metric, _emb_metric)
             _emb_normalize = (_emb_metric == "normalized_td_error_emd")
 
-            # Load precomputed buffer TD errors if available
-            buf_quant_matrix = None  # (n_buf, 200) quantile matrix
+            # Load precomputed buffer data if available
+            buf_quant_matrix = None  # (n_buf, D) quantile matrix
             n_buf = 0
             _N_QUANT = 200
             _quantiles = np.linspace(0, 1, _N_QUANT)
-            if (buffer_td_errors_path and os.path.exists(buffer_td_errors_path)
-                    and _emb_metric in ("normalized_td_error_emd", "td_error_emd")
-                    and buffer_embed_samples != 0):
+            buf_difficulty_pass = None
+
+            _has_precomputed = (buffer_td_errors_path and os.path.exists(buffer_td_errors_path)
+                                and buffer_embed_samples != 0)
+            _use_td_buf = _has_precomputed and _emb_metric in ("normalized_td_error_emd", "td_error_emd")
+            _use_emb_buf = _has_precomputed and _emb_metric == "embedding"
+
+            if _use_td_buf or _use_emb_buf:
                 buf_data = np.load(buffer_td_errors_path)
-                buf_td_padded = buf_data["td_errors"]   # (N, max_len)
                 buf_ep_lens = buf_data["ep_lens"]        # (N,)
                 n_total_buf = len(buf_ep_lens)
                 # Subsample unless -1 (all)
@@ -1196,32 +1655,43 @@ def save_results(
                 else:
                     buf_sample_idx = np.arange(n_total_buf)
                 n_buf = len(buf_sample_idx)
-                # Build quantile matrix for buffer levels
-                buf_quant_matrix = np.zeros((n_buf, _N_QUANT))
-                for i, idx in enumerate(buf_sample_idx):
-                    td = buf_td_padded[idx, :buf_ep_lens[idx]]
-                    if _emb_normalize:
-                        total = max(float(np.sum(np.abs(td))), 1e-8)
-                        td = td / total
-                    buf_quant_matrix[i] = np.quantile(np.sort(td), _quantiles)
+
+                if _use_td_buf:
+                    # TD error quantiles: (n_buf, 200)
+                    buf_td_padded = buf_data["td_errors"]
+                    buf_quant_matrix = np.zeros((n_buf, _N_QUANT))
+                    for i, idx in enumerate(buf_sample_idx):
+                        td = buf_td_padded[idx, :buf_ep_lens[idx]]
+                        if _emb_normalize:
+                            total = max(float(np.sum(np.abs(td))), 1e-8)
+                            td = td / total
+                        buf_quant_matrix[i] = np.quantile(np.sort(td), _quantiles)
+                    logger.info(f"Loaded {n_buf} buffer TD error profiles for embedding (from {n_total_buf} total)")
+                elif _use_emb_buf and "mean_embeddings" in buf_data.files:
+                    # Mean LSTM state-action embeddings: (n_buf, 257) precomputed
+                    buf_quant_matrix = buf_data["mean_embeddings"][buf_sample_idx]
+                    logger.info(f"Loaded {n_buf} buffer mean embeddings for embedding plot (from {n_total_buf} total)")
+                else:
+                    logger.warning("Embedding metric selected but no precomputed mean_embeddings in buffer file — no buffer dots")
+                    n_buf = 0
+
                 # Build difficulty mask for buffer dots coloring
-                buf_difficulty_pass = None
-                buf_data_indices = buf_data["indices"] if "indices" in buf_data.files else None
-                if buffer_scores is not None and buf_data_indices is not None:
-                    buf_sampled_scores = buffer_scores[buf_data_indices[buf_sample_idx]]
-                    if difficulty_metric == "sfl":
-                        max_r = max(float(np.max(buffer_scores)), 1e-8)
-                        approx_p = np.clip(1.0 - buf_sampled_scores / max_r, 0, 1)
-                        diff_scores = approx_p * (1.0 - approx_p)
-                        all_p = np.clip(1.0 - buffer_scores / max_r, 0, 1)
-                        mean_diff = float(np.mean(all_p * (1.0 - all_p)))
-                    else:
-                        diff_scores = buf_sampled_scores
-                        mean_diff = float(np.mean(buffer_scores))
-                    buf_difficulty_pass = diff_scores >= mean_diff
-                    n_pass = int(np.sum(buf_difficulty_pass))
-                    logger.info(f"Buffer embedding: {n_pass}/{n_buf} dots pass difficulty filter")
-                logger.info(f"Loaded {n_buf} buffer TD error profiles for embedding (from {n_total_buf} total)")
+                if n_buf > 0:
+                    buf_data_indices = buf_data["indices"] if "indices" in buf_data.files else None
+                    if buffer_scores is not None and buf_data_indices is not None:
+                        buf_sampled_scores = buffer_scores[buf_data_indices[buf_sample_idx]]
+                        if difficulty_metric == "sfl":
+                            max_r = max(float(np.max(buffer_scores)), 1e-8)
+                            approx_p = np.clip(1.0 - buf_sampled_scores / max_r, 0, 1)
+                            diff_scores = approx_p * (1.0 - approx_p)
+                            all_p = np.clip(1.0 - buffer_scores / max_r, 0, 1)
+                            mean_diff = float(np.mean(all_p * (1.0 - all_p)))
+                        else:
+                            diff_scores = buf_sampled_scores
+                            mean_diff = float(np.mean(buffer_scores))
+                        buf_difficulty_pass = diff_scores >= mean_diff
+                        n_pass = int(np.sum(buf_difficulty_pass))
+                        logger.info(f"Buffer embedding: {n_pass}/{n_buf} dots pass difficulty filter")
 
             # Build quantile matrix for foreground trajectories
             fg_quant_matrix = None
@@ -1235,30 +1705,47 @@ def save_results(
                         total = max(float(np.sum(np.abs(td))), 1e-8)
                         td = td / total
                     fg_quant_matrix[i] = np.quantile(np.sort(td), _quantiles)
+            elif _emb_metric == "embedding":
+                from metrics.pairwise.embedding_divergence import compute_mean_embedding
+                n_fg = len(all_trajs)
+                # Each trajectory -> (257,) mean state-action vector
+                fg_quant_matrix = np.zeros((n_fg, 257))
+                for i, t in enumerate(all_trajs):
+                    fg_quant_matrix[i] = compute_mean_embedding(
+                        t["hstates"], t["dones"], actions=t.get("actions"),
+                    )
 
             n_fg = len(all_trajs)
             n_total = n_fg + n_buf
 
-            def _chunked_pairwise_emd(quant_mat):
-                """Compute pairwise EMD matrix from quantile matrix, chunked to limit memory."""
-                n = len(quant_mat)
+            def _chunked_pairwise_dist(feat_mat, metric='l1_mean'):
+                """Compute pairwise distance matrix, chunked to limit memory.
+
+                Args:
+                    feat_mat: (N, D) feature matrix
+                    metric: 'l1_mean' for mean abs diff (quantile EMD), 'l2' for Euclidean
+                """
+                n = len(feat_mat)
                 dm = np.zeros((n, n), dtype=np.float32)
                 chunk = max(1, min(500, n))
                 for start in range(0, n, chunk):
                     end = min(start + chunk, n)
-                    dm[start:end] = np.mean(
-                        np.abs(quant_mat[start:end, np.newaxis, :] - quant_mat[np.newaxis, :, :]),
-                        axis=2,
-                    )
+                    diff = feat_mat[start:end, np.newaxis, :] - feat_mat[np.newaxis, :, :]
+                    if metric == 'l2':
+                        dm[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+                    else:
+                        dm[start:end] = np.mean(np.abs(diff), axis=2)
                 return dm
 
+            _dist_metric = 'l2' if _emb_metric == 'embedding' else 'l1_mean'
+
             if fg_quant_matrix is not None and n_buf > 0:
-                # Vectorized: combine foreground + buffer quantile matrices
-                all_quant = np.vstack([fg_quant_matrix, buf_quant_matrix])  # (n_total, 200)
-                dist_matrix = _chunked_pairwise_emd(all_quant)
+                # Vectorized: combine foreground + buffer feature matrices
+                all_quant = np.vstack([fg_quant_matrix, buf_quant_matrix])
+                dist_matrix = _chunked_pairwise_dist(all_quant, metric=_dist_metric)
             elif fg_quant_matrix is not None:
                 # No buffer — vectorize foreground only
-                dist_matrix = _chunked_pairwise_emd(fg_quant_matrix)
+                dist_matrix = _chunked_pairwise_dist(fg_quant_matrix, metric=_dist_metric)
             else:
                 # Non-EMD metric — loop-based foreground distances
                 dist_matrix = np.zeros((n_total, n_total))
@@ -1268,13 +1755,31 @@ def save_results(
                         dist_matrix[i, j] = d
                         dist_matrix[j, i] = d
 
-            # t-SNE on precomputed distance matrix
+            # Log foreground pairwise distances for diagnostic
+            logger.info(f"Embedding pairwise distances ({_emb_label}):")
+            for i in range(n_fg):
+                dists_to_others = []
+                for j in range(n_fg):
+                    if i != j:
+                        dists_to_others.append(f"{all_labels[j]}={dist_matrix[i, j]:.4f}")
+                logger.info(f"  {all_labels[i]}: {', '.join(dists_to_others)}")
+
+            # Dimensionality reduction on precomputed distance matrix
+            # Generate both t-SNE and MDS embeddings
             perplexity = min(30 if n_buf > 0 else 5, n_total - 1)
-            embedding = TSNE(
+            embedding_tsne = TSNE(
                 n_components=2, metric="precomputed",
                 perplexity=perplexity, random_state=42,
                 init="random",
             ).fit_transform(dist_matrix)
+
+            from sklearn.manifold import MDS
+            embedding_mds = MDS(
+                n_components=2, dissimilarity="precomputed",
+                random_state=42, normalized_stress='auto',
+            ).fit_transform(dist_matrix)
+
+            embedding = embedding_tsne  # default for main plot
 
             # Build per-point edge colors: red edge for force-accepted
             n_before_accepted = n_ref_in_emb + sum(1 for rc in all_rejected if rc.trajectory is not None and "dones" in rc.trajectory)
@@ -1347,18 +1852,37 @@ def save_results(
                     fontsize=7, color='black', fontweight='bold',
                 )
 
-            # Draw edges between foreground points only (not buffer)
-            for i in range(n_fg):
-                for j in range(i + 1, n_fg):
+            # Draw edges between rejected/accepted and their closest reference,
+            # annotated with actual EMD distance
+            for i in range(n_ref_in_emb, n_fg):
+                # Find closest reference
+                closest_ref = -1
+                closest_dist = float('inf')
+                for j in range(n_ref_in_emb):
+                    d = dist_matrix[i, j]
+                    if d < closest_dist:
+                        closest_dist = d
+                        closest_ref = j
+                if closest_ref >= 0:
+                    mid_x = (embedding[i, 0] + embedding[closest_ref, 0]) / 2
+                    mid_y = (embedding[i, 1] + embedding[closest_ref, 1]) / 2
                     ax_emb.plot(
-                        [embedding[i, 0], embedding[j, 0]],
-                        [embedding[i, 1], embedding[j, 1]],
-                        'gray', alpha=0.15, linewidth=0.5,
+                        [embedding[i, 0], embedding[closest_ref, 0]],
+                        [embedding[i, 1], embedding[closest_ref, 1]],
+                        'gray', alpha=0.4, linewidth=1.0, linestyle='--',
+                    )
+                    ax_emb.annotate(
+                        f"{closest_dist:.4f}",
+                        (mid_x, mid_y),
+                        fontsize=5.5, color='dimgray', ha='center',
+                        bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                                  alpha=0.8, edgecolor='none'),
                     )
 
             ax_emb.set_title(
-                f"Diversity Embedding ({_emb_label})",
-                fontsize=11, fontweight='bold',
+                f"Diversity Embedding ({_emb_label})\n"
+                f"t-SNE layout — distances on edges are actual metric values",
+                fontsize=10, fontweight='bold',
             )
             ax_emb.set_xlabel("t-SNE dim 1", fontsize=9)
             ax_emb.set_ylabel("t-SNE dim 2", fontsize=9)
@@ -1413,6 +1937,104 @@ def save_results(
             fig_emb.savefig(emb_path, dpi=150, bbox_inches='tight')
             plt.close(fig_emb)
             logger.info(f"Saved {emb_path}")
+
+            # --- MDS embedding (preserves global distances) ---
+            fig_mds, ax_mds = plt.subplots(1, 1, figsize=(8, 7) if n_buf > 0 else (7, 6))
+
+            if n_buf > 0:
+                buf_emb_mds = embedding_mds[n_fg:]
+                if buf_difficulty_pass is not None:
+                    pass_mask = buf_difficulty_pass
+                    fail_mask = ~pass_mask
+                    if np.any(fail_mask):
+                        ax_mds.scatter(
+                            buf_emb_mds[fail_mask, 0], buf_emb_mds[fail_mask, 1],
+                            c='khaki', s=10, marker='o', zorder=1,
+                            alpha=0.4, edgecolors='none',
+                        )
+                    if np.any(pass_mask):
+                        ax_mds.scatter(
+                            buf_emb_mds[pass_mask, 0], buf_emb_mds[pass_mask, 1],
+                            c='lightsteelblue', s=12, marker='o', zorder=2,
+                            alpha=0.5, edgecolors='none',
+                        )
+                else:
+                    ax_mds.scatter(
+                        buf_emb_mds[:, 0], buf_emb_mds[:, 1],
+                        c='lightsteelblue', s=12, marker='o', zorder=1,
+                        alpha=0.5, edgecolors='none',
+                    )
+
+            # Foreground points
+            for i in range(n_fg):
+                ax_mds.scatter(
+                    embedding_mds[i, 0], embedding_mds[i, 1],
+                    c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
+                    marker=all_markers[i], zorder=5,
+                    edgecolors=edge_colors[i],
+                    linewidths=2.0 if edge_colors[i] == 'red' else 0.5,
+                )
+                ax_mds.annotate(
+                    all_labels[i], (embedding_mds[i, 0], embedding_mds[i, 1]),
+                    textcoords="offset points", xytext=(6, 6),
+                    fontsize=7, color=all_colors[i], fontweight='bold',
+                )
+
+            # Ref centroid
+            if n_ref_in_emb >= 2:
+                ref_emb_mds = embedding_mds[:n_ref_in_emb]
+                centroid_mds = ref_emb_mds.mean(axis=0)
+                ax_mds.scatter(
+                    centroid_mds[0], centroid_mds[1],
+                    c='black', s=200, marker='D', zorder=6,
+                    edgecolors='white', linewidths=1.5,
+                )
+                ax_mds.annotate(
+                    "Centroid", (centroid_mds[0], centroid_mds[1]),
+                    textcoords="offset points", xytext=(6, -10),
+                    fontsize=7, color='black', fontweight='bold',
+                )
+
+            # Distance edges from rejected/accepted to closest reference
+            for i in range(n_ref_in_emb, n_fg):
+                closest_ref = -1
+                closest_dist = float('inf')
+                for j in range(n_ref_in_emb):
+                    d = dist_matrix[i, j]
+                    if d < closest_dist:
+                        closest_dist = d
+                        closest_ref = j
+                if closest_ref >= 0:
+                    mid_x = (embedding_mds[i, 0] + embedding_mds[closest_ref, 0]) / 2
+                    mid_y = (embedding_mds[i, 1] + embedding_mds[closest_ref, 1]) / 2
+                    ax_mds.plot(
+                        [embedding_mds[i, 0], embedding_mds[closest_ref, 0]],
+                        [embedding_mds[i, 1], embedding_mds[closest_ref, 1]],
+                        'gray', alpha=0.4, linewidth=1.0, linestyle='--',
+                    )
+                    ax_mds.annotate(
+                        f"{closest_dist:.4f}",
+                        (mid_x, mid_y),
+                        fontsize=5.5, color='dimgray', ha='center',
+                        bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                                  alpha=0.8, edgecolor='none'),
+                    )
+
+            ax_mds.set_title(
+                f"Diversity Embedding ({_emb_label})\n"
+                f"MDS layout — distances reflect actual metric values",
+                fontsize=10, fontweight='bold',
+            )
+            ax_mds.set_xlabel("MDS dim 1", fontsize=9)
+            ax_mds.set_ylabel("MDS dim 2", fontsize=9)
+            ax_mds.grid(alpha=0.2)
+            ax_mds.legend(handles=emb_legend, loc='best', fontsize=8, framealpha=0.9)
+
+            mds_path = os.path.join(run_dir, "diversity_embedding_mds.png")
+            fig_mds.savefig(mds_path, dpi=150, bbox_inches='tight')
+            plt.close(fig_mds)
+            logger.info(f"Saved {mds_path}")
+
         except ImportError:
             logger.warning("sklearn not installed — skipping diversity embedding")
         except Exception as e:
@@ -1442,24 +2064,34 @@ def run_test(args):
 
     # Select reference mazes
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
-    if args.strategy in ("diverse", "hybrid") and evaluator is not None:
-        # Build difficulty mask for hybrid strategy
-        difficulty_mask = None
-        if args.strategy == "hybrid":
-            active_scores = scores[:size]
-            if args.difficulty_metric == "sfl":
-                max_regret = max(float(np.max(active_scores)), 1e-8)
-                approx_p = np.clip(1.0 - active_scores / max_regret, 0, 1)
-                difficulty_scores = approx_p * (1.0 - approx_p)
-            else:
-                difficulty_scores = active_scores
-            mean_diff = float(np.mean(difficulty_scores))
-            difficulty_mask = difficulty_scores >= mean_diff
-            n_pass = int(np.sum(difficulty_mask))
-            logger.info(
-                f"Hybrid filter ({args.difficulty_metric}): "
-                f"{n_pass}/{size} levels above mean ({mean_diff:.4f})"
-            )
+
+    # Build difficulty mask for hybrid/kmedoids strategies
+    difficulty_mask = None
+    if args.strategy in ("hybrid", "kmedoids"):
+        active_scores = scores[:size]
+        if args.difficulty_metric == "sfl":
+            max_regret = max(float(np.max(active_scores)), 1e-8)
+            approx_p = np.clip(1.0 - active_scores / max_regret, 0, 1)
+            difficulty_scores = approx_p * (1.0 - approx_p)
+        else:
+            difficulty_scores = active_scores
+        mean_diff = float(np.mean(difficulty_scores))
+        difficulty_mask = difficulty_scores >= mean_diff
+        n_pass = int(np.sum(difficulty_mask))
+        logger.info(
+            f"Difficulty filter ({args.difficulty_metric}): "
+            f"{n_pass}/{size} levels above mean ({mean_diff:.4f})"
+        )
+
+    if args.strategy == "kmedoids":
+        ref_data = select_references_kmedoids(
+            tokens, scores, size,
+            n=args.num_refs,
+            metric=args.diverse_metric,
+            buffer_td_errors_path=args.buffer_td_errors,
+            min_difficulty_mask=difficulty_mask,
+        )
+    elif args.strategy in ("diverse", "hybrid") and evaluator is not None:
         ref_data = select_references_diverse(
             tokens, scores, size, evaluator,
             n=args.num_refs,
@@ -1577,6 +2209,7 @@ def run_test(args):
         min_walls=args.min_walls,
         min_path_distance=args.min_path_distance,
         validate_solvable=args.validate_solvable,
+        dev=args.dev,
     )
     generator = MazeGenerator(config)
 
@@ -1704,7 +2337,7 @@ def run_test(args):
 
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_short = args.model.replace(":", "_").replace("/", "_")
+    model_short = "dev" if args.dev else args.model.replace(":", "_").replace("/", "_")
     run_dir = os.path.join(OUTPUT_DIR, f"{timestamp}_{model_short}")
     save_results(
         results, references, args.model, run_dir,
@@ -1776,13 +2409,14 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse", "hybrid"],
+    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse", "hybrid", "kmedoids"],
                         default=cfg.get("strategy"),
-                        help="Reference selection strategy (hybrid = above-mean difficulty + max diversity)")
+                        help="Reference selection strategy (diverse = greedy max-min, "
+                             "kmedoids = PAM cluster medoids, hybrid = difficulty-filtered diverse)")
     parser.add_argument("--diverse-metric",
-                        choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw"],
-                        default=cfg.get("diverse_metric", cfg.get("gate", {}).get("diversity_metric", "td_error_emd")),
-                        help="Pairwise metric for diverse/hybrid selection (defaults to gate diversity_metric)")
+                        choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", "embedding"],
+                        default=None,
+                        help="Pairwise metric for diverse/hybrid selection (defaults to --diversity-metric)")
     parser.add_argument("--diverse-pool-size", type=int,
                         default=cfg.get("diverse_pool_size", 20),
                         help="Candidate pool size for diverse strategy")
@@ -1873,13 +2507,13 @@ def main():
                         default=gate_cfg.get("min_diversity", cfg.get("min_diversity")),
                         help="Min mean pairwise diversity vs references (null = disabled)")
     parser.add_argument("--diversity-metric",
-                        choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", "cenie"],
+                        choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", "embedding", "cenie"],
                         default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "normalized_td_error_emd")),
-                        help="Diversity metric: pairwise (normalized_td_error_emd, experience_divergence, position_dtw) or buffer-wide (cenie)")
+                        help="Diversity metric: pairwise (normalized_td_error_emd, experience_divergence, position_dtw, embedding) or buffer-wide (cenie)")
     parser.add_argument("--embedding-metric",
-                        choices=["td_error_emd", "normalized_td_error_emd"],
+                        choices=["td_error_emd", "normalized_td_error_emd", "embedding"],
                         default=cfg.get("embedding_metric", "normalized_td_error_emd"),
-                        help="Pairwise metric for t-SNE diversity embedding plot")
+                        help="Pairwise metric for t-SNE/MDS diversity embedding plot")
     parser.add_argument("--buffer-td-errors", default=cfg.get("buffer_td_errors"),
                         help="Path to precomputed buffer TD errors .npz (from precompute_buffer_embeddings.py)")
     parser.add_argument("--buffer-embed-samples", type=int,
@@ -1890,6 +2524,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         default=cfg.get("dry_run", False),
                         help="Only build prompts, skip LLM calls")
+    parser.add_argument("--dev", action="store_true",
+                        default=cfg.get("dev", False),
+                        help="Dev mode: skip LLM, return random valid mazes instantly")
 
     args = parser.parse_args()
 
@@ -1902,6 +2539,10 @@ def main():
         api_key_env = cfg.get("api_key_env", "")
         if api_key_env:
             args.api_key = os.environ.get(api_key_env, "")
+
+    # Default diverse-metric to diversity-metric if not explicitly set
+    if args.diverse_metric is None:
+        args.diverse_metric = args.diversity_metric
 
     # Attach metric config dicts (not CLI-overridable, config-only)
     args.prompt_metrics = cfg.get("prompt_metrics", None)

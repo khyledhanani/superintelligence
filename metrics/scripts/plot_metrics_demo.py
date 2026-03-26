@@ -636,7 +636,7 @@ def main():
     print(f"  Regret DTW:      mean={reg_dtw_dists.mean():.3f}, std={reg_dtw_dists.std():.3f}")
     print(f"  Value Error L1:  mean={ve_dists.mean():.3f}, std={ve_dists.std():.3f}")
     print(f"  Mode Div (KL):   mean={mode_div_dists.mean():.3f}, std={mode_div_dists.std():.3f}")
-    print(f"  TD Error EMD:    mean={td_emd_dists.mean():.3f}, std={td_emd_dists.std():.3f}")
+    print(f"  Norm TD Error EMD: mean={td_emd_dists.mean():.3f}, std={td_emd_dists.std():.3f}")
     print(f"\n  Correlations:")
     print(f"    pos-action r={corr_pa:.3f}, pos-regret r={corr_pr:.3f}, action-regret r={corr_ar:.3f}")
     print(f"    pos-mode r={corr_pm:.3f}, action-mode r={corr_am:.3f}, regret-mode r={corr_rm:.3f}")
