@@ -1963,7 +1963,7 @@ def main(config=None, project="JAXUED_TEST"):
             "mean_embeddings": mean_embeddings,
         }
 
-        dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+        dump_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
         os.makedirs(dump_dir, exist_ok=True)
         tag = f"_{update_num}k" if update_num > 0 else "_final"
         tokens_path = os.path.join(dump_dir, f"buffer_tokens{tag}.npy")

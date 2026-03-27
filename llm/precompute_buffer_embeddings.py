@@ -14,7 +14,7 @@ Usage:
     PYTHONPATH=src:. python3 llm/precompute_buffer_embeddings.py \
         --buffer-path gcs_artifacts/buffer/buffer_dump_final.npz \
         --agent-dir gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198 \
-        --output llm/buffer_td_errors.npz
+        --output llm/buffer_precomputed.npz
 
     # Subsample for faster computation
     PYTHONPATH=src:. python3 llm/precompute_buffer_embeddings.py --max-levels 500
@@ -45,7 +45,7 @@ def main():
     parser = argparse.ArgumentParser(description="Precompute buffer TD errors for embedding plots")
     parser.add_argument("--buffer-path", default="gcs_artifacts/buffer/buffer_dump_final.npz")
     parser.add_argument("--agent-dir", default="gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198")
-    parser.add_argument("--output", default="gcs_artifacts/buffer/buffer_td_errors.npz")
+    parser.add_argument("--output", default="gcs_artifacts/buffer/buffer_precomputed.npz")
     parser.add_argument("--max-levels", type=int, default=None,
                         help="Max levels to process (default: all)")
     parser.add_argument("--batch-size", type=int, default=100,

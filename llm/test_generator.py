@@ -185,15 +185,16 @@ def select_references_diverse(
     n: int = 3,
     pool_size: int = 20,
     metric: str = "normalized_td_error_emd",
-    buffer_td_errors_path: str = None,
+    buffer_precomputed_path: str = None,
     min_difficulty_mask: np.ndarray = None,
+    mean_embeddings: np.ndarray = None,
 ) -> list:
     """Select maximally diverse references using pairwise trajectory metrics.
 
-    If precomputed buffer TD errors are available and metric is
-    normalized_td_error_emd, selects from ALL buffer levels using the
-    precomputed data (no rollouts needed for selection). Otherwise falls
-    back to rollout-based selection on a candidate pool.
+    For embedding metric: uses mean_embeddings from the buffer dump directly
+    if available, otherwise falls back to precomputed file.
+    For TD error metrics: requires precomputed file.
+    Final fallback: rollout-based selection on a candidate pool.
 
     Args:
         tokens: (capacity, 52) token array
@@ -203,26 +204,35 @@ def select_references_diverse(
         n: number of references to select
         pool_size: candidate pool size (fallback only)
         metric: pairwise metric to maximize
-        buffer_td_errors_path: path to precomputed buffer TD errors .npz
+        buffer_precomputed_path: path to precomputed buffer data .npz (embeddings, TD errors)
         min_difficulty_mask: (size,) bool mask — True for levels that pass
             the difficulty filter. None = no filter (all levels eligible).
+        mean_embeddings: (capacity, 257) mean LSTM embeddings from buffer dump.
+            If provided and metric is "embedding", used directly (no precomputed file needed).
 
     Returns:
         List of (index, tokens, score) tuples
     """
     active_scores = scores[:size]
 
-    # Fast path: use precomputed data to select from all buffer levels
-    if buffer_td_errors_path and os.path.exists(buffer_td_errors_path):
+    # Fast path for embedding: use buffer dump embeddings directly
+    if metric == "embedding" and mean_embeddings is not None:
+        return _select_diverse_from_buffer_embeddings(
+            tokens, active_scores, size, n, mean_embeddings,
+            min_difficulty_mask=min_difficulty_mask,
+        )
+
+    # Precomputed file path
+    if buffer_precomputed_path and os.path.exists(buffer_precomputed_path):
         if metric in ("normalized_td_error_emd", "td_error_emd"):
             return _select_diverse_from_precomputed(
-                tokens, active_scores, size, n, buffer_td_errors_path,
+                tokens, active_scores, size, n, buffer_precomputed_path,
                 min_difficulty_mask=min_difficulty_mask,
                 normalize=(metric == "normalized_td_error_emd"),
             )
         if metric == "embedding":
             return _select_diverse_from_precomputed_embedding(
-                tokens, active_scores, size, n, buffer_td_errors_path,
+                tokens, active_scores, size, n, buffer_precomputed_path,
                 min_difficulty_mask=min_difficulty_mask,
             )
 
@@ -238,8 +248,9 @@ def select_references_kmedoids(
     size: int,
     n: int = 6,
     metric: str = "normalized_td_error_emd",
-    buffer_td_errors_path: str = None,
+    buffer_precomputed_path: str = None,
     min_difficulty_mask: np.ndarray = None,
+    mean_embeddings: np.ndarray = None,
 ) -> list:
     """Select representative references via k-medoids clustering.
 
@@ -247,38 +258,51 @@ def select_references_kmedoids(
     minimize total within-cluster distance — each reference represents a
     different behavioral region of the buffer.
 
-    Requires precomputed TD errors. No agent rollouts needed for selection.
+    For embedding metric: uses mean_embeddings from the buffer dump directly
+    if available, otherwise falls back to precomputed file.
+    For TD error metrics: requires precomputed file.
 
     Args:
         tokens: (capacity, 52) token array
         scores: (capacity,) score array
         size: number of active levels
         n: number of references (= number of clusters)
-        metric: "td_error_emd" or "normalized_td_error_emd"
-        buffer_td_errors_path: path to precomputed buffer TD errors .npz
+        metric: "td_error_emd", "normalized_td_error_emd", or "embedding"
+        buffer_precomputed_path: path to precomputed buffer data .npz (embeddings, TD errors)
         min_difficulty_mask: (size,) bool mask — True for eligible levels
+        mean_embeddings: (capacity, 257) mean LSTM embeddings from buffer dump.
+            If provided and metric is "embedding", used directly (no precomputed file needed).
 
     Returns:
         List of (index, tokens, score) tuples
     """
-    if not buffer_td_errors_path or not os.path.exists(buffer_td_errors_path):
+    active_scores = scores[:size]
+
+    # Fast path for embedding: use buffer dump embeddings directly
+    if metric == "embedding" and mean_embeddings is not None:
+        return _select_kmedoids_from_buffer_embeddings(
+            tokens, active_scores, size, n, mean_embeddings,
+            min_difficulty_mask=min_difficulty_mask,
+        )
+
+    # Precomputed file required for TD error metrics and embedding fallback
+    if not buffer_precomputed_path or not os.path.exists(buffer_precomputed_path):
         raise ValueError(
-            "k-medoids strategy requires precomputed data "
-            f"(buffer_td_errors_path={buffer_td_errors_path})"
+            f"Strategy requires precomputed data or buffer embeddings "
+            f"(buffer_precomputed_path={buffer_precomputed_path})"
         )
     if metric not in ("normalized_td_error_emd", "td_error_emd", "embedding"):
         raise ValueError(
             f"k-medoids strategy requires td_error_emd or embedding metric, got {metric}"
         )
 
-    active_scores = scores[:size]
     if metric == "embedding":
         return _select_kmedoids_from_precomputed_embedding(
-            tokens, active_scores, size, n, buffer_td_errors_path,
+            tokens, active_scores, size, n, buffer_precomputed_path,
             min_difficulty_mask=min_difficulty_mask,
         )
     return _select_kmedoids_from_precomputed(
-        tokens, active_scores, size, n, buffer_td_errors_path,
+        tokens, active_scores, size, n, buffer_precomputed_path,
         min_difficulty_mask=min_difficulty_mask,
         normalize=(metric == "normalized_td_error_emd"),
     )
@@ -289,7 +313,7 @@ def _select_diverse_from_precomputed(
     active_scores: np.ndarray,
     size: int,
     n: int,
-    buffer_td_errors_path: str,
+    buffer_precomputed_path: str,
     min_difficulty_mask: np.ndarray = None,
     normalize: bool = True,
 ) -> list:
@@ -297,7 +321,7 @@ def _select_diverse_from_precomputed(
     import time
     t0 = time.time()
 
-    buf_data = np.load(buffer_td_errors_path)
+    buf_data = np.load(buffer_precomputed_path)
     buf_td_padded = buf_data["td_errors"]    # (N_precomputed, max_len)
     buf_ep_lens = buf_data["ep_lens"]         # (N_precomputed,)
     buf_indices = buf_data["indices"]          # (N_precomputed,) buffer indices
@@ -389,19 +413,194 @@ def _select_diverse_from_precomputed(
     return refs
 
 
+def _select_diverse_from_buffer_embeddings(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    n: int,
+    mean_embeddings: np.ndarray,
+    min_difficulty_mask: np.ndarray = None,
+) -> list:
+    """Select N maximally diverse references using embeddings from the buffer dump directly."""
+    import time
+    t0 = time.time()
+
+    emb = mean_embeddings[:size]  # (size, 257)
+    norms = np.sqrt(np.sum(emb ** 2, axis=1))
+
+    # Filter: non-degenerate embeddings + difficulty
+    valid_mask = norms > 1e-6
+    if min_difficulty_mask is not None:
+        valid_mask &= min_difficulty_mask
+    valid_indices = np.where(valid_mask)[0]
+    n_valid = len(valid_indices)
+    logger.info(f"Diverse selection (buffer embeddings): {n_valid} candidate levels")
+
+    if n_valid <= n:
+        return [(int(i), tokens[i], float(active_scores[i])) for i in valid_indices]
+
+    # L2 pairwise distance matrix
+    valid_emb = emb[valid_indices]
+    dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+    chunk_size = max(1, min(500, n_valid))
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        diff = valid_emb[start:end, np.newaxis, :] - valid_emb[np.newaxis, :, :]
+        dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    # Greedy max-min selection
+    np.fill_diagonal(dist_matrix, 0)
+    flat_idx = np.argmax(dist_matrix)
+    best_i, best_j = np.unravel_index(flat_idx, dist_matrix.shape)
+    selected = [int(best_i), int(best_j)]
+
+    min_dist_to_selected = np.minimum(dist_matrix[best_i], dist_matrix[best_j])
+    min_dist_to_selected[best_i] = -1
+    min_dist_to_selected[best_j] = -1
+
+    while len(selected) < n and len(selected) < n_valid:
+        best_next = int(np.argmax(min_dist_to_selected))
+        if min_dist_to_selected[best_next] <= 0:
+            break
+        selected.append(best_next)
+        min_dist_to_selected = np.minimum(min_dist_to_selected, dist_matrix[best_next])
+        min_dist_to_selected[best_next] = -1
+
+    elapsed = time.time() - t0
+
+    refs = []
+    for i, s in enumerate(selected):
+        idx = int(valid_indices[s])
+        score = float(active_scores[idx])
+        min_d = float(min(dist_matrix[s, o] for o in selected if o != s))
+        logger.info(f"  Diverse ref {i+1}: buffer idx={idx}, score={score:.4f}, min_dist={min_d:.4f}")
+        refs.append((idx, tokens[idx], score))
+
+    logger.info(f"Diverse selection (buffer embeddings) complete in {elapsed:.1f}s")
+    return refs
+
+
+def _select_kmedoids_from_buffer_embeddings(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    n: int,
+    mean_embeddings: np.ndarray,
+    min_difficulty_mask: np.ndarray = None,
+) -> list:
+    """Select N representative references via k-medoids on buffer dump embeddings directly."""
+    import time
+    t0 = time.time()
+
+    emb = mean_embeddings[:size]
+    norms = np.sqrt(np.sum(emb ** 2, axis=1))
+
+    valid_mask = norms > 1e-6
+    if min_difficulty_mask is not None:
+        valid_mask &= min_difficulty_mask
+    valid_indices = np.where(valid_mask)[0]
+    n_valid = len(valid_indices)
+    logger.info(f"K-medoids selection (buffer embeddings): {n_valid} candidate levels")
+
+    if n_valid <= n:
+        return [(int(i), tokens[i], float(active_scores[i])) for i in valid_indices]
+
+    # L2 pairwise distance matrix
+    valid_emb = emb[valid_indices]
+    dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+    chunk_size = max(1, min(500, n_valid))
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        diff = valid_emb[start:end, np.newaxis, :] - valid_emb[np.newaxis, :, :]
+        dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    # PAM BUILD: greedy initialization
+    total_dist = dist_matrix.sum(axis=1)
+    medoids = [int(np.argmin(total_dist))]
+
+    nearest_medoid_dist = dist_matrix[medoids[0]].copy()
+    for _ in range(1, n):
+        gains = np.zeros(n_valid)
+        for c in range(n_valid):
+            if c in medoids:
+                gains[c] = -1
+                continue
+            gains[c] = np.maximum(0, nearest_medoid_dist - dist_matrix[c]).sum()
+        best = int(np.argmax(gains))
+        medoids.append(best)
+        nearest_medoid_dist = np.minimum(nearest_medoid_dist, dist_matrix[best])
+
+    # PAM SWAP: iterative improvement
+    for iteration in range(100):
+        medoid_dists = dist_matrix[medoids]
+        assignments = np.argmin(medoid_dists, axis=0)
+
+        improved = False
+        for mi, m in enumerate(medoids):
+            cluster_members = np.where(assignments == mi)[0]
+            best_swap, best_delta = None, 0
+
+            for candidate in cluster_members:
+                if candidate == m:
+                    continue
+                delta = 0
+                for j in range(n_valid):
+                    old_d = dist_matrix[medoids[assignments[j]], j]
+                    if assignments[j] == mi:
+                        new_d = dist_matrix[candidate, j]
+                        for mk in range(len(medoids)):
+                            if mk != mi:
+                                new_d = min(new_d, dist_matrix[medoids[mk], j])
+                    else:
+                        new_d = min(old_d, dist_matrix[candidate, j])
+                    delta += new_d - old_d
+
+                if delta < best_delta:
+                    best_delta = delta
+                    best_swap = candidate
+
+            if best_swap is not None:
+                medoids[mi] = best_swap
+                improved = True
+                break
+
+        if not improved:
+            logger.info(f"K-medoids (buffer embeddings) converged after {iteration + 1} iterations")
+            break
+
+    elapsed = time.time() - t0
+
+    refs = []
+    medoid_dists = dist_matrix[medoids]
+    assignments = np.argmin(medoid_dists, axis=0)
+    for i, m in enumerate(medoids):
+        idx = int(valid_indices[m])
+        score = float(active_scores[idx])
+        min_d = float(min(dist_matrix[m, o] for o in medoids if o != m))
+        cluster_size = int(np.sum(assignments == i))
+        logger.info(
+            f"  K-medoid {i+1}: buffer idx={idx}, score={score:.4f}, "
+            f"min_dist={min_d:.4f}, cluster_size={cluster_size}/{n_valid}"
+        )
+        refs.append((idx, tokens[idx], score))
+
+    logger.info(f"K-medoids (buffer embeddings) complete in {elapsed:.1f}s")
+    return refs
+
+
 def _select_diverse_from_precomputed_embedding(
     tokens: np.ndarray,
     active_scores: np.ndarray,
     size: int,
     n: int,
-    buffer_td_errors_path: str,
+    buffer_precomputed_path: str,
     min_difficulty_mask: np.ndarray = None,
 ) -> list:
     """Select N maximally diverse references using precomputed mean LSTM embeddings."""
     import time
     t0 = time.time()
 
-    buf_data = np.load(buffer_td_errors_path)
+    buf_data = np.load(buffer_precomputed_path)
     if "mean_embeddings" not in buf_data.files:
         raise ValueError(
             "Precomputed file missing 'mean_embeddings'. "
@@ -483,7 +682,7 @@ def _select_kmedoids_from_precomputed(
     active_scores: np.ndarray,
     size: int,
     n: int,
-    buffer_td_errors_path: str,
+    buffer_precomputed_path: str,
     min_difficulty_mask: np.ndarray = None,
     normalize: bool = True,
 ) -> list:
@@ -499,7 +698,7 @@ def _select_kmedoids_from_precomputed(
     import time
     t0 = time.time()
 
-    buf_data = np.load(buffer_td_errors_path)
+    buf_data = np.load(buffer_precomputed_path)
     buf_td_padded = buf_data["td_errors"]
     buf_ep_lens = buf_data["ep_lens"]
     buf_indices = buf_data["indices"]
@@ -650,14 +849,14 @@ def _select_kmedoids_from_precomputed_embedding(
     active_scores: np.ndarray,
     size: int,
     n: int,
-    buffer_td_errors_path: str,
+    buffer_precomputed_path: str,
     min_difficulty_mask: np.ndarray = None,
 ) -> list:
     """Select N representative references via k-medoids on precomputed mean LSTM embeddings."""
     import time
     t0 = time.time()
 
-    buf_data = np.load(buffer_td_errors_path)
+    buf_data = np.load(buffer_precomputed_path)
     if "mean_embeddings" not in buf_data.files:
         raise ValueError(
             "Precomputed file missing 'mean_embeddings'. "
@@ -975,6 +1174,19 @@ def build_references_with_metrics(
                     metric_key="scalar_regret",
                 ))
 
+            # Solve rate (requires multi-rollout eval)
+            if _enabled(pm, "solve_rate") and "solve_rate" in traj:
+                n_rolls = len(traj.get("all_returns", []))
+                metrics.append(MetricEntry(
+                    name="Solve Rate",
+                    value=f"{traj['solve_rate']:.0%}",
+                    description=(
+                        f"Agent solves this maze {traj['solve_rate']:.0%} of the time "
+                        f"across {n_rolls} rollouts"
+                    ),
+                    metric_key="solve_rate",
+                ))
+
             # SFL Learnability (requires solve_rate from multi-rollout eval)
             if _enabled(pm, "learnability") and "solve_rate" in traj:
                 learn_info = compute_learnability(traj)
@@ -1278,7 +1490,7 @@ def save_results(
     ref_trajectories: list = None,
     gen_trajectories: list = None,
     embedding_metric: str = "normalized_td_error_emd",
-    buffer_td_errors_path: str = None,
+    buffer_precomputed_path: str = None,
     buffer_embed_samples: int = 200,
     buffer_scores: np.ndarray = None,
     difficulty_metric: str = "regret",
@@ -1672,13 +1884,13 @@ def save_results(
             _quantiles = np.linspace(0, 1, _N_QUANT)
             buf_difficulty_pass = None
 
-            _has_precomputed = (buffer_td_errors_path and os.path.exists(buffer_td_errors_path)
+            _has_precomputed = (buffer_precomputed_path and os.path.exists(buffer_precomputed_path)
                                 and buffer_embed_samples != 0)
             _use_td_buf = _has_precomputed and _emb_metric in ("normalized_td_error_emd", "td_error_emd")
             _use_emb_buf = _has_precomputed and _emb_metric == "embedding"
 
             if _use_td_buf or _use_emb_buf:
-                buf_data = np.load(buffer_td_errors_path)
+                buf_data = np.load(buffer_precomputed_path)
                 buf_ep_lens = buf_data["ep_lens"]        # (N,)
                 n_total_buf = len(buf_ep_lens)
                 # Subsample unless -1 (all)
@@ -2096,8 +2308,9 @@ def run_test(args):
     _validate_buffer_difficulty(args.difficulty_metric, args.agent_dir)
 
     # Load agent early if needed for diverse selection or metrics
+    _diverse_strategies = ("diverse-greedy", "diverse-kmedoid", "hybrid-greedy", "hybrid-kmedoid")
     evaluator = None
-    if args.inject_metrics or args.strategy in ("diverse", "hybrid"):
+    if args.inject_metrics or args.strategy in _diverse_strategies:
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
         evaluator = AgentEvaluator(args.agent_dir, num_steps=args.num_steps)
@@ -2105,9 +2318,14 @@ def run_test(args):
     # Select reference mazes
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
 
-    # Build difficulty mask for hybrid/kmedoids strategies
+    # Extract mean_embeddings from buffer dump if available (avoids needing precomputed file)
+    buf_mean_embeddings = buf.get("mean_embeddings", None)
+    if buf_mean_embeddings is not None:
+        logger.info(f"Buffer has mean_embeddings ({buf_mean_embeddings.shape})")
+
+    # Build difficulty mask for hybrid strategies
     difficulty_mask = None
-    if args.strategy in ("hybrid", "kmedoids"):
+    if args.strategy in ("hybrid-greedy", "hybrid-kmedoid"):
         active_scores = scores[:size]
         if args.difficulty_metric == "sfl":
             max_regret = max(float(np.max(active_scores)), 1e-8)
@@ -2123,22 +2341,24 @@ def run_test(args):
             f"{n_pass}/{size} levels above mean ({mean_diff:.4f})"
         )
 
-    if args.strategy == "kmedoids":
+    if args.strategy in ("diverse-kmedoid", "hybrid-kmedoid"):
         ref_data = select_references_kmedoids(
             tokens, scores, size,
             n=args.num_refs,
             metric=args.diverse_metric,
-            buffer_td_errors_path=args.buffer_td_errors,
+            buffer_precomputed_path=args.buffer_precomputed,
             min_difficulty_mask=difficulty_mask,
+            mean_embeddings=buf_mean_embeddings,
         )
-    elif args.strategy in ("diverse", "hybrid") and evaluator is not None:
+    elif args.strategy in ("diverse-greedy", "hybrid-greedy") and evaluator is not None:
         ref_data = select_references_diverse(
             tokens, scores, size, evaluator,
             n=args.num_refs,
             pool_size=args.diverse_pool_size,
             metric=args.diverse_metric,
-            buffer_td_errors_path=args.buffer_td_errors,
+            buffer_precomputed_path=args.buffer_precomputed,
             min_difficulty_mask=difficulty_mask,
+            mean_embeddings=buf_mean_embeddings,
         )
     else:
         ref_data = select_references(
@@ -2154,8 +2374,22 @@ def run_test(args):
         for idx, tok, score in ref_data:
             ref_levels.append(tokens_to_level_obj(tok))
 
-        logger.info(f"Rolling out agent on {len(ref_levels)} reference levels...")
-        ref_trajectories = evaluator.evaluate_levels(ref_levels)
+        # Use multi-rollout if learnability or solve_rate metrics are enabled
+        _pm = args.prompt_metrics or {}
+        _needs_multi = _pm.get("learnability", False) or _pm.get("solve_rate", False)
+        if _needs_multi:
+            logger.info(f"Multi-rollout ({args.n_rollouts}x) on {len(ref_levels)} reference levels...")
+            ref_trajectories = []
+            for i, lv in enumerate(ref_levels):
+                traj = evaluator.evaluate_level_multi_rollout(lv, n_rollouts=args.n_rollouts)
+                logger.info(
+                    f"  Ref {i+1}: solve_rate={traj['solve_rate']:.0%}, "
+                    f"best_return={traj['best_return']:.3f}"
+                )
+                ref_trajectories.append(traj)
+        else:
+            logger.info(f"Rolling out agent on {len(ref_levels)} reference levels...")
+            ref_trajectories = evaluator.evaluate_levels(ref_levels)
         logger.info("Reference trajectories collected")
 
     # Build references with metrics (configurable via prompt_metrics/pairwise_metrics)
@@ -2384,7 +2618,7 @@ def run_test(args):
         ref_trajectories=ref_trajectories,
         gen_trajectories=gen_trajectories,
         embedding_metric=args.embedding_metric,
-        buffer_td_errors_path=args.buffer_td_errors,
+        buffer_precomputed_path=args.buffer_precomputed,
         buffer_embed_samples=args.buffer_embed_samples,
         buffer_scores=scores[:size],
         difficulty_metric=args.difficulty_metric,
@@ -2449,10 +2683,15 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse", "hybrid", "kmedoids"],
+    parser.add_argument("--strategy", choices=["top_regret", "random",
+                                               "diverse-greedy", "diverse-kmedoid",
+                                               "hybrid-greedy", "hybrid-kmedoid"],
                         default=cfg.get("strategy"),
-                        help="Reference selection strategy (diverse = greedy max-min, "
-                             "kmedoids = PAM cluster medoids, hybrid = difficulty-filtered diverse)")
+                        help="Reference selection strategy: "
+                             "diverse-greedy = greedy max-min, "
+                             "diverse-kmedoid = PAM cluster medoids, "
+                             "hybrid-greedy = difficulty-filtered + greedy max-min, "
+                             "hybrid-kmedoid = difficulty-filtered + PAM cluster medoids")
     parser.add_argument("--diverse-metric",
                         choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", "embedding"],
                         default=None,
@@ -2554,8 +2793,8 @@ def main():
                         choices=["td_error_emd", "normalized_td_error_emd", "embedding"],
                         default=cfg.get("embedding_metric", "normalized_td_error_emd"),
                         help="Pairwise metric for t-SNE/MDS diversity embedding plot")
-    parser.add_argument("--buffer-td-errors", default=cfg.get("buffer_td_errors"),
-                        help="Path to precomputed buffer TD errors .npz (from precompute_buffer_embeddings.py)")
+    parser.add_argument("--buffer-precomputed", default=cfg.get("buffer_precomputed"),
+                        help="Path to precomputed buffer data .npz (embeddings, TD errors, episode lengths)")
     parser.add_argument("--buffer-embed-samples", type=int,
                         default=cfg.get("buffer_embed_samples", 200),
                         help="Buffer levels to include in embedding (0=none, -1=all, default=200)")

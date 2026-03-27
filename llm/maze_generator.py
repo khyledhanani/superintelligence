@@ -937,8 +937,8 @@ class MazeGenerator:
                     k: np.array(v) if isinstance(v, np.ndarray) else v
                     for k, v in candidate_traj.items()
                     if k in ("positions", "values", "dones", "rewards",
-                             "actions", "entropy", "solve_rate", "best_return",
-                             "all_returns")
+                             "actions", "entropy", "hstates",
+                             "solve_rate", "best_return", "all_returns")
                 },
             ))
 

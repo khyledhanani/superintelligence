@@ -175,13 +175,14 @@ The `--strategy` flag controls how reference mazes are selected from the buffer 
 |----------|-----------|----------|
 | `top_regret` | Select N highest-regret levels from buffer | Maximizing difficulty of references |
 | `random` | Uniform random sample from buffer | Baseline / quick runs |
-| `diverse` | Greedy max-min on precomputed pairwise distance matrix | Maximizing spread — picks levels that are far apart from each other |
-| `kmedoids` | PAM (Partitioning Around Medoids) BUILD+SWAP on precomputed pairwise distance matrix | Finding cluster centers — picks levels that minimize within-cluster distance, representing typical buffer regions |
-| `hybrid` | Filter to above-mean difficulty, then apply `diverse` selection on filtered set | Difficulty-filtered diversity — avoids easy references |
+| `diverse-greedy` | Greedy max-min on precomputed pairwise distance matrix | Maximizing spread — picks levels that are far apart from each other |
+| `diverse-kmedoid` | PAM (Partitioning Around Medoids) BUILD+SWAP on precomputed pairwise distance matrix | Finding cluster centers — picks levels that minimize within-cluster distance, representing typical buffer regions |
+| `hybrid-greedy` | Filter to above-mean difficulty, then apply `diverse-greedy` selection on filtered set | Difficulty-filtered diversity — avoids easy references |
+| `hybrid-kmedoid` | Filter to above-mean difficulty, then apply `diverse-kmedoid` selection on filtered set | Difficulty-filtered representative coverage — avoids easy references and picks cluster centers |
 
-**Key distinction:** `diverse` (greedy max-min) maximizes spread and tends to pick outliers. `kmedoids` (PAM cluster medoids) finds representative centers. Use `diverse` when you want the LLM to see the full range of buffer experiences; use `kmedoids` when you want references that represent typical clusters.
+**Key distinction:** `diverse-greedy` (greedy max-min) maximizes spread and tends to pick outliers. `diverse-kmedoid` (PAM cluster medoids) finds representative centers. Use `diverse-greedy` when you want the LLM to see the full range of buffer experiences; use `diverse-kmedoid` when you want references that represent typical clusters. The `hybrid-*` variants apply an above-mean difficulty filter first.
 
-Both `diverse` and `kmedoids` require precomputed pairwise distances (`buffer_td_errors.npz` or `buffer_embeddings.npz`). If unavailable, they fall back to rollout-based selection.
+All `diverse-*` and `hybrid-*` strategies require precomputed buffer data (`buffer_precomputed.npz`). If unavailable, `diverse-greedy` and `hybrid-greedy` fall back to rollout-based selection.
 
 ## Embedding Visualization
 

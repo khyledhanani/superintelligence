@@ -192,7 +192,7 @@ This means CENIE's advantage over pairwise metrics (which subsample ~6 reference
 Five strategies are available via `--strategy`:
 
 ### `diverse` (greedy max-min)
-Uses precomputed pairwise distances (`buffer_td_errors.npz` or `buffer_embeddings.npz`) to greedily select N maximally-spread references from all 4000 buffer levels in ~0.3s (no agent rollouts needed for selection). Starts with the global maximum-distance pair, then iteratively adds the level farthest from the current set. Tends to pick outliers.
+Uses precomputed buffer data (`buffer_precomputed.npz`) to greedily select N maximally-spread references from all 4000 buffer levels in ~0.3s (no agent rollouts needed for selection). Starts with the global maximum-distance pair, then iteratively adds the level farthest from the current set. Tends to pick outliers.
 
 ### `kmedoids` (PAM cluster medoids)
 Uses the same precomputed pairwise distance matrix but applies the PAM (Partitioning Around Medoids) BUILD+SWAP algorithm. Finds K cluster centers that minimize within-cluster distance. Unlike greedy max-min, this picks *representative* levels (cluster centers) rather than maximally-spread outliers. Better when you want references that cover typical buffer behavior.

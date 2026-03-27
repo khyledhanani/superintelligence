@@ -28,7 +28,7 @@ validate_solvable: true     # BFS solvability check on generated mazes
 # --- Reference Mazes ---
 buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
 num_refs: 6                 # Number of reference mazes from buffer
-strategy: hybrid            # "top_regret", "random", "diverse", "kmedoids", or "hybrid" (above-mean difficulty + max diversity)
+strategy: hybrid-greedy     # "top_regret", "random", "diverse-greedy", "diverse-kmedoid", "hybrid-greedy", or "hybrid-kmedoid"
 
 # --- Metric Injection ---
 # Controls which metrics are computed from agent rollouts and shown to the LLM.
@@ -42,18 +42,19 @@ prompt_metrics:
   per_step_entropy: true    # Policy uncertainty at each timestep
   per_step_regret: false     # (max_return - V(s_t)) time series
   scalar_regret: true       # Mean per-step regret (single number, MaxMC)
-  action_sequence: true     # Agent's discrete actions per step (behavioral fingerprint)
+  action_sequence: false     # Agent's discrete actions per step (behavioral fingerprint)
   path_overlay: true        # ASCII visualization of agent trajectory on the grid
   position_vector: true    # Agent (x,y) per step — lets LLM link regret/entropy spikes to grid locations
-  value_error: true        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
+  value_error: false        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
   normalized_td_error: false # Normalized TD error per step — fraction of total learning signal at each timestep
-  learnability: false       # SFL learnability p*(1-p) from multi-rollout solve rate (requires n_rollouts > 1)
+  learnability: true        # SFL learnability p*(1-p) from multi-rollout solve rate
+  solve_rate: false          # Agent solve rate across n_rollouts (requires multi-rollout references)
 
 # Pairwise metrics injected into the LLM prompt (between all reference pairs).
 pairwise_metrics:
   position_dtw: false        # Spatial path similarity between two trajectories
-  mode_transition: true    # Experience mode transition divergence (experiential diversity)
-  td_error: true           # Normalized TD error distribution EMD (task-agnostic learning signal shape diversity)
+  mode_transition: false    # Experience mode transition divergence (experiential diversity)
+  td_error: false           # Normalized TD error distribution EMD (task-agnostic learning signal shape diversity)
 
 # --- Agent & Feedback Loop ---
 agent_dir: gcs_artifacts/agent/cmaes_vae_beta2.0_seed0_198
@@ -66,16 +67,16 @@ max_diversity_retries: 3
 # Thresholds for accepting a generated maze. Set to null to disable a gate.
 # A maze must pass ALL enabled gates. On failure, LLM gets metric feedback and retries.
 gate:
-  difficulty_threshold: 0.6     # Min difficulty score to accept (null = disabled)
-  difficulty_metric: regret     # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
+  difficulty_threshold: 0.1     # Min difficulty score to accept (null = disabled)
+  difficulty_metric: sfl     # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
                                 #   regret: rejects too-easy mazes (threshold ~0.6, buffer max 0.475)
                                 #   sfl: rejects too-easy AND too-hard mazes (threshold ~0.1, max at p=0.5 is 0.25)
-  min_diversity: 0.03           # Min distance to closest reference
+  min_diversity: 0.02           # Min distance to closest reference
   diversity_metric: embedding    # "td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", "embedding", or "cenie"
 
 # --- Visualization ---
 embedding_metric: embedding       # Pairwise metric for t-SNE/MDS diversity embedding plot ("td_error_emd", "normalized_td_error_emd", or "embedding")
-buffer_td_errors: gcs_artifacts/buffer/buffer_td_errors.npz  # Precomputed buffer TD errors for embedding background (run precompute_buffer_embeddings.py)
+buffer_precomputed: gcs_artifacts/buffer/buffer_precomputed.npz  # Precomputed buffer data: embeddings, TD errors, episode lengths (run precompute_buffer_embeddings.py)
 buffer_embed_samples: -1    # Buffer levels in embedding plot (0=none, -1=all, default=-1)
 
 # --- Metric Display ---

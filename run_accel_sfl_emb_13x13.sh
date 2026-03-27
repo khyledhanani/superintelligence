@@ -12,12 +12,15 @@ set -e
 
 BUCKET="ucl-ued-project-bucket"
 PREFIX="llm-exp"
-PROJECT="JAXUED_VAE_COMPARISON"
+PROJECT="OEGI"
 RUN_NAME="accel_sfl_emb_13x13"
 
 export WANDB_DIR=/tmp/wandb
+export WANDB_ENTITY=shr1ramrg
+export WANDB_PROJECT=OEGI
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="src:."
+export GOOGLE_CLOUD_PROJECT=open-endedness-ued-project
 
 COMMON="--project $PROJECT \
         --run_name $RUN_NAME \

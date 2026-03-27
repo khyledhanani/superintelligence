@@ -234,6 +234,13 @@ METRIC_DEFINITIONS: Dict[str, tuple] = {
         "recognize good positions). The sign reveals the nature of the error, not just "
         "its magnitude.",
     ),
+    "solve_rate": (
+        "Solve Rate",
+        "Solve Rate is the fraction of rollouts where the agent reaches the goal. "
+        "100% means the maze is too easy — the agent has mastered it. 0% means it's "
+        "impossible or far too hard. The most useful mazes for training have solve rates "
+        "between 30% and 70% — the agent can sometimes solve them but not always.",
+    ),
     "learnability": (
         "SFL Learnability",
         "SFL Learnability is p × (1-p) where p is the agent's solve rate across many "
