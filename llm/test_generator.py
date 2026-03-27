@@ -1494,6 +1494,7 @@ def save_results(
     buffer_embed_samples: int = 200,
     buffer_scores: np.ndarray = None,
     difficulty_metric: str = "regret",
+    buf_mean_embeddings: np.ndarray = None,
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
 
@@ -1887,9 +1888,31 @@ def save_results(
             _has_precomputed = (buffer_precomputed_path and os.path.exists(buffer_precomputed_path)
                                 and buffer_embed_samples != 0)
             _use_td_buf = _has_precomputed and _emb_metric in ("normalized_td_error_emd", "td_error_emd")
-            _use_emb_buf = _has_precomputed and _emb_metric == "embedding"
+            _use_emb_buf = _emb_metric == "embedding" and buffer_embed_samples != 0
+            # For embedding metric: prefer buffer dump embeddings, fall back to precomputed file
+            _has_buf_emb = buf_mean_embeddings is not None and _use_emb_buf
 
-            if _use_td_buf or _use_emb_buf:
+            if _has_buf_emb:
+                # Use embeddings directly from the buffer dump
+                n_total_buf = len(buf_mean_embeddings)
+                if buffer_embed_samples == -1:
+                    max_buf = n_total_buf
+                else:
+                    max_buf = buffer_embed_samples
+                if n_total_buf > max_buf:
+                    np.random.seed(42)
+                    buf_sample_idx = np.sort(np.random.choice(n_total_buf, max_buf, replace=False))
+                else:
+                    buf_sample_idx = np.arange(n_total_buf)
+                n_buf = len(buf_sample_idx)
+                # Filter out zero-norm embeddings
+                norms = np.sqrt(np.sum(buf_mean_embeddings[buf_sample_idx] ** 2, axis=1))
+                valid = norms > 1e-6
+                buf_sample_idx = buf_sample_idx[valid]
+                n_buf = len(buf_sample_idx)
+                buf_quant_matrix = buf_mean_embeddings[buf_sample_idx]
+                logger.info(f"Loaded {n_buf} buffer mean embeddings from buffer dump for embedding plot (from {n_total_buf} total)")
+            elif _use_td_buf or (_use_emb_buf and _has_precomputed):
                 buf_data = np.load(buffer_precomputed_path)
                 buf_ep_lens = buf_data["ep_lens"]        # (N,)
                 n_total_buf = len(buf_ep_lens)
@@ -1916,7 +1939,7 @@ def save_results(
                             td = td / total
                         buf_quant_matrix[i] = np.quantile(np.sort(td), _quantiles)
                     logger.info(f"Loaded {n_buf} buffer TD error profiles for embedding (from {n_total_buf} total)")
-                elif _use_emb_buf and "mean_embeddings" in buf_data.files:
+                elif "mean_embeddings" in buf_data.files:
                     # Mean LSTM state-action embeddings: (n_buf, 257) precomputed
                     buf_quant_matrix = buf_data["mean_embeddings"][buf_sample_idx]
                     logger.info(f"Loaded {n_buf} buffer mean embeddings for embedding plot (from {n_total_buf} total)")
@@ -1924,7 +1947,7 @@ def save_results(
                     logger.warning("Embedding metric selected but no precomputed mean_embeddings in buffer file — no buffer dots")
                     n_buf = 0
 
-                # Build difficulty mask for buffer dots coloring
+                # Build difficulty mask for buffer dots coloring (precomputed file path)
                 if n_buf > 0:
                     buf_data_indices = buf_data["indices"] if "indices" in buf_data.files else None
                     if buffer_scores is not None and buf_data_indices is not None:
@@ -1941,6 +1964,22 @@ def save_results(
                         buf_difficulty_pass = diff_scores >= mean_diff
                         n_pass = int(np.sum(buf_difficulty_pass))
                         logger.info(f"Buffer embedding: {n_pass}/{n_buf} dots pass difficulty filter")
+
+            # Build difficulty mask for buffer dots (buffer dump direct path)
+            if _has_buf_emb and n_buf > 0 and buf_difficulty_pass is None and buffer_scores is not None:
+                buf_sampled_scores = buffer_scores[buf_sample_idx]
+                if difficulty_metric == "sfl":
+                    max_r = max(float(np.max(buffer_scores)), 1e-8)
+                    approx_p = np.clip(1.0 - buf_sampled_scores / max_r, 0, 1)
+                    diff_scores = approx_p * (1.0 - approx_p)
+                    all_p = np.clip(1.0 - buffer_scores / max_r, 0, 1)
+                    mean_diff = float(np.mean(all_p * (1.0 - all_p)))
+                else:
+                    diff_scores = buf_sampled_scores
+                    mean_diff = float(np.mean(buffer_scores))
+                buf_difficulty_pass = diff_scores >= mean_diff
+                n_pass = int(np.sum(buf_difficulty_pass))
+                logger.info(f"Buffer embedding: {n_pass}/{n_buf} dots pass difficulty filter")
 
             # Build quantile matrix for foreground trajectories
             fg_quant_matrix = None
@@ -2622,6 +2661,7 @@ def run_test(args):
         buffer_embed_samples=args.buffer_embed_samples,
         buffer_scores=scores[:size],
         difficulty_metric=args.difficulty_metric,
+        buf_mean_embeddings=buf_mean_embeddings,
     )
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    - maze_XXX.txt files (ASCII grids)")
