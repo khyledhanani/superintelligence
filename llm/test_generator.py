@@ -2509,12 +2509,13 @@ def run_test(args):
             difficulty_scores = approx_p * (1.0 - approx_p)
         else:
             difficulty_scores = active_scores
-        mean_diff = float(np.mean(difficulty_scores))
-        difficulty_mask = difficulty_scores >= mean_diff
+        pct = args.hybrid_difficulty_percentile
+        diff_threshold = float(np.percentile(difficulty_scores, pct))
+        difficulty_mask = difficulty_scores >= diff_threshold
         n_pass = int(np.sum(difficulty_mask))
         logger.info(
-            f"Difficulty filter ({args.difficulty_metric}): "
-            f"{n_pass}/{size} levels above mean ({mean_diff:.4f})"
+            f"Difficulty filter ({args.difficulty_metric}, p{pct:.0f}): "
+            f"{n_pass}/{size} levels above {diff_threshold:.4f}"
         )
 
     if args.strategy in ("diverse-weighted-kmedoid", "hybrid-weighted-kmedoid"):
@@ -2891,6 +2892,9 @@ def main():
     parser.add_argument("--density-radius-frac", type=float,
                         default=cfg.get("density_radius_frac", 0.5),
                         help="Density radius as fraction of median pairwise distance (weighted-kmedoid only)")
+    parser.add_argument("--hybrid-difficulty-percentile", type=float,
+                        default=cfg.get("hybrid_difficulty_percentile", 50),
+                        help="Percentile threshold for hybrid difficulty filter (50=above median, 75=top 25%%)")
 
     # Metric injection flags
     parser.add_argument("--inject-metrics", action="store_true",

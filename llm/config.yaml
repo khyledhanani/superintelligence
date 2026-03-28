@@ -29,6 +29,7 @@ validate_solvable: true     # BFS solvability check on generated mazes
 buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
 num_refs: 6                 # Number of reference mazes from buffer
 strategy: hybrid-weighted-kmedoid  # "top_regret", "random", "diverse-greedy", "diverse-kmedoid", "diverse-weighted-kmedoid", "hybrid-greedy", "hybrid-kmedoid", or "hybrid-weighted-kmedoid"
+hybrid_difficulty_percentile: 50  # Percentile threshold for hybrid difficulty filter (50 = above median, 75 = top 25%, 25 = top 75%)
 density_radius_frac: 0.5     # Density radius as fraction of median pairwise distance (weighted-kmedoid only). Smaller = more local density, larger = more global
 
 # --- Metric Injection ---
