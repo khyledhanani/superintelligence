@@ -28,7 +28,8 @@ validate_solvable: true     # BFS solvability check on generated mazes
 # --- Reference Mazes ---
 buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
 num_refs: 6                 # Number of reference mazes from buffer
-strategy: hybrid-greedy     # "top_regret", "random", "diverse-greedy", "diverse-kmedoid", "hybrid-greedy", or "hybrid-kmedoid"
+strategy: hybrid-weighted-kmedoid  # "top_regret", "random", "diverse-greedy", "diverse-kmedoid", "diverse-weighted-kmedoid", "hybrid-greedy", "hybrid-kmedoid", or "hybrid-weighted-kmedoid"
+density_radius_frac: 0.5     # Density radius as fraction of median pairwise distance (weighted-kmedoid only). Smaller = more local density, larger = more global
 
 # --- Metric Injection ---
 # Controls which metrics are computed from agent rollouts and shown to the LLM.

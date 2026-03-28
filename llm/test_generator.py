@@ -588,6 +588,142 @@ def _select_kmedoids_from_buffer_embeddings(
     return refs
 
 
+def _select_weighted_kmedoids_from_buffer_embeddings(
+    tokens: np.ndarray,
+    active_scores: np.ndarray,
+    size: int,
+    n: int,
+    mean_embeddings: np.ndarray,
+    min_difficulty_mask: np.ndarray = None,
+    density_radius_frac: float = 0.5,
+) -> list:
+    """Select N representative references via density-weighted k-medoids.
+
+    Like standard k-medoids, but each point is weighted by its local density
+    (number of neighbors within a radius). This biases medoid selection toward
+    dense regions of the embedding space, avoiding outlier clusters stealing
+    medoid slots from the populated core.
+
+    Weight = number of neighbors within radius (median pairwise distance * density_radius_frac).
+    The PAM BUILD and SWAP steps multiply each point's contribution to the
+    objective by its weight, so dense regions pull harder for medoids.
+    """
+    import time
+    t0 = time.time()
+
+    emb = mean_embeddings[:size]
+    norms = np.sqrt(np.sum(emb ** 2, axis=1))
+
+    valid_mask = norms > 1e-6
+    if min_difficulty_mask is not None:
+        valid_mask &= min_difficulty_mask
+    valid_indices = np.where(valid_mask)[0]
+    n_valid = len(valid_indices)
+    logger.info(f"Weighted k-medoids selection (buffer embeddings): {n_valid} candidate levels")
+
+    if n_valid <= n:
+        return [(int(i), tokens[i], float(active_scores[i])) for i in valid_indices]
+
+    # L2 pairwise distance matrix
+    valid_emb = emb[valid_indices]
+    dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+    chunk_size = max(1, min(500, n_valid))
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        diff = valid_emb[start:end, np.newaxis, :] - valid_emb[np.newaxis, :, :]
+        dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    # Compute density weights: neighbors within radius
+    median_dist = float(np.median(dist_matrix[np.triu_indices(n_valid, k=1)]))
+    radius = median_dist * density_radius_frac
+    weights = np.sum(dist_matrix < radius, axis=1).astype(np.float64)
+    # Normalize so weights sum to n_valid (preserves scale of objective)
+    weights = weights / weights.mean()
+    logger.info(
+        f"  Density weights: radius={radius:.4f}, "
+        f"min={weights.min():.2f}, max={weights.max():.2f}, "
+        f"median={np.median(weights):.2f}"
+    )
+
+    # Weighted PAM BUILD: greedy initialization
+    # Pick first medoid minimizing weighted total distance
+    weighted_total_dist = (dist_matrix * weights[np.newaxis, :]).sum(axis=1)
+    medoids = [int(np.argmin(weighted_total_dist))]
+
+    nearest_medoid_dist = dist_matrix[medoids[0]].copy()
+    for _ in range(1, n):
+        gains = np.zeros(n_valid)
+        for c in range(n_valid):
+            if c in medoids:
+                gains[c] = -1
+                continue
+            # Weighted gain: how much each point's nearest-medoid distance improves
+            improvement = np.maximum(0, nearest_medoid_dist - dist_matrix[c])
+            gains[c] = (improvement * weights).sum()
+        best = int(np.argmax(gains))
+        medoids.append(best)
+        nearest_medoid_dist = np.minimum(nearest_medoid_dist, dist_matrix[best])
+
+    # Weighted PAM SWAP: iterative improvement
+    for iteration in range(100):
+        medoid_dists = dist_matrix[medoids]
+        assignments = np.argmin(medoid_dists, axis=0)
+
+        improved = False
+        for mi, m in enumerate(medoids):
+            cluster_members = np.where(assignments == mi)[0]
+            best_swap, best_delta = None, 0.0
+
+            for candidate in cluster_members:
+                if candidate == m:
+                    continue
+                delta = 0.0
+                for j in range(n_valid):
+                    old_d = dist_matrix[medoids[assignments[j]], j]
+                    if assignments[j] == mi:
+                        new_d = dist_matrix[candidate, j]
+                        for mk in range(len(medoids)):
+                            if mk != mi:
+                                new_d = min(new_d, dist_matrix[medoids[mk], j])
+                    else:
+                        new_d = min(old_d, dist_matrix[candidate, j])
+                    delta += (new_d - old_d) * weights[j]
+
+                if delta < best_delta:
+                    best_delta = delta
+                    best_swap = candidate
+
+            if best_swap is not None:
+                medoids[mi] = best_swap
+                improved = True
+                break
+
+        if not improved:
+            logger.info(f"Weighted k-medoids converged after {iteration + 1} iterations")
+            break
+
+    elapsed = time.time() - t0
+
+    refs = []
+    medoid_dists = dist_matrix[medoids]
+    assignments = np.argmin(medoid_dists, axis=0)
+    for i, m in enumerate(medoids):
+        idx = int(valid_indices[m])
+        score = float(active_scores[idx])
+        min_d = float(min(dist_matrix[m, o] for o in medoids if o != m))
+        cluster_size = int(np.sum(assignments == i))
+        density_at_medoid = float(weights[m])
+        logger.info(
+            f"  Weighted medoid {i+1}: buffer idx={idx}, score={score:.4f}, "
+            f"min_dist={min_d:.4f}, cluster_size={cluster_size}/{n_valid}, "
+            f"density={density_at_medoid:.2f}"
+        )
+        refs.append((idx, tokens[idx], score))
+
+    logger.info(f"Weighted k-medoids (buffer embeddings) complete in {elapsed:.1f}s")
+    return refs
+
+
 def _select_diverse_from_precomputed_embedding(
     tokens: np.ndarray,
     active_scores: np.ndarray,
@@ -2347,7 +2483,8 @@ def run_test(args):
     _validate_buffer_difficulty(args.difficulty_metric, args.agent_dir)
 
     # Load agent early if needed for diverse selection or metrics
-    _diverse_strategies = ("diverse-greedy", "diverse-kmedoid", "hybrid-greedy", "hybrid-kmedoid")
+    _diverse_strategies = ("diverse-greedy", "diverse-kmedoid", "diverse-weighted-kmedoid",
+                           "hybrid-greedy", "hybrid-kmedoid", "hybrid-weighted-kmedoid")
     evaluator = None
     if args.inject_metrics or args.strategy in _diverse_strategies:
         from llm.agent_evaluator import AgentEvaluator
@@ -2364,7 +2501,7 @@ def run_test(args):
 
     # Build difficulty mask for hybrid strategies
     difficulty_mask = None
-    if args.strategy in ("hybrid-greedy", "hybrid-kmedoid"):
+    if args.strategy in ("hybrid-greedy", "hybrid-kmedoid", "hybrid-weighted-kmedoid"):
         active_scores = scores[:size]
         if args.difficulty_metric == "sfl":
             max_regret = max(float(np.max(active_scores)), 1e-8)
@@ -2380,7 +2517,17 @@ def run_test(args):
             f"{n_pass}/{size} levels above mean ({mean_diff:.4f})"
         )
 
-    if args.strategy in ("diverse-kmedoid", "hybrid-kmedoid"):
+    if args.strategy in ("diverse-weighted-kmedoid", "hybrid-weighted-kmedoid"):
+        if buf_mean_embeddings is None:
+            raise ValueError("weighted-kmedoid strategy requires buffer with mean_embeddings")
+        ref_data = _select_weighted_kmedoids_from_buffer_embeddings(
+            tokens, scores[:size], size,
+            n=args.num_refs,
+            mean_embeddings=buf_mean_embeddings,
+            min_difficulty_mask=difficulty_mask,
+            density_radius_frac=args.density_radius_frac,
+        )
+    elif args.strategy in ("diverse-kmedoid", "hybrid-kmedoid"):
         ref_data = select_references_kmedoids(
             tokens, scores, size,
             n=args.num_refs,
@@ -2725,13 +2872,15 @@ def main():
                         help="Number of reference mazes")
     parser.add_argument("--strategy", choices=["top_regret", "random",
                                                "diverse-greedy", "diverse-kmedoid",
-                                               "hybrid-greedy", "hybrid-kmedoid"],
+                                               "diverse-weighted-kmedoid",
+                                               "hybrid-greedy", "hybrid-kmedoid",
+                                               "hybrid-weighted-kmedoid"],
                         default=cfg.get("strategy"),
                         help="Reference selection strategy: "
                              "diverse-greedy = greedy max-min, "
                              "diverse-kmedoid = PAM cluster medoids, "
-                             "hybrid-greedy = difficulty-filtered + greedy max-min, "
-                             "hybrid-kmedoid = difficulty-filtered + PAM cluster medoids")
+                             "diverse-weighted-kmedoid = density-weighted PAM (covers dense regions), "
+                             "hybrid-* = difficulty-filtered variants")
     parser.add_argument("--diverse-metric",
                         choices=["td_error_emd", "normalized_td_error_emd", "experience_divergence", "position_dtw", "embedding"],
                         default=None,
@@ -2739,6 +2888,9 @@ def main():
     parser.add_argument("--diverse-pool-size", type=int,
                         default=cfg.get("diverse_pool_size", 20),
                         help="Candidate pool size for diverse strategy")
+    parser.add_argument("--density-radius-frac", type=float,
+                        default=cfg.get("density_radius_frac", 0.5),
+                        help="Density radius as fraction of median pairwise distance (weighted-kmedoid only)")
 
     # Metric injection flags
     parser.add_argument("--inject-metrics", action="store_true",
