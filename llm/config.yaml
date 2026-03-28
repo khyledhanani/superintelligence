@@ -78,7 +78,7 @@ gate:
 
 # --- Visualization ---
 embedding_metric: embedding       # Pairwise metric for t-SNE/MDS diversity embedding plot ("td_error_emd", "normalized_td_error_emd", or "embedding")
-buffer_precomputed: gcs_artifacts/buffer/buffer_precomputed.npz  # Precomputed buffer data: embeddings, TD errors, episode lengths (run precompute_buffer_embeddings.py)
+buffer_precomputed: null    # Precomputed buffer data .npz (only needed for TD error metrics; embedding reads from buffer dump directly)
 buffer_embed_samples: -1    # Buffer levels in embedding plot (0=none, -1=all, default=-1)
 
 # --- Metric Display ---
