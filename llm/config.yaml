@@ -79,7 +79,7 @@ gate:
 
 # --- Visualization ---
 embedding_metric: embedding       # Pairwise metric for t-SNE/MDS diversity embedding plot ("td_error_emd", "normalized_td_error_emd", or "embedding")
-buffer_precomputed: gcs_artifacts/buffer_dumps/accel_sfl_emb_13x13/0/buffer_embedding_distances.npz  # Precomputed buffer pairwise distances (null = recompute from embeddings)
+buffer_precomputed: null    # Precomputed buffer pairwise distances .npz (null = recompute from embeddings)
 buffer_embed_samples: -1    # Buffer levels in embedding plot (0=none, -1=all, default=-1)
 
 # --- Metric Display ---
