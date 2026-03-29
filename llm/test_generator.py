@@ -141,7 +141,7 @@ def select_references(
         scores: (capacity,) score array (regret)
         size: number of active levels
         n: number of references to select
-        strategy: "top_regret", "random"
+        strategy: "top_difficulty" (or legacy "top_regret"), "random"
         difficulty_metric: "regret" (higher=harder) or "sfl" (mid-range=harder).
             For "sfl", score is converted to learnability p*(1-p) using
             a regret-to-solve-rate heuristic.
@@ -163,7 +163,7 @@ def select_references(
     else:
         difficulty_scores = active_scores
 
-    if strategy == "top_regret":
+    if strategy == "top_difficulty":
         # Top n by difficulty score
         top_indices = np.argsort(difficulty_scores)[::-1][:n]
     elif strategy == "random":
@@ -1631,6 +1631,7 @@ def save_results(
     buffer_scores: np.ndarray = None,
     difficulty_metric: str = "regret",
     buf_mean_embeddings: np.ndarray = None,
+    plot_3d: bool = False,
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
 
@@ -2163,8 +2164,35 @@ def save_results(
 
             _dist_metric = 'l2' if _emb_metric == 'embedding' else 'l1_mean'
 
-            if fg_quant_matrix is not None and n_buf > 0:
-                # Vectorized: combine foreground + buffer feature matrices
+            # Check for precomputed buffer distance matrix
+            _precomputed_buf_dm = None
+            if _has_precomputed and n_buf > 0:
+                _precomp = np.load(buffer_precomputed_path)
+                if "distance_matrix" in _precomp.files:
+                    full_dm = _precomp["distance_matrix"]
+                    # Subsample the precomputed matrix to match buf_sample_idx
+                    _precomputed_buf_dm = full_dm[np.ix_(buf_sample_idx, buf_sample_idx)]
+                    logger.info(f"Using precomputed buffer distance matrix ({_precomputed_buf_dm.shape})")
+
+            if fg_quant_matrix is not None and n_buf > 0 and _precomputed_buf_dm is not None:
+                # Fast path: use precomputed buf-buf distances, only compute fg-fg and fg-buf
+                dist_matrix = np.zeros((n_total, n_total), dtype=np.float32)
+                # fg-fg block (small)
+                fg_dm = _chunked_pairwise_dist(fg_quant_matrix, metric=_dist_metric)
+                dist_matrix[:n_fg, :n_fg] = fg_dm
+                # fg-buf block (n_fg x n_buf, fast)
+                for i in range(n_fg):
+                    diff = fg_quant_matrix[i] - buf_quant_matrix
+                    if _dist_metric == 'l2':
+                        dists = np.sqrt(np.sum(diff ** 2, axis=1))
+                    else:
+                        dists = np.mean(np.abs(diff), axis=1)
+                    dist_matrix[i, n_fg:] = dists
+                    dist_matrix[n_fg:, i] = dists
+                # buf-buf block (precomputed)
+                dist_matrix[n_fg:, n_fg:] = _precomputed_buf_dm
+            elif fg_quant_matrix is not None and n_buf > 0:
+                # Slow path: compute full distance matrix from features
                 all_quant = np.vstack([fg_quant_matrix, buf_quant_matrix])
                 dist_matrix = _chunked_pairwise_dist(all_quant, metric=_dist_metric)
             elif fg_quant_matrix is not None:
@@ -2459,6 +2487,112 @@ def save_results(
             plt.close(fig_mds)
             logger.info(f"Saved {mds_path}")
 
+            # --- 3D interactive HTML plots (t-SNE and MDS, opt-in) ---
+            if plot_3d:
+                try:
+                    import plotly.graph_objects as go
+
+                    embedding_tsne_3d = TSNE(
+                        n_components=3, metric="precomputed",
+                        perplexity=perplexity, random_state=42,
+                        init="random",
+                    ).fit_transform(dist_matrix)
+
+                    embedding_mds_3d = MDS(
+                        n_components=3, dissimilarity="precomputed",
+                        random_state=42, normalized_stress='auto',
+                    ).fit_transform(dist_matrix)
+
+                    for emb_3d, name in [(embedding_tsne_3d, "tsne"), (embedding_mds_3d, "mds")]:
+                        fig_3d = go.Figure()
+
+                        if n_buf > 0:
+                            buf_coords = emb_3d[n_fg:]
+                            if buf_difficulty_pass is not None:
+                                pass_mask = buf_difficulty_pass
+                                fail_mask = ~buf_difficulty_pass
+                                n_pass = int(np.sum(pass_mask))
+                                n_fail = int(np.sum(fail_mask))
+                                if n_pass > 0:
+                                    fig_3d.add_trace(go.Scatter3d(
+                                        x=buf_coords[pass_mask, 0], y=buf_coords[pass_mask, 1], z=buf_coords[pass_mask, 2],
+                                        mode='markers', marker=dict(size=2.5, color='dodgerblue', opacity=0.5),
+                                        name=f'Buffer pass ({n_pass})', hoverinfo='skip',
+                                    ))
+                                if n_fail > 0:
+                                    fig_3d.add_trace(go.Scatter3d(
+                                        x=buf_coords[fail_mask, 0], y=buf_coords[fail_mask, 1], z=buf_coords[fail_mask, 2],
+                                        mode='markers', marker=dict(size=2, color='khaki', opacity=0.2),
+                                        name=f'Buffer fail ({n_fail})', hoverinfo='skip',
+                                    ))
+                            else:
+                                fig_3d.add_trace(go.Scatter3d(
+                                    x=buf_coords[:, 0], y=buf_coords[:, 1], z=buf_coords[:, 2],
+                                    mode='markers', marker=dict(size=2, color='lightgray', opacity=0.2),
+                                    name=f'Buffer ({n_buf})', hoverinfo='skip',
+                                ))
+
+                        _category_map = {
+                            ('blue', 'o'): ('Reference', 'blue', 'circle', 8),
+                            ('gold', 'X'): ('Rej (diversity)', 'gold', 'x', 6),
+                            ('red', 'X'): ('Rej (difficulty)', 'red', 'x', 6),
+                            ('orange', 'X'): ('Rej (both)', 'orange', 'x', 6),
+                            ('green', '*'): ('Accepted', 'green', 'diamond', 10),
+                        }
+                        seen_cats = set()
+                        for i in range(n_fg):
+                            cat_key = (all_colors[i], all_markers[i])
+                            cat_name, cat_color, cat_symbol, cat_size = _category_map.get(
+                                cat_key, (all_labels[i], all_colors[i], 'circle', 6))
+                            if i >= n_before_accepted and all_markers[i] == '*':
+                                fa_idx = i - n_before_accepted
+                                if fa_idx < len(all_force_accepted) and all_force_accepted[fa_idx]:
+                                    cat_name = 'Force-Accepted'
+                                    cat_color = 'green'
+                                    cat_symbol = 'diamond'
+
+                            show_legend = cat_name not in seen_cats
+                            seen_cats.add(cat_name)
+                            fig_3d.add_trace(go.Scatter3d(
+                                x=[emb_3d[i, 0]], y=[emb_3d[i, 1]], z=[emb_3d[i, 2]],
+                                mode='markers+text',
+                                marker=dict(size=cat_size, color=cat_color, symbol=cat_symbol,
+                                            line=dict(width=2, color='red' if (i < len(edge_colors) and edge_colors[i] == 'red') else 'black')),
+                                text=[all_labels[i]], textposition='top center', textfont=dict(size=9, color=cat_color),
+                                name=cat_name, legendgroup=cat_name, showlegend=show_legend,
+                                hovertext=all_labels[i], hoverinfo='text',
+                            ))
+
+                        if n_ref_in_emb >= 2:
+                            centroid_3d = emb_3d[:n_ref_in_emb].mean(axis=0)
+                            fig_3d.add_trace(go.Scatter3d(
+                                x=[centroid_3d[0]], y=[centroid_3d[1]], z=[centroid_3d[2]],
+                                mode='markers+text',
+                                marker=dict(size=12, color='black', symbol='diamond'),
+                                text=['Centroid'], textposition='bottom center', textfont=dict(size=8, color='black'),
+                                name='Ref Centroid', hovertext='Ref Centroid', hoverinfo='text',
+                            ))
+
+                        method_label = "t-SNE" if name == "tsne" else "MDS"
+                        fig_3d.update_layout(
+                            title=f"3D Diversity Embedding ({_emb_label}) — {method_label}",
+                            scene=dict(
+                                xaxis_title=f"{method_label} dim 1",
+                                yaxis_title=f"{method_label} dim 2",
+                                zaxis_title=f"{method_label} dim 3",
+                            ),
+                            width=900, height=700,
+                            legend=dict(x=0.02, y=0.98),
+                        )
+                        html_path = os.path.join(run_dir, f"diversity_embedding_3d_{name}.html")
+                        fig_3d.write_html(html_path)
+                        logger.info(f"Saved {html_path}")
+
+                except ImportError:
+                    logger.warning("plotly not installed — skipping 3D interactive embeddings")
+                except Exception as e:
+                    logger.warning(f"3D embedding failed: {e}")
+
         except ImportError:
             logger.warning("sklearn not installed — skipping diversity embedding")
         except Exception as e:
@@ -2501,7 +2635,7 @@ def run_test(args):
 
     # Build difficulty mask for hybrid strategies
     difficulty_mask = None
-    if args.strategy in ("hybrid-greedy", "hybrid-kmedoid", "hybrid-weighted-kmedoid"):
+    if args.strategy in ("hybrid-random", "hybrid-greedy", "hybrid-kmedoid", "hybrid-weighted-kmedoid"):
         active_scores = scores[:size]
         if args.difficulty_metric == "sfl":
             max_regret = max(float(np.max(active_scores)), 1e-8)
@@ -2518,7 +2652,16 @@ def run_test(args):
             f"{n_pass}/{size} levels above {diff_threshold:.4f}"
         )
 
-    if args.strategy in ("diverse-weighted-kmedoid", "hybrid-weighted-kmedoid"):
+    if args.strategy == "hybrid-random":
+        # Random selection from difficulty-filtered pool
+        if difficulty_mask is None:
+            raise ValueError("hybrid-random requires a difficulty mask")
+        candidate_indices = np.where(difficulty_mask)[0]
+        n_select = min(args.num_refs, len(candidate_indices))
+        chosen = np.random.choice(candidate_indices, n_select, replace=False)
+        ref_data = [(int(i), tokens[i], float(scores[i])) for i in chosen]
+        logger.info(f"Hybrid-random: selected {n_select} from {len(candidate_indices)} candidates")
+    elif args.strategy in ("diverse-weighted-kmedoid", "hybrid-weighted-kmedoid"):
         if buf_mean_embeddings is None:
             raise ValueError("weighted-kmedoid strategy requires buffer with mean_embeddings")
         ref_data = _select_weighted_kmedoids_from_buffer_embeddings(
@@ -2810,6 +2953,7 @@ def run_test(args):
         buffer_scores=scores[:size],
         difficulty_metric=args.difficulty_metric,
         buf_mean_embeddings=buf_mean_embeddings,
+        plot_3d=args.plot_3d,
     )
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    - maze_XXX.txt files (ASCII grids)")
@@ -2871,11 +3015,11 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["top_regret", "random",
+    parser.add_argument("--strategy", choices=["top_difficulty", "random",
                                                "diverse-greedy", "diverse-kmedoid",
                                                "diverse-weighted-kmedoid",
-                                               "hybrid-greedy", "hybrid-kmedoid",
-                                               "hybrid-weighted-kmedoid"],
+                                               "hybrid-random", "hybrid-greedy",
+                                               "hybrid-kmedoid", "hybrid-weighted-kmedoid"],
                         default=cfg.get("strategy"),
                         help="Reference selection strategy: "
                              "diverse-greedy = greedy max-min, "
@@ -2999,6 +3143,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         default=cfg.get("dry_run", False),
                         help="Only build prompts, skip LLM calls")
+    parser.add_argument("--plot-3d", action="store_true",
+                        default=cfg.get("plot_3d", False),
+                        help="Generate 3D interactive HTML embedding plots (slow with large buffers)")
     parser.add_argument("--dev", action="store_true",
                         default=cfg.get("dev", False),
                         help="Dev mode: skip LLM, return random valid mazes instantly")
