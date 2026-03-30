@@ -30,7 +30,9 @@ LLM="--use_llm \
      --llm_amplification \
      --llm_mutations_per_seed 50"
 
-export OPENROUTER_API_KEY="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"
+# Set OPENROUTER_API_KEY in your shell before running, or in ~/.bashrc
+# export OPENROUTER_API_KEY="sk-or-v1-..."
+if [ -z "$OPENROUTER_API_KEY" ]; then echo "ERROR: OPENROUTER_API_KEY not set"; exit 1; fi
 
 OUTDIR="$(cd "$(dirname "$0")/.." && pwd)/results/accel-llm-sonnet-v6"
 mkdir -p "$OUTDIR"
