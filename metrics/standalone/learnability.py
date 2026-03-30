@@ -75,8 +75,8 @@ def check_learnability(
                 f"need > {min_learnability:.4f}).\n"
                 f"  The agent almost never solves this level across "
                 f"{info.n_rollouts} rollouts.\n"
-                f"  Simplify the maze — fewer dead ends, shorter paths, "
-                f"or more open corridors."
+                f"  The maze needs to be easier — the agent cannot learn from "
+                f"a level it never solves."
             )
         elif info.solve_rate > 0.9:
             issues.append(
@@ -85,8 +85,8 @@ def check_learnability(
                 f"need > {min_learnability:.4f}).\n"
                 f"  The agent solves this level almost every time across "
                 f"{info.n_rollouts} rollouts.\n"
-                f"  Add more dead ends, deceptive branches, or hidden corridors "
-                f"to challenge the agent."
+                f"  The maze needs to be harder — the agent learns nothing from "
+                f"a level it already masters."
             )
         else:
             # Edge case: moderate solve rate but still below threshold

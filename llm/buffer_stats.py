@@ -82,9 +82,9 @@ class BufferStatsExtractor:
             ascii_grid = level.to_str()
 
             metric = MetricEntry(
-                name="Regret Score",
+                name="Buffer Score",
                 value=float(scores[idx]),
-                description="Agent's learning potential",
+                description="PLR buffer priority score (higher = more learning potential)",
                 higher_is="more to learn",
                 metric_key="scalar_regret",
             )

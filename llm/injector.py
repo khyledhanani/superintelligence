@@ -31,8 +31,27 @@ from llm.decision_gate import DiversityThresholds
 from llm.injection_config import LLMInjectionConfig
 from llm.level_cache import LevelCache
 from llm.maze_generator import GenerationConfig, MazeGenerator
+from llm.prompt_builder import (
+    MetricEntry,
+    PairwiseMetricEntry,
+    ReferenceMaze,
+    overlay_path_on_grid,
+)
 from jaxued.environments.maze.util import make_level_mutator_minimax
 from jaxued.level_sampler import LevelSampler
+
+# Standalone metric computers (per-maze)
+from metrics.standalone.per_step_entropy import compute_per_step_entropy
+from metrics.standalone.per_step_regret import compute_per_step_regret
+from metrics.standalone.per_step_action import compute_per_step_action
+from metrics.standalone.regret import compute_regret
+from metrics.standalone.learnability import compute_learnability
+from metrics.standalone.value_error import compute_value_error
+# Pairwise metric computers
+from metrics.pairwise.pos_dtw import position_trace_dtw
+from metrics.pairwise.mode_transition import mode_transition_divergence, compute_baseline_stats
+from metrics.pairwise.td_error_distribution import td_error_divergence
+from metrics.utils import downsample, format_vector, truncate_at_done
 
 logger = logging.getLogger(__name__)
 
@@ -166,9 +185,14 @@ class LLMInjectionManager:
             strategy=config.reference_maze_strategy,
         )
 
-        # Initialize MazeGenerator from config
-        gen_config = self._build_generation_config(config)
+        # Initialize MazeGenerator from config + load metric settings from YAML
+        gen_config, yaml_cfg = self._build_generation_config(config)
         self.generator = MazeGenerator(gen_config)
+
+        # Metric injection settings from config.yaml
+        self.prompt_metrics = yaml_cfg.get("prompt_metrics", {}) if yaml_cfg else {}
+        self.pairwise_metrics_cfg = yaml_cfg.get("pairwise_metrics", {}) if yaml_cfg else {}
+        self.downsample_points = yaml_cfg.get("downsample_points", 20) if yaml_cfg else 20
 
         # Wall-flip mutation function (JAX-compiled)
         self.mutate_level = make_level_mutator_minimax(100)
@@ -178,13 +202,17 @@ class LLMInjectionManager:
         self.total_attempted = 0
         self.batch_all_rejected_count = 0  # Number of events where all gate attempts failed
 
-    def _build_generation_config(self, config: LLMInjectionConfig) -> GenerationConfig:
+    def _build_generation_config(self, config: LLMInjectionConfig) -> tuple:
         """Build a GenerationConfig from LLMInjectionConfig.
 
         If config_path is set, loads settings from the YAML file and overrides
         provider/model from CLI flags if they were explicitly set.
+
+        Returns:
+            (GenerationConfig, yaml_cfg_dict_or_None) tuple
         """
         gen_kwargs = {}
+        yaml_cfg = None
 
         # Load from YAML config file if provided
         if config.config_path:
@@ -223,7 +251,244 @@ class LLMInjectionManager:
         if config.model:
             gen_kwargs["model"] = config.model
 
-        return GenerationConfig(**gen_kwargs)
+        return GenerationConfig(**gen_kwargs), yaml_cfg
+
+    def _enrich_references(
+        self,
+        references: List[ReferenceMaze],
+        trajectories: List[dict],
+    ) -> Tuple[List[ReferenceMaze], List[PairwiseMetricEntry]]:
+        """Enrich reference mazes with behavioral metrics from agent trajectories.
+
+        Reads self.prompt_metrics and self.pairwise_metrics_cfg (from config.yaml)
+        to decide which metrics to include. This gives the LLM the full behavioral
+        picture: entropy profiles, position traces, action sequences, value error,
+        path overlays, and pairwise diversity metrics.
+
+        Args:
+            references: List of ReferenceMaze objects (with only regret score)
+            trajectories: Matching list of trajectory dicts from agent rollouts
+
+        Returns:
+            (enriched_references, pairwise_metrics) tuple
+        """
+        pm = self.prompt_metrics
+        pw = self.pairwise_metrics_cfg
+        ds = self.downsample_points
+
+        def _enabled(cfg_dict, key):
+            return cfg_dict.get(key, True)
+
+        enriched = []
+        for i, (ref, traj) in enumerate(zip(references, trajectories)):
+            metrics = list(ref.metrics)  # keep existing regret score
+
+            # Per-step entropy
+            if _enabled(pm, "per_step_entropy"):
+                ent_info = compute_per_step_entropy(traj["entropy"], traj["dones"])
+                ds_entropy = downsample(ent_info["entropy"], ds)
+                metrics.append(MetricEntry(
+                    name="Per-Step Entropy",
+                    value=format_vector(ds_entropy),
+                    description=(
+                        f"Policy uncertainty at each step "
+                        f"(mean={ent_info['mean']:.3f}, max={ent_info['max']:.3f} "
+                        f"at step {ent_info['max_step']}, ep_len={ent_info['episode_length']})"
+                    ),
+                    higher_is="more uncertain (harder decision points)",
+                    metric_key="per_step_entropy",
+                ))
+
+            # Per-step regret
+            if _enabled(pm, "per_step_regret"):
+                reg_info = compute_per_step_regret(
+                    traj["values"], traj["rewards"], traj["dones"]
+                )
+                ds_regret = downsample(reg_info["regret_curve"], ds)
+                metrics.append(MetricEntry(
+                    name="Per-Step Regret",
+                    value=format_vector(ds_regret),
+                    description=(
+                        f"Difficulty at each step (max_return - V(s_t)), "
+                        f"mean={reg_info['mean_regret']:.3f}, "
+                        f"ep_len={reg_info['episode_length']}"
+                    ),
+                    higher_is="harder (agent expects lower return)",
+                    metric_key="per_step_regret",
+                ))
+
+            # Scalar regret
+            if _enabled(pm, "scalar_regret"):
+                regret_info = compute_regret(traj)
+                metrics.append(MetricEntry(
+                    name="Scalar Regret",
+                    value=regret_info.regret,
+                    description=(
+                        f"MaxMC regret (mean gap between best return and value estimate), "
+                        f"solved={regret_info.solved}, ep_len={regret_info.episode_length}"
+                    ),
+                    higher_is="more learning potential",
+                    metric_key="scalar_regret",
+                ))
+
+            # SFL Learnability
+            if _enabled(pm, "learnability") and "solve_rate" in traj:
+                learn_info = compute_learnability(traj)
+                metrics.append(MetricEntry(
+                    name="SFL Learnability",
+                    value=learn_info.learnability,
+                    description=(
+                        f"p×(1-p) where p=solve_rate={learn_info.solve_rate:.0%} "
+                        f"across {learn_info.n_rollouts} rollouts "
+                        f"(max 0.25 at p=0.5)"
+                    ),
+                    higher_is="more at learning frontier (peak at p=0.5)",
+                    metric_key="learnability",
+                ))
+
+            # Action sequence
+            if _enabled(pm, "action_sequence"):
+                act_info = compute_per_step_action(traj["actions"], traj["dones"])
+                ds_actions = downsample(act_info["actions"].astype(np.float64), ds)
+                metrics.append(MetricEntry(
+                    name="Action Sequence",
+                    value=format_vector(ds_actions, decimals=0),
+                    description=(
+                        f"Agent's action at each step "
+                        f"({act_info['num_unique_actions']} unique, "
+                        f"dominant=action {act_info['dominant_action']} "
+                        f"at {act_info['dominant_fraction']:.0%})"
+                    ),
+                    metric_key="action_sequence",
+                ))
+
+            # Value error profile
+            if _enabled(pm, "value_error"):
+                ve_info = compute_value_error(traj["values"], traj["rewards"], traj["dones"])
+                ds_error = downsample(ve_info["error_curve"], ds)
+                metrics.append(MetricEntry(
+                    name="Value Error",
+                    value=format_vector(ds_error),
+                    description=(
+                        f"Signed V(s_t)-G_t: positive=overconfident, negative=underconfident "
+                        f"(mean={ve_info['mean_error']:.3f}, "
+                        f"overconfident {ve_info['overconfident_frac']:.0%} of steps, "
+                        f"ep_len={ve_info['episode_length']})"
+                    ),
+                    higher_is="more overconfident (agent expects more than reality)",
+                    metric_key="value_error",
+                ))
+
+            # Normalized TD error
+            if _enabled(pm, "normalized_td_error"):
+                from metrics.pairwise.td_error_distribution import compute_td_errors
+                td_errs = compute_td_errors(traj["values"], traj["rewards"], traj["dones"])
+                if len(td_errs) > 0:
+                    total = max(float(np.sum(np.abs(td_errs))), 1e-8)
+                    norm_td = td_errs / total
+                    ds_norm_td = downsample(norm_td, ds)
+                    metrics.append(MetricEntry(
+                        name="Normalized TD Error",
+                        value=format_vector(ds_norm_td),
+                        description=(
+                            f"Fraction of total learning signal at each step "
+                            f"(ep_len={len(td_errs)}, total |δ|={total:.4f})"
+                        ),
+                        higher_is="larger fraction of learning concentrated at this step",
+                        metric_key="normalized_td_error",
+                    ))
+
+            # Position vector
+            if _enabled(pm, "position_vector"):
+                ep_pos = truncate_at_done(traj["positions"], traj["dones"])
+                ds_pos = downsample(ep_pos, ds)
+                pos_str = "[" + ", ".join(f"({int(p[0])},{int(p[1])})" for p in ds_pos) + "]"
+                metrics.append(MetricEntry(
+                    name="Position Trace",
+                    value=pos_str,
+                    description=(
+                        f"Agent (x,y) at each step "
+                        f"(ep_len={len(ep_pos)}, downsampled to {len(ds_pos)} points)"
+                    ),
+                    metric_key="position_vector",
+                ))
+
+            # Path overlay
+            path_overlay = None
+            if _enabled(pm, "path_overlay"):
+                try:
+                    ep_pos = truncate_at_done(traj["positions"], traj["dones"])
+                    path_overlay = overlay_path_on_grid(ref.grid, ep_pos)
+                except Exception:
+                    pass
+
+            enriched.append(ReferenceMaze(
+                grid=ref.grid,
+                label=ref.label,
+                metrics=metrics,
+                path_overlay=path_overlay,
+            ))
+
+        # --- Pairwise metrics ---
+        pairwise_metrics = []
+
+        if len(trajectories) >= 2:
+            # Position DTW
+            if _enabled(pw, "position_dtw"):
+                for i in range(len(trajectories)):
+                    for j in range(i + 1, len(trajectories)):
+                        ti, tj = trajectories[i], trajectories[j]
+                        dtw_result = position_trace_dtw(
+                            ti["positions"], ti["dones"],
+                            tj["positions"], tj["dones"],
+                        )
+                        pairwise_metrics.append(PairwiseMetricEntry(
+                            maze_a_label=enriched[i].label,
+                            maze_b_label=enriched[j].label,
+                            name="Position DTW",
+                            value=dtw_result["distance"],
+                            description="Spatial path similarity (lower = more similar routes)",
+                            metric_key="position_dtw",
+                        ))
+
+            # Mode transition divergence
+            if _enabled(pw, "mode_transition"):
+                baseline = compute_baseline_stats(trajectories)
+                for i in range(len(trajectories)):
+                    for j in range(i + 1, len(trajectories)):
+                        ti, tj = trajectories[i], trajectories[j]
+                        div_result = mode_transition_divergence(
+                            ti, ti["dones"],
+                            tj, tj["dones"],
+                            entropy_a=ti.get("entropy"),
+                            entropy_b=tj.get("entropy"),
+                            baseline_stats=baseline,
+                        )
+                        pairwise_metrics.append(PairwiseMetricEntry(
+                            maze_a_label=enriched[i].label,
+                            maze_b_label=enriched[j].label,
+                            name="Experience Divergence",
+                            value=div_result["kl_divergence"],
+                            description="Mode transition KL divergence (higher = more different agent experiences)",
+                            metric_key="mode_transition",
+                        ))
+
+            # TD error EMD
+            if _enabled(pw, "td_error"):
+                for i in range(len(trajectories)):
+                    for j in range(i + 1, len(trajectories)):
+                        ti, tj = trajectories[i], trajectories[j]
+                        td_result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
+                        pairwise_metrics.append(PairwiseMetricEntry(
+                            maze_a_label=enriched[i].label,
+                            maze_b_label=enriched[j].label,
+                            name="Normalized TD Error EMD",
+                            value=td_result["emd"],
+                            description="Normalized EMD between TD error distributions (higher = more different learning signals)",
+                            metric_key="td_error",
+                        ))
+
+        return enriched, pairwise_metrics
 
     def maybe_inject(self, runner_state: tuple, eval_step: int) -> tuple:
         """Entry point called at each eval step in the training loop.
@@ -256,6 +521,335 @@ class LLMInjectionManager:
         except Exception as e:
             print(f"[LLM] Injection FAILED at step {current_step}: {e}. Training continues.", flush=True)
             return runner_state
+
+    def _do_injection_independent(
+        self, rng, train_state, sampler, current_step: int, injection_start: float
+    ) -> tuple:
+        """Independent generation: per-maze random refs, adaptive thresholds, no feedback.
+
+        Each maze gets its own random references from the live buffer. Thresholds are
+        derived adaptively from reference pairwise distances. On gate rejection, retries
+        are fresh LLM calls (same refs, no feedback about the rejected maze).
+
+        After generating seeds, runs standard mutation amplification and buffer insertion.
+        """
+        from llm.decision_gate import (
+            DiversityThresholds, evaluate_candidate, compute_adaptive_thresholds,
+        )
+
+        target_seeds = self.config.n_raw
+        random_extractor = BufferStatsExtractor(
+            n_references=self.config.n_reference_mazes,
+            strategy=self.config.reference_maze_strategy,
+        )
+
+        buffer_summary = self.buffer_stats.extract_buffer_summary(sampler)
+        global_metrics = BufferStatsExtractor.extract_global_metrics(buffer_summary)
+
+        valid_levels = []
+        seed_sfl_scores = []
+        gate_accepted = 0
+        gate_rejected = 0
+        seeds_attempted = 0
+        diversity_scores = []
+        difficulty_scores = []
+
+        # Cache ref trajectories by wall_map hash to avoid redundant rollouts
+        # across seeds (buffer has ~500 levels, 6 random refs per seed → frequent overlap)
+        ref_traj_cache = {}
+
+        for seed_i in range(target_seeds):
+            seeds_attempted += 1
+
+            # 1. Random refs for this maze
+            refs, ref_levels = random_extractor.extract_references_with_levels(sampler)
+            if not ref_levels:
+                logger.warning(f"[LLM] Seed {seed_i+1}: empty buffer, skipping")
+                continue
+
+            ref_trajs = []
+            cache_hits = 0
+            for level in ref_levels:
+                level_hash = LevelCache.compute_hash(level)
+                if level_hash in ref_traj_cache:
+                    ref_trajs.append(ref_traj_cache[level_hash])
+                    cache_hits += 1
+                else:
+                    traj = self.agent_evaluator.evaluate_level_multi_rollout(
+                        level, n_rollouts=self.config.n_rollouts_gate,
+                    )
+                    ref_traj_cache[level_hash] = traj
+                    ref_trajs.append(traj)
+            if cache_hits > 0:
+                logger.info(f"[LLM] Seed {seed_i+1}: {cache_hits}/{len(ref_levels)} ref trajs from cache")
+
+            refs, pw_metrics = self._enrich_references(refs, ref_trajs)
+            ref_labels = [r.label for r in refs]
+
+            # 2. Adaptive thresholds from this ref set
+            base_thresholds = DiversityThresholds(
+                difficulty_threshold=self.config.difficulty_threshold,
+                difficulty_metric=self.config.difficulty_metric,
+                min_diversity=self.config.min_diversity,
+                diversity_metric=self.config.diversity_metric,
+                diversity_scale=self.config.diversity_scale,
+                difficulty_scale=self.config.difficulty_scale,
+                difficulty_floor=self.config.difficulty_floor,
+            )
+            thresholds = compute_adaptive_thresholds(ref_trajs, base_thresholds)
+            logger.info(
+                f"[LLM] Seed {seed_i+1}/{target_seeds}: adaptive thresholds "
+                f"diversity={thresholds.min_diversity:.4f}, "
+                f"difficulty={thresholds.difficulty_threshold}"
+            )
+
+            # 3. Generate with fresh retries (no feedback)
+            best_result = None
+            accepted = False
+            for attempt in range(self.config.max_independent_retries + 1):
+                result = self.generator.generate(
+                    references=refs,
+                    pairwise_metrics=pw_metrics,
+                    global_metrics=global_metrics,
+                )
+                if not result.success:
+                    logger.info(
+                        f"[LLM] Seed {seed_i+1} attempt {attempt+1}: "
+                        f"generation failed (format/solvability)"
+                    )
+                    best_result = result
+                    continue
+
+                # 4. Evaluate gate
+                cand_traj = self.agent_evaluator.evaluate_level_multi_rollout(
+                    result.level, n_rollouts=self.config.n_rollouts_gate,
+                )
+                gate_result = evaluate_candidate(
+                    cand_traj, ref_trajs, ref_labels, thresholds,
+                    cenie_model=cenie_model if self.config.diversity_metric == "cenie" else None,
+                )
+                result.gate_metrics = gate_result.summary
+                best_result = result
+
+                if gate_result.accepted:
+                    accepted = True
+                    gate_accepted += 1
+                    valid_levels.append(result.level)
+                    diversity_scores.append(float(gate_result.summary.get("mean_diversity", 0.0)))
+                    difficulty_scores.append(float(gate_result.summary.get("learnability", 0.0)))
+                    seed_sfl_scores.append(float(gate_result.summary.get("learnability", 0.0)))
+                    print(
+                        f"[LLM] Seed {len(valid_levels)}/{target_seeds} accepted "
+                        f"(attempt {attempt+1}, "
+                        f"sfl={gate_result.summary.get('learnability', 0):.4f}, "
+                        f"div={gate_result.summary.get('mean_diversity', 0):.4f})",
+                        flush=True,
+                    )
+                    break
+
+                logger.info(
+                    f"[LLM] Seed {seed_i+1} attempt {attempt+1}: gate rejected "
+                    f"({', '.join(issue[:60] for issue in gate_result.issues)})"
+                )
+
+            # Force-accept if all retries exhausted
+            if not accepted and best_result is not None and best_result.success:
+                gate_rejected += 1
+                valid_levels.append(best_result.level)
+                gate_metrics = best_result.gate_metrics or {}
+                diversity_scores.append(float(gate_metrics.get("mean_diversity", 0.0)))
+                difficulty_scores.append(float(gate_metrics.get("learnability", 0.0)))
+                seed_sfl_scores.append(float(gate_metrics.get("learnability", 0.0)))
+                print(
+                    f"[LLM] Seed {len(valid_levels)}/{target_seeds} force-accepted "
+                    f"(max retries exhausted)",
+                    flush=True,
+                )
+            elif not accepted:
+                gate_rejected += 1
+                print(
+                    f"[LLM] Seed {seed_i+1}/{target_seeds}: all attempts failed",
+                    flush=True,
+                )
+
+        seeds_valid = len(valid_levels)
+        print(
+            f"[LLM] Independent seeds: {seeds_valid}/{target_seeds} "
+            f"({seeds_attempted} attempted, {gate_rejected} rejected)",
+            flush=True,
+        )
+
+        if gate_accepted == 0 and seeds_attempted > 0:
+            self.batch_all_rejected_count += 1
+
+        # ---------------------------------------------------------------
+        # Cache accepted seeds to disk
+        # ---------------------------------------------------------------
+        accepted_hashes = []
+        if valid_levels:
+            for idx, level in enumerate(valid_levels):
+                gate_metrics_for_seed = {}
+                if idx < len(diversity_scores):
+                    gate_metrics_for_seed = {
+                        "mean_diversity": diversity_scores[idx],
+                        "learnability": difficulty_scores[idx],
+                    }
+                if self.level_cache is not None:
+                    h = self.level_cache.save_accepted(level, current_step, idx, gate_metrics_for_seed)
+                else:
+                    h = LevelCache.compute_hash(level)
+                accepted_hashes.append(h)
+
+            if self.level_cache is not None:
+                try:
+                    from scripts.visualize_llm_levels import visualize_single_step
+                    wall_maps = [np.asarray(lv.wall_map, dtype=bool) for lv in valid_levels]
+                    visualize_single_step(str(self.level_cache.run_dir), wall_maps, current_step)
+                except Exception as e:
+                    logger.warning(f"[LLM] Visualization failed: {e}")
+
+        # ---------------------------------------------------------------
+        # Mutation amplification
+        # ---------------------------------------------------------------
+        mutations_generated = 0
+        mutations_solvable = 0
+        mutation_levels = []
+
+        if self.config.amplification_enabled and valid_levels:
+            max_mutation_rounds = 10
+            for seed_level in valid_levels:
+                target = self.config.mutations_per_seed
+                seed_mutations = []
+                for round_idx in range(max_mutation_rounds):
+                    if len(seed_mutations) >= target:
+                        break
+                    n_batch = min(target * 2, 100)
+                    mutations_generated += n_batch
+                    rng, mut_rng = jax.random.split(rng)
+                    mut_rngs = jax.random.split(mut_rng, n_batch)
+                    mutated_levels = jax.vmap(
+                        lambda r: self.mutate_level(r, seed_level, 3)
+                    )(mut_rngs)
+                    wall_map_batch = np.asarray(mutated_levels.wall_map)
+                    agent_pos_batch = np.asarray(mutated_levels.agent_pos)
+                    goal_pos_batch = np.asarray(mutated_levels.goal_pos)
+                    for j in range(n_batch):
+                        if len(seed_mutations) >= target:
+                            break
+                        if self.config.mutations_solvability_check:
+                            wm = wall_map_batch[j]
+                            ap = (int(agent_pos_batch[j, 0]), int(agent_pos_batch[j, 1]))
+                            gp = (int(goal_pos_batch[j, 0]), int(goal_pos_batch[j, 1]))
+                            path_len = _bfs_path_length(wm, ap, gp)
+                            if path_len < 0:
+                                continue
+                        mutation = jax.tree_util.tree_map(lambda x: x[j], mutated_levels)
+                        seed_mutations.append(mutation)
+                mutations_solvable += len(seed_mutations)
+                mutation_levels.extend(seed_mutations)
+
+        total_levels_to_inject = len(valid_levels) + len(mutation_levels)
+
+        # ---------------------------------------------------------------
+        # Buffer insertion
+        # ---------------------------------------------------------------
+        retained_seeds = 0
+        retained_mutations = 0
+
+        if valid_levels:
+            # Independent mode: use max priority (same as non-competitive gated mode)
+            buf_size = int(np.asarray(sampler["size"]))
+            if buf_size > 0:
+                max_score = float(np.asarray(sampler["scores"][:buf_size]).max())
+            else:
+                max_score = 1.0
+            inject_score = max_score + 1e-4
+            seed_scores_arr = jnp.full(len(valid_levels), inject_score, dtype=jnp.float32)
+
+            seed_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *valid_levels
+            )
+            new_sampler, seed_indices = self.level_sampler.insert_batch(
+                sampler, seed_batch, seed_scores_arr
+            )
+            retained_seeds = int(jnp.sum(seed_indices >= 0))
+            train_state = train_state.replace(sampler=new_sampler)
+            sampler = new_sampler
+
+        if mutation_levels and self.agent_evaluator is not None:
+            logger.info(f"[LLM] Scoring {len(mutation_levels)} mutations via 10-rollout SFL eval...")
+            mut_sfl_scores = []
+            for mut_level in mutation_levels:
+                traj = self.agent_evaluator.evaluate_level_multi_rollout(mut_level, n_rollouts=10)
+                p = traj.get("solve_rate", 0.0)
+                mut_sfl_scores.append(p * (1.0 - p))
+            mut_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *mutation_levels
+            )
+            mut_scores_arr = jnp.array(mut_sfl_scores, dtype=jnp.float32)
+            new_sampler, mut_indices = self.level_sampler.insert_batch(
+                sampler, mut_batch, mut_scores_arr
+            )
+            retained_mutations = int(jnp.sum(mut_indices >= 0))
+            train_state = train_state.replace(sampler=new_sampler)
+            sampler = new_sampler
+
+        retained_count = retained_seeds + retained_mutations
+        retained_rate = retained_count / total_levels_to_inject if total_levels_to_inject > 0 else 0.0
+
+        # ---------------------------------------------------------------
+        # WandB logging
+        # ---------------------------------------------------------------
+        self.total_injected += retained_count
+        self.total_attempted += total_levels_to_inject
+        injection_time = time.time() - injection_start
+        acceptance_rate = seeds_valid / seeds_attempted if seeds_attempted > 0 else 0.0
+        mutation_survival_rate = mutations_solvable / mutations_generated if mutations_generated > 0 else 0.0
+
+        log_payload = {
+            "llm/injected_count": retained_count,
+            "llm/retained_seeds": retained_seeds,
+            "llm/retained_mutations": retained_mutations,
+            "llm/seeds_target": target_seeds,
+            "llm/seeds_attempted": seeds_attempted,
+            "llm/seeds_valid": seeds_valid,
+            "llm/mutations_generated": mutations_generated,
+            "llm/mutations_solvable": mutations_solvable,
+            "llm/acceptance_rate": acceptance_rate,
+            "llm/retained_rate": retained_rate,
+            "llm/injection_time_seconds": injection_time,
+            "llm/total_injected": self.total_injected,
+            "llm/mutation_survival_rate": mutation_survival_rate,
+            "llm/diversity_score_mean": float(np.mean(diversity_scores)) if diversity_scores else 0.0,
+            "llm/difficulty_score_mean": float(np.mean(difficulty_scores)) if difficulty_scores else 0.0,
+            "llm/gate_rejection_rate": gate_rejected / seeds_attempted if seeds_attempted > 0 else 0.0,
+            "llm/batch_all_rejected_count": self.batch_all_rejected_count,
+            "llm/difficulty_gate_mode": "adaptive",
+            "llm/diversity_gate_mode": "adaptive",
+            "llm/generation_mode": "independent",
+        }
+
+        if accepted_hashes:
+            hash_table = wandb.Table(
+                columns=["step", "batch_index", "wall_map_hash"],
+                data=[[current_step, i, h] for i, h in enumerate(accepted_hashes)]
+            )
+            log_payload["llm/accepted_level_hashes"] = hash_table
+
+        try:
+            log_payload["num_updates"] = current_step
+            wandb.log(log_payload)
+        except Exception:
+            logger.info(f"[LLM] WandB unavailable, metrics: {log_payload}")
+
+        print(
+            f"[LLM] Independent injection complete in {injection_time:.1f}s: "
+            f"injected={retained_count}, acceptance={acceptance_rate:.0%}, "
+            f"retained={retained_rate:.0%}, total={self.total_injected}",
+            flush=True,
+        )
+
+        return (rng, train_state)
 
     def _do_injection(self, runner_state: tuple, current_step: int) -> tuple:
         """Execute the full injection pipeline.
@@ -297,6 +891,14 @@ class LLMInjectionManager:
             self.agent_evaluator.update_params(train_state.params)
 
         # ---------------------------------------------------------------
+        # Independent mode: per-maze random refs, adaptive thresholds
+        # ---------------------------------------------------------------
+        if self.config.independent and gate_active:
+            return self._do_injection_independent(
+                rng, train_state, sampler, current_step, injection_start
+            )
+
+        # ---------------------------------------------------------------
         # Step 2: Extract references and buffer summary
         # ---------------------------------------------------------------
         if gate_active:
@@ -323,10 +925,67 @@ class LLMInjectionManager:
                 ref_trajectories.append(traj)
                 ref_labels.append(ref.label)
 
-        # Build DiversityThresholds from config (gate path)
-        # Compute effective difficulty threshold based on gate mode
+        # ---------------------------------------------------------------
+        # Step 3b: Enrich references with behavioral metrics from trajectories
+        # ---------------------------------------------------------------
+        pairwise_metrics = []
+        if ref_trajectories and references:
+            enrichment_start = time.time()
+            references, pairwise_metrics = self._enrich_references(references, ref_trajectories)
+            n_metrics = sum(len(r.metrics) for r in references)
+            logger.info(
+                f"[LLM] Enriched {len(references)} refs with {n_metrics} total metrics "
+                f"+ {len(pairwise_metrics)} pairwise in {time.time() - enrichment_start:.1f}s"
+            )
+            print(
+                f"[LLM] Prompt metrics: {n_metrics} per-maze, {len(pairwise_metrics)} pairwise",
+                flush=True,
+            )
+
+        # ---------------------------------------------------------------
+        # Step 3c: Buffer stats for gate threshold computation + CENIE
+        # ---------------------------------------------------------------
         buffer_size = int(np.asarray(sampler["size"]))
         buffer_scores = np.asarray(sampler["scores"][:buffer_size]) if buffer_size > 0 else np.array([0.0])
+
+        # Fit CENIE GMM if using CENIE diversity metric
+        cenie_model = None
+        if gate_active and self.config.diversity_metric == "cenie":
+            from metrics.standalone.cenie import fit_cenie_model
+            cenie_fit_start = time.time()
+            # Use reference trajectories as base; expand to more buffer levels
+            # for better GMM coverage (up to 50 total)
+            cenie_trajs = list(ref_trajectories)  # copy
+            n_cenie_target = min(buffer_size, 50)
+            n_cenie_extra = n_cenie_target - len(cenie_trajs)
+            if n_cenie_extra > 0 and buffer_size > 0:
+                levels_pytree = sampler["levels"]
+                extra_indices = np.random.choice(
+                    buffer_size, min(n_cenie_extra, buffer_size), replace=False
+                )
+                extra_levels = [
+                    jax.tree_util.tree_map(lambda x: x[int(idx)], levels_pytree)
+                    for idx in extra_indices
+                ]
+                if extra_levels:
+                    extra_trajs = self.agent_evaluator.evaluate_levels(extra_levels)
+                    cenie_trajs.extend(extra_trajs)
+            cenie_model = fit_cenie_model(cenie_trajs)
+            if cenie_model is not None:
+                logger.info(
+                    f"[LLM] CENIE GMM fitted on {len(cenie_trajs)} trajectories "
+                    f"({cenie_model.n_components} components) in {time.time() - cenie_fit_start:.1f}s"
+                )
+                print(
+                    f"[LLM] CENIE GMM: {cenie_model.n_components} components, "
+                    f"{cenie_model.n_samples} state-action pairs",
+                    flush=True,
+                )
+            else:
+                logger.warning("[LLM] CENIE GMM fitting failed — falling back to no diversity gate")
+
+        # Build DiversityThresholds from config (gate path)
+        # Compute effective difficulty threshold based on gate mode
 
         mode = self.config.difficulty_gate_mode
         if mode == "fixed":
@@ -343,11 +1002,29 @@ class LLMInjectionManager:
 
         # Compute effective diversity threshold based on diversity gate mode
         div_mode = self.config.diversity_gate_mode
+        is_cenie = self.config.diversity_metric == "cenie"
         if div_mode == "fixed":
             effective_diversity = self.config.min_diversity
         elif div_mode == "buffer_median":
-            # Median pairwise distance among reference trajectories
-            if len(ref_trajectories) >= 2:
+            if is_cenie and cenie_model is not None:
+                # For CENIE: median novelty (NLL) of reference trajectories under GMM
+                from metrics.standalone.cenie import compute_cenie_novelty
+                ref_novelties = [
+                    compute_cenie_novelty(traj, cenie_model).novelty
+                    for traj in ref_trajectories
+                ]
+                if ref_novelties:
+                    effective_diversity = float(np.median(ref_novelties))
+                    print(
+                        f"[LLM] CENIE buffer_median: ref novelties "
+                        f"min={min(ref_novelties):.2f}, median={effective_diversity:.2f}, "
+                        f"max={max(ref_novelties):.2f}",
+                        flush=True,
+                    )
+                else:
+                    effective_diversity = self.config.min_diversity
+            elif len(ref_trajectories) >= 2:
+                # Pairwise metrics: median pairwise distance among references
                 from llm.decision_gate import _compute_pairwise_diversity
                 pairwise_dists = []
                 for a in range(len(ref_trajectories)):
@@ -365,8 +1042,8 @@ class LLMInjectionManager:
         else:
             effective_diversity = self.config.min_diversity
 
-        logger.info(f"[LLM] Difficulty gate: mode={mode}, threshold={effective_threshold}")
-        logger.info(f"[LLM] Diversity gate: mode={div_mode}, threshold={effective_diversity}")
+        print(f"[LLM] Difficulty gate: mode={mode}, threshold={effective_threshold}", flush=True)
+        print(f"[LLM] Diversity gate: mode={div_mode}, threshold={effective_diversity}", flush=True)
 
         thresholds = DiversityThresholds(
             difficulty_threshold=effective_threshold,
@@ -377,6 +1054,9 @@ class LLMInjectionManager:
 
         # ---------------------------------------------------------------
         # Step 4: Generate candidate mazes via LLM until n_raw accepted
+        # Wave-style: accepted grids are shown to subsequent LLM calls
+        # as session references (grid-only, no metrics) for deduplication.
+        # Gate diversity computation uses full trajectories.
         # ---------------------------------------------------------------
         target_seeds = self.config.n_raw
         max_total_attempts = target_seeds * self.config.max_seed_retries  # safety cap
@@ -387,6 +1067,10 @@ class LLMInjectionManager:
         seeds_attempted = 0
         diversity_scores = []
         difficulty_scores = []
+        session_grids = []  # grid-only session refs for prompt deduplication
+        max_session_refs = 6  # cap on session grids shown in prompt
+
+        print(f"[LLM] Starting generation loop: target={target_seeds}, max_attempts={max_total_attempts}", flush=True)
 
         while len(valid_levels) < target_seeds and seeds_attempted < max_total_attempts:
             seeds_attempted += 1
@@ -397,10 +1081,13 @@ class LLMInjectionManager:
                     reference_trajectories=ref_trajectories,
                     reference_labels=ref_labels,
                     references=references,
+                    pairwise_metrics=pairwise_metrics if pairwise_metrics else None,
                     global_metrics=global_metrics,
                     diversity_thresholds=thresholds,
                     max_diversity_retries=self.config.max_diversity_retries,
                     n_rollouts=self.config.n_rollouts_gate,
+                    cenie_model=cenie_model,
+                    session_grids=session_grids[-max_session_refs:] if session_grids else None,
                 )
                 if not result.success:
                     error_detail = "; ".join(result.errors) if result.errors else "unknown error"
@@ -420,6 +1107,16 @@ class LLMInjectionManager:
                     diversity_scores.append(float(gate_metrics.get("mean_diversity", 0.0)))
                     difficulty_scores.append(float(gate_metrics.get("regret", 0.0)))
                     seed_sfl_scores.append(float(gate_metrics.get("learnability", 0.0)))
+                    # Add to session grids for prompt deduplication
+                    if result.grid:
+                        session_grids.append(result.grid)
+                    # Add trajectory to gate references for diversity computation
+                    if result.level is not None:
+                        gen_traj = self.agent_evaluator.evaluate_level_multi_rollout(
+                            result.level, n_rollouts=self.config.n_rollouts_gate,
+                        )
+                        ref_trajectories.append(gen_traj)
+                        ref_labels.append(f"Gen {len(valid_levels)}")
                     print(
                         f"[LLM] Seed {len(valid_levels)}/{target_seeds} accepted "
                         f"(attempt {seeds_attempted}, "
@@ -437,7 +1134,12 @@ class LLMInjectionManager:
                     )
             else:
                 # Ungated path (Phase 1 fallback): generate + validate_llm_level
-                result = self.generator.generate(references=references, global_metrics=global_metrics)
+                result = self.generator.generate(
+                    references=references,
+                    pairwise_metrics=pairwise_metrics if pairwise_metrics else None,
+                    global_metrics=global_metrics,
+                    session_grids=session_grids[-max_session_refs:] if session_grids else None,
+                )
                 if not result.success:
                     error_detail = "; ".join(result.errors) if result.errors else "unknown error"
                     print(
@@ -451,6 +1153,8 @@ class LLMInjectionManager:
                 if is_valid:
                     gate_accepted += 1
                     valid_levels.append(result.level)
+                    if result.grid:
+                        session_grids.append(result.grid)
                 else:
                     gate_rejected += 1
                     logger.info(f"[LLM] Seed {i+1} rejected: {reason}")

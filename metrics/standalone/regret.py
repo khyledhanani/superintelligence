@@ -84,6 +84,6 @@ def check_regret(regret_info: RegretInfo, min_regret: float, issues: List[str]):
                 f"  The agent's value predictions nearly match its actual return "
                 f"({regret_info.max_return:.3f}), meaning it is confident and correct.\n"
                 f"  Agent solved in {regret_info.episode_length} steps.\n"
-                f"  Add more dead ends, deceptive branches, or hidden corridors "
-                f"to confuse the agent and increase regret."
+                f"  The maze needs to be harder — the agent's value estimates are "
+                f"already accurate, so it learns nothing new."
             )

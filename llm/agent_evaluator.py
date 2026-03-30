@@ -92,8 +92,7 @@ class AgentEvaluator:
         # Override env_params with clean eval defaults
         self.env_params = self.eval_env.default_params
 
-        self._rollout_fn = None
-        self._rollout_fn_num_levels = None
+        self._rollout_fn_cache = {}  # {num_levels: jit_fn}
 
         logger.info("AgentEvaluator constructed")
 
@@ -108,8 +107,7 @@ class AgentEvaluator:
             params: Updated policy network parameters (train_state.params)
         """
         self.params = params
-        self._rollout_fn = None
-        self._rollout_fn_num_levels = None
+        self._rollout_fn_cache = {}
 
     @classmethod
     def from_checkpoint(
@@ -162,9 +160,9 @@ class AgentEvaluator:
         Args:
             num_levels: Number of levels in the evaluation batch
         """
-        # Return cached fn if still valid for this batch size
-        if self._rollout_fn is not None and self._rollout_fn_num_levels == num_levels:
-            return self._rollout_fn
+        # Return cached fn if already compiled for this batch size
+        if num_levels in self._rollout_fn_cache:
+            return self._rollout_fn_cache[num_levels]
 
         eval_env = self.eval_env
         env_params = self.env_params
@@ -217,8 +215,7 @@ class AgentEvaluator:
             )
             return traj
 
-        self._rollout_fn = rollout
-        self._rollout_fn_num_levels = num_levels
+        self._rollout_fn_cache[num_levels] = rollout
         return rollout
 
     def evaluate_level(self, level) -> dict:

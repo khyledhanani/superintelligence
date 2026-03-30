@@ -45,6 +45,11 @@ class DiversityThresholds:
     difficulty_metric: str = "regret"             # "regret" or "sfl"
     min_diversity: Optional[float] = 0.04         # pairwise diversity vs references
     diversity_metric: str = "normalized_td_error_emd"  # "normalized_td_error_emd", "experience_divergence", "position_dtw"
+    # Adaptive scaling: when set, override min_diversity / difficulty_threshold
+    # relative to the reference set's own pairwise distances / difficulties.
+    diversity_scale: Optional[float] = None       # threshold = scale * median(ref pairwise dists)
+    difficulty_scale: Optional[float] = None      # threshold = scale * mean(ref difficulties)
+    difficulty_floor: Optional[float] = None      # minimum difficulty threshold (adaptive won't go below this)
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +141,97 @@ def _compute_pairwise_diversity(
         )
         return result["distance"]
 
+    elif metric == "embedding":
+        from metrics.pairwise.embedding_divergence import embedding_divergence
+        result = embedding_divergence(
+            cand, cand["dones"],
+            ref, ref["dones"],
+        )
+        return result["distance"]
+
     else:
         raise ValueError(f"Unknown diversity metric: {metric}")
+
+
+# ---------------------------------------------------------------------------
+# Adaptive threshold computation
+# ---------------------------------------------------------------------------
+
+def compute_adaptive_thresholds(
+    reference_trajectories: List[dict],
+    base_thresholds: DiversityThresholds,
+) -> DiversityThresholds:
+    """Derive adaptive thresholds from reference pairwise distances.
+
+    Computes all C(n,2) pairwise distances among references and sets:
+      min_diversity = diversity_scale * median(pairwise_dists)
+      difficulty_threshold = difficulty_scale * mean(ref_difficulties)
+
+    Returns a NEW DiversityThresholds with adaptive values. Fields whose
+    scale is None keep the original fixed value.
+    """
+    import logging
+    from dataclasses import replace
+    from itertools import combinations
+    logger = logging.getLogger(__name__)
+
+    result = replace(base_thresholds)  # shallow copy
+
+    # --- Adaptive diversity ---
+    if base_thresholds.diversity_scale is not None and len(reference_trajectories) >= 2:
+        dists = []
+        for i, j in combinations(range(len(reference_trajectories)), 2):
+            d = _compute_pairwise_diversity(
+                reference_trajectories[i],
+                reference_trajectories[j],
+                base_thresholds.diversity_metric,
+            )
+            dists.append(d)
+        median_dist = float(np.median(dists))
+        result.min_diversity = base_thresholds.diversity_scale * median_dist
+        logger.info(
+            f"Adaptive diversity: median ref pairwise dist = {median_dist:.4f}, "
+            f"scale = {base_thresholds.diversity_scale}, "
+            f"threshold = {result.min_diversity:.4f}"
+        )
+
+    # --- Adaptive difficulty ---
+    if base_thresholds.difficulty_scale is not None and reference_trajectories:
+        if base_thresholds.difficulty_metric == "sfl":
+            diffs = []
+            for traj in reference_trajectories:
+                info = compute_learnability(traj)
+                diffs.append(info.learnability)
+            mean_diff = float(np.mean(diffs))
+            result.difficulty_threshold = base_thresholds.difficulty_scale * mean_diff
+            logger.info(
+                f"Adaptive difficulty (SFL): mean ref learnability = {mean_diff:.4f}, "
+                f"scale = {base_thresholds.difficulty_scale}, "
+                f"threshold = {result.difficulty_threshold:.4f}"
+            )
+        else:
+            diffs = []
+            for traj in reference_trajectories:
+                info = compute_regret(traj, max_steps=250)
+                diffs.append(info.regret)
+            mean_diff = float(np.mean(diffs))
+            result.difficulty_threshold = base_thresholds.difficulty_scale * mean_diff
+            logger.info(
+                f"Adaptive difficulty (regret): mean ref regret = {mean_diff:.4f}, "
+                f"scale = {base_thresholds.difficulty_scale}, "
+                f"threshold = {result.difficulty_threshold:.4f}"
+            )
+
+    # --- Apply difficulty floor ---
+    if base_thresholds.difficulty_floor is not None and result.difficulty_threshold is not None:
+        if result.difficulty_threshold < base_thresholds.difficulty_floor:
+            logger.info(
+                f"Difficulty floor applied: {result.difficulty_threshold:.4f} -> "
+                f"{base_thresholds.difficulty_floor:.4f}"
+            )
+            result.difficulty_threshold = base_thresholds.difficulty_floor
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +376,7 @@ def evaluate_candidate(
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
+                "embedding": "LSTM Embedding L2",
             }.get(thresholds.diversity_metric, thresholds.diversity_metric)
             closest = min(result.pair_metrics, key=lambda p: p.diversity_distance)
             issues.append(

@@ -89,27 +89,63 @@ class PairwiseMetricEntry:
         return line
 
 
-_SYSTEM_PROMPT_BASE = """You are a maze designer for a reinforcement learning environment.
+_SYSTEM_PROMPT_BASE = """You are a maze designer for a reinforcement learning CURRICULUM.
 
 MAZE FORMAT:
 - Grid: exactly 13 rows x 13 columns
 - Characters:
   # = wall (impassable)
   . = empty floor
-  > = agent start (facing right)
-  v = agent start (facing down)
-  < = agent start (facing left)
-  ^ = agent start (facing up)
+  > = agent start (facing right)  v = agent start (facing down)
+  < = agent start (facing left)   ^ = agent start (facing up)
   G = goal position
 - Exactly ONE agent start and ONE goal position
 - The outer border does NOT need to be all walls — open borders are fine
 - The agent must be able to reach the goal (maze must be solvable)
 
-DESIGN PRINCIPLES:
-- Interesting mazes force the agent to navigate around obstacles
-- Variety in path structure: corridors, open rooms, chokepoints, dead ends
-- The agent start and goal should be separated by meaningful navigation
-- Avoid trivial mazes (no walls) or impossible mazes (goal unreachable)"""
+YOUR ROLE:
+You are not designing standalone puzzles. You are designing mazes that
+TEACH the RL agent something the current training buffer does not already
+teach. A good maze fills a GAP in the agent's experience — it creates
+behavioral patterns (paths, decision points, traps) that are structurally
+different from what the agent has already seen.
+
+READING BEHAVIORAL METRICS:
+You will receive metrics from the agent's experience on reference mazes.
+Use these to infer what STRUCTURES the buffer already contains:
+
+- Entropy profile shape → DECISION STRUCTURE:
+  Decaying = funnels (open start, constrained end)
+  Rising = expanding choices (constrained start, open end)
+  Flat low = forced corridors (no real choices)
+  Flat high = many-branching (always uncertain)
+  Spiky = alternating open and constrained regions
+
+- Position trace spread → SPATIAL COVERAGE:
+  Clustered = agent loops in one region (dead-end traps)
+  Spread = agent traverses full grid (winding global path)
+  Linear = straight or gently curving corridor
+
+- Action sequence repetitiveness → PATH GEOMETRY:
+  Long same-action runs = straight corridors
+  Frequent direction changes = zigzag or maze-like
+  Repeated subsequences = symmetric or repetitive layout
+
+- Regret + solve rate → DIFFICULTY SOURCE:
+  High regret + low solve rate = deceptive (plausible wrong paths)
+  High regret + high solve rate = suboptimal routing (multiple paths)
+  Low regret = too easy or too familiar
+
+- Low pairwise TD Error EMD across references = the buffer has
+  CONVERGED structurally. A radical departure is needed, not a tweak.
+
+STRUCTURAL DIVERSITY means varying the FUNDAMENTAL TOPOLOGY:
+- How space is partitioned (corridors vs rooms vs open vs hybrid)
+- How paths branch (linear vs tree vs graph vs hub-and-spoke)
+- Where decisions happen (early vs late vs distributed)
+- Wall density and distribution (dense clusters vs sparse scattered)
+Do NOT just move the same structure to a different grid position.
+A corridor in the top-left is NOT diverse from a corridor in the bottom-right."""
 
 _OUTPUT_FORMAT_GRID_ONLY = """
 OUTPUT FORMAT:
@@ -135,35 +171,31 @@ Example of valid output format (this is deliberately trivial — generate someth
 
 _OUTPUT_FORMAT_WITH_REASONING = """
 OUTPUT FORMAT:
-First, write a brief reasoning section (3-5 sentences max), then output the grid.
+First write a brief analysis, then the grid.
 
-REASONING (keep it short):
-- What makes your maze different from the references
-- Where you placed agent/goal and why
-- How you verified solvability (trace the path mentally)
+ANALYSIS (2-3 sentences max):
+1. What structural pattern do the reference mazes share?
+2. What structural property is ABSENT — what would produce different behavioral signatures?
 
-GRID:
-Then output EXACTLY 13 rows of 13 characters each using only: # . > v < ^ G
+Then a blank line, then EXACTLY 13 rows of 13 characters each using only: # . > v < ^ G
 One agent start (>v<^) and one goal (G). Must be solvable.
 
 Example:
 
-REASONING:
-Agent bottom-left, goal top-right. Winding corridor with two dead ends.
-Path: right along bottom, up through center gap, right to goal.
+ANALYSIS: References are all narrow corridor mazes with linear paths and low entropy.
+Missing: open multi-path structure with distributed decision points.
 
-GRID:
 #############
 #>..........#
-#...........#
-#...........#
-#...........#
-#...........#
-#.####.####.#
-#...........#
-#...........#
-#...........#
-#...........#
+#.###.#.###.#
+#.#...#...#.#
+#.#.#####.#.#
+#.#.......#.#
+#.#.#.###.#.#
+#...#.#.#...#
+#.###.#.###.#
+#.#...#...#.#
+#.#.#####.#.#
 #..........G#
 #############"""
 
@@ -175,7 +207,7 @@ def get_system_prompt(thinking_in_output: bool = False) -> str:
     return _SYSTEM_PROMPT_BASE + _OUTPUT_FORMAT_GRID_ONLY
 
 
-# Keep backward compat
+# Keep backward compat (grid-only mode, no reasoning)
 SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE + _OUTPUT_FORMAT_GRID_ONLY
 
 
@@ -365,6 +397,7 @@ def build_generation_prompt(
     global_metrics: Optional[List[MetricEntry]] = None,
     instruction: str = "",
     target_metrics: Optional[List[MetricEntry]] = None,
+    session_grids: Optional[List[str]] = None,
 ) -> str:
     """Build the user prompt for maze generation.
 
@@ -375,6 +408,9 @@ def build_generation_prompt(
         instruction: Custom instruction appended to the prompt.
             If empty, a default instruction is used.
         target_metrics: Optional target metric values to aim for
+        session_grids: Optional list of ASCII grid strings for mazes already
+            generated this session (wave-accepted). Shown grid-only (no metrics)
+            as visual deduplication signals.
 
     Returns:
         User prompt string (system prompt is returned separately)
@@ -388,7 +424,7 @@ def build_generation_prompt(
         sections.append(defs)
         sections.append("")
 
-    # Section 1: Reference mazes
+    # Section 1: Reference mazes (from buffer, with full metrics)
     if references:
         sections.append("=== REFERENCE MAZES FROM THE REPLAY BUFFER ===")
         sections.append("These are mazes the RL agent is currently training on.\n")
@@ -410,6 +446,18 @@ def build_generation_prompt(
                 sections.append(f"\nNote: {ref.notes}")
 
             sections.append("")  # blank line
+
+    # Section 1b: Session-generated mazes (grid only, no metrics)
+    if session_grids:
+        sections.append("=== MAZES ALREADY GENERATED THIS SESSION ===")
+        sections.append(
+            "These were already accepted. Do NOT generate anything with "
+            "a similar connectivity structure or spatial layout.\n"
+        )
+        for i, grid in enumerate(session_grids, 1):
+            sections.append(f"--- Session Maze {i} ---")
+            sections.append(grid)
+            sections.append("")
 
     # Section 2: Pairwise metrics
     if pairwise_metrics:
@@ -440,10 +488,15 @@ def build_generation_prompt(
     else:
         sections.append("=== INSTRUCTION ===")
         sections.append(
-            "Generate a NEW 13x13 maze that is DIFFERENT from the reference mazes above. "
-            "The new maze should provide a distinct navigation challenge — different path "
-            "structure, different obstacle layout, different spatial regions explored. "
-            "Make sure it is solvable (agent can reach the goal)."
+            "STEP 1 — ANALYZE: Examine the reference mazes' behavioral metrics. "
+            "What structural pattern do they share? What do the entropy profiles, "
+            "position traces, and action sequences tell you about the topology "
+            "that dominates the current buffer?\n\n"
+            "STEP 2 — IDENTIFY GAP: What structural property is ABSENT from the "
+            "references — something that would produce fundamentally different "
+            "behavioral signatures?\n\n"
+            "STEP 3 — GENERATE: Build a 13x13 maze that embodies the missing "
+            "property. The maze must be solvable (agent can reach the goal)."
         )
 
     return '\n'.join(sections)
@@ -502,7 +555,7 @@ def build_diversity_feedback_prompt(
         Follow-up user prompt
     """
     sections = [
-        "Your maze is valid but too similar to existing buffer mazes:\n",
+        "YOUR MAZE WAS REJECTED — too similar to existing buffer mazes.\n",
     ]
 
     # Inject metric definitions so the LLM understands the feedback
@@ -534,17 +587,16 @@ def build_diversity_feedback_prompt(
             sections.append(f"\n=== {section.title} ===")
             sections.append(section.body)
 
-    if analysis_sections:
-        sections.append(
-            "\nGenerate a MORE DIFFERENT maze. Use the analysis above to guide "
-            "your wall placement — block the identified overlap regions and open "
-            "paths through unused regions. Return ONLY the 13x13 grid."
-        )
-    else:
-        sections.append(
-            "\nGenerate a MORE DIFFERENT maze. Change the wall structure to force "
-            "the agent into a completely different navigation path. "
-            "Return ONLY the 13x13 grid."
-        )
+    sections.append(
+        "\nIMPORTANT: Do NOT patch your previous maze. Design a COMPLETELY NEW "
+        "maze from scratch. Your previous maze produced similar agent behavior "
+        "because it shares the same underlying connectivity structure. Think about "
+        "what TOPOLOGY would cause fundamentally different agent behavior — not "
+        "just which walls to flip, but what spatial organization would make the "
+        "agent take a completely different path.\n\n"
+        "Follow the same ANALYZE → IDENTIFY GAP → GENERATE process, but also "
+        "consider: what about your previous attempt made it too similar? "
+        "Avoid that structural pattern entirely."
+    )
 
     return '\n'.join(sections)

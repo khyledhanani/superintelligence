@@ -1581,7 +1581,141 @@ def run_test(args):
     generator = MazeGenerator(config)
 
     # Generate mazes
-    if args.feedback:
+    if args.independent:
+        # ---------------------------------------------------------------
+        # Independent mode: per-maze random refs, no feedback accumulation
+        # ---------------------------------------------------------------
+        print("\n" + "=" * 60)
+        print(f"  GENERATING {args.n} MAZES (INDEPENDENT MODE)")
+        print("=" * 60)
+
+        from llm.decision_gate import (
+            DiversityThresholds,
+            evaluate_candidate,
+            compute_adaptive_thresholds,
+        )
+
+        # Ensure evaluator is loaded
+        if evaluator is None:
+            from llm.agent_evaluator import AgentEvaluator
+            evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
+
+        max_retries = args.max_independent_retries
+
+        base_thresholds = DiversityThresholds(
+            difficulty_threshold=args.difficulty_threshold,
+            difficulty_metric=args.difficulty_metric,
+            min_diversity=args.min_diversity,
+            diversity_metric=args.diversity_metric,
+            diversity_scale=args.diversity_scale if args.diversity_scale is not None else 0.5,
+            difficulty_scale=args.difficulty_scale if args.difficulty_scale is not None else 0.5,
+            difficulty_floor=args.difficulty_floor,
+        )
+
+        results = []
+        # Keep first maze's references for visualization
+        first_references = None
+        first_ref_trajectories = None
+        first_pairwise_metrics = None
+
+        for maze_i in range(args.n):
+            logger.info(f"=== Independent maze {maze_i + 1}/{args.n} ===")
+
+            # 1. Select 6 random references for THIS maze
+            maze_ref_data = select_references(
+                tokens, scores, size, n=args.num_refs,
+                strategy="random",
+                difficulty_metric=args.difficulty_metric,
+            )
+
+            # 2. Roll out agent on these refs
+            maze_ref_levels = [tokens_to_level_obj(tok) for _, tok, _ in maze_ref_data]
+            logger.info(f"Rolling out agent on {len(maze_ref_levels)} random references...")
+            maze_ref_trajs = evaluator.evaluate_levels(maze_ref_levels)
+
+            # 3. Build references with metrics
+            maze_refs, maze_pw_metrics = build_references_with_metrics(
+                maze_ref_data,
+                trajectories=maze_ref_trajs,
+                inject_regret=args.inject_regret,
+                downsample_points=args.downsample_points,
+                prompt_metrics=args.prompt_metrics,
+                pairwise_metrics_cfg=args.pairwise_metrics_cfg,
+            )
+            maze_ref_labels = [r.label for r in maze_refs]
+
+            # Save first maze's refs for visualization
+            if first_references is None:
+                first_references = maze_refs
+                first_ref_trajectories = maze_ref_trajs
+                first_pairwise_metrics = maze_pw_metrics
+
+            # 4. Compute adaptive thresholds from this ref set
+            thresholds = compute_adaptive_thresholds(maze_ref_trajs, base_thresholds)
+            logger.info(
+                f"Gate thresholds: min_diversity={thresholds.min_diversity:.4f}, "
+                f"difficulty={thresholds.difficulty_threshold}"
+            )
+
+            # Print refs for this maze
+            print(f"\n--- References for Maze {maze_i + 1} ---")
+            print(f"  Adaptive thresholds: diversity={thresholds.min_diversity:.4f}, difficulty={thresholds.difficulty_threshold}")
+            for ref in maze_refs:
+                scalar_regret = next((m.value for m in ref.metrics if "regret" in m.name.lower()), "?")
+                print(f"  {ref.label}: regret={scalar_regret}")
+
+            # 5. Generate with fresh retries (no feedback)
+            best_result = None
+            for attempt in range(max_retries + 1):
+                result = generator.generate(
+                    references=maze_refs,
+                    pairwise_metrics=maze_pw_metrics,
+                    global_metrics=global_metrics,
+                    instruction=args.instruction,
+                )
+
+                if not result.success:
+                    logger.info(f"Attempt {attempt + 1}: generation failed (format/solvability)")
+                    best_result = result
+                    continue
+
+                # 6. Run agent on candidate, evaluate gate
+                candidate_traj = evaluator.evaluate_level_multi_rollout(
+                    result.level, n_rollouts=args.n_rollouts,
+                )
+                gate_result = evaluate_candidate(
+                    candidate_traj,
+                    maze_ref_trajs,
+                    maze_ref_labels,
+                    thresholds,
+                )
+                result.gate_metrics = gate_result.summary
+                result.gate_pair_metrics = gate_result.pair_metrics
+                result.diversity_attempts = attempt + 1
+
+                if gate_result.accepted:
+                    logger.info(f"Maze {maze_i + 1} accepted on attempt {attempt + 1}")
+                    best_result = result
+                    break
+
+                # Gate failed — log and retry (fresh call, no feedback)
+                logger.info(
+                    f"Maze {maze_i + 1} attempt {attempt + 1}: gate rejected "
+                    f"({', '.join(issue[:60] for issue in gate_result.issues)})"
+                )
+                best_result = result
+
+                if attempt >= max_retries:
+                    logger.info(f"Maze {maze_i + 1}: max retries reached, force-accepting")
+
+            results.append(best_result)
+
+        # Use first maze's references for visualization
+        references = first_references or references
+        ref_trajectories = first_ref_trajectories or ref_trajectories
+        pairwise_metrics = first_pairwise_metrics or pairwise_metrics
+
+    elif args.feedback:
         print("\n" + "=" * 60)
         print(f"  GENERATING {args.n} MAZES WITH METRIC FEEDBACK LOOP")
         print("=" * 60)
@@ -1802,7 +1936,7 @@ def main():
     parser.add_argument("--no-inject-buffer-stats", action="store_false", dest="inject_buffer_stats")
 
     # LLM settings
-    parser.add_argument("--provider", choices=["ollama", "openrouter", "claude-code"],
+    parser.add_argument("--provider", choices=["ollama", "openrouter", "claude-code", "anthropic"],
                         default=cfg.get("provider"),
                         help="API provider")
     parser.add_argument("--base-url", default=None,
@@ -1885,6 +2019,23 @@ def main():
     parser.add_argument("--buffer-embed-samples", type=int,
                         default=cfg.get("buffer_embed_samples", 200),
                         help="Buffer levels to include in embedding (0=none, -1=all, default=200)")
+
+    # Independent mode
+    parser.add_argument("--independent", action="store_true",
+                        default=cfg.get("independent", False),
+                        help="Independent mode: random refs per maze, no feedback loop")
+    parser.add_argument("--diversity-scale", type=float,
+                        default=cfg.get("diversity_scale"),
+                        help="Adaptive diversity = scale * median ref pairwise distance (default: 0.5)")
+    parser.add_argument("--difficulty-scale", type=float,
+                        default=cfg.get("difficulty_scale"),
+                        help="Adaptive difficulty = scale * mean ref difficulty (default: 0.5)")
+    parser.add_argument("--max-independent-retries", type=int,
+                        default=cfg.get("max_independent_retries", 2),
+                        help="Max fresh retries per maze in independent mode (default: 2)")
+    parser.add_argument("--difficulty-floor", type=float,
+                        default=cfg.get("difficulty_floor", 0.05),
+                        help="Minimum difficulty threshold floor for adaptive mode (default: 0.05)")
 
     # Mode
     parser.add_argument("--dry-run", action="store_true",

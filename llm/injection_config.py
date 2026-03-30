@@ -54,6 +54,13 @@ class LLMInjectionConfig:
     max_seed_retries: int = 3              # --llm_max_seed_retries (fresh LLM calls if gate rejects)
     n_rollouts_gate: int = 100              # --llm_n_rollouts (rollouts per candidate)
 
+    # Independent mode: per-maze random refs, adaptive thresholds, no feedback
+    independent: bool = False              # --llm_independent
+    diversity_scale: float = 0.5           # --llm_diversity_scale
+    difficulty_scale: float = 0.5          # --llm_difficulty_scale
+    difficulty_floor: float = 0.05         # --llm_difficulty_floor
+    max_independent_retries: int = 2       # --llm_max_independent_retries
+
     # Mutation amplification
     amplification_enabled: bool = True   # --llm_amplification
     mutations_per_seed: int = 30         # --llm_mutations_per_seed
@@ -108,6 +115,11 @@ class LLMInjectionConfig:
             max_diversity_retries=config.get("llm_max_diversity_retries", 2),
             max_seed_retries=config.get("llm_max_seed_retries", 3),
             n_rollouts_gate=config.get("llm_n_rollouts", 100),
+            independent=config.get("llm_independent", False),
+            diversity_scale=config.get("llm_diversity_scale", 0.5),
+            difficulty_scale=config.get("llm_difficulty_scale", 0.5),
+            difficulty_floor=config.get("llm_difficulty_floor", 0.05),
+            max_independent_retries=config.get("llm_max_independent_retries", 2),
             amplification_enabled=config.get("llm_amplification", True),
             mutations_per_seed=config.get("llm_mutations_per_seed", 30),
             max_inject_per_event=config.get("llm_max_inject_per_event", 200),

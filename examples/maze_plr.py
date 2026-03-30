@@ -1779,15 +1779,27 @@ if __name__=="__main__":
                            help="How LLM diversity threshold is set: fixed=absolute, "
                                 "buffer_median=median pairwise distance among references, "
                                 "disabled=no diversity gate")
-    llm_group.add_argument("--llm_diversity_metric", type=str, default="td_error_emd",
-                           choices=["td_error_emd", "experience_divergence", "position_dtw"],
-                           help="Diversity metric for decision gate")
+    llm_group.add_argument("--llm_diversity_metric", type=str, default="cenie",
+                           choices=["td_error_emd", "normalized_td_error_emd",
+                                    "experience_divergence", "position_dtw",
+                                    "embedding", "cenie"],
+                           help="Diversity metric for decision gate (cenie=GMM novelty, embedding=LSTM L2)")
     llm_group.add_argument("--llm_max_diversity_retries", type=int, default=2,
                            help="Max LLM retries when diversity gate rejects (feedback loop)")
     llm_group.add_argument("--llm_max_seed_retries", type=int, default=3,
                            help="Max fresh LLM calls per seed slot when gate rejects (difficulty or diversity)")
     llm_group.add_argument("--llm_n_rollouts", type=int, default=100,
                            help="Number of agent rollouts per candidate for gate evaluation")
+    llm_group.add_argument("--llm_independent", action=argparse.BooleanOptionalAction, default=False,
+                           help="Independent mode: random refs per maze, adaptive thresholds, no feedback loop")
+    llm_group.add_argument("--llm_diversity_scale", type=float, default=0.5,
+                           help="Adaptive diversity = scale * median ref pairwise distance")
+    llm_group.add_argument("--llm_difficulty_scale", type=float, default=0.5,
+                           help="Adaptive difficulty = scale * mean ref difficulty")
+    llm_group.add_argument("--llm_difficulty_floor", type=float, default=0.05,
+                           help="Minimum difficulty threshold floor for adaptive mode")
+    llm_group.add_argument("--llm_max_independent_retries", type=int, default=2,
+                           help="Max fresh retries per maze in independent mode")
 
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:

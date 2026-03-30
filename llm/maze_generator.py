@@ -89,6 +89,10 @@ class GenerationConfig:
             "api_key_env": "OPENROUTER_API_KEY",
         },
         "claude-code": {},  # no API key needed, uses CLI subscription
+        "anthropic": {
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY",
+        },
     }
 
     def __post_init__(self):
@@ -101,7 +105,7 @@ class GenerationConfig:
             env_var = defaults.get("api_key_env", "")
             if env_var:
                 self.api_key = _load_api_key(env_var)
-        if not self.api_key and self.provider not in ("claude-code",):
+        if not self.api_key and self.provider not in ("claude-code", "anthropic"):
             logger.warning(
                 f"No API key found for provider '{self.provider}'. "
                 f"Set {defaults.get('api_key_env', 'API_KEY')} via environment variable or .env file."
@@ -169,6 +173,7 @@ class MazeGenerator:
         target_metrics: Optional[List[MetricEntry]] = None,
         solvability_checker: Optional[Callable] = None,
         prior_messages: Optional[List[Dict]] = None,
+        session_grids: Optional[List[str]] = None,
     ) -> GenerationResult:
         """Generate a new maze level via LLM.
 
@@ -183,6 +188,8 @@ class MazeGenerator:
             prior_messages: Optional conversation history from previous diversity
                 attempts. List of {"role": ..., "content": ...} dicts appended
                 after the initial user prompt so the LLM sees its rejected mazes.
+            session_grids: Optional list of ASCII grids for mazes already generated
+                this session (wave-accepted). Shown grid-only for deduplication.
 
         Returns:
             GenerationResult with the generated maze (or error details)
@@ -196,6 +203,7 @@ class MazeGenerator:
             global_metrics=global_metrics,
             instruction=instruction,
             target_metrics=target_metrics,
+            session_grids=session_grids,
         )
 
         system_prompt = get_system_prompt(self.config.thinking_in_output)
@@ -318,11 +326,183 @@ class MazeGenerator:
             (content, thinking) tuple. content is None on failure.
             thinking is None for non-reasoning models or on failure.
         """
+        if self.config.provider == "anthropic":
+            return self._call_anthropic(messages)
         if self.config.provider == "claude-code":
             return self._call_claude_code(messages)
         if self.config.provider == "openrouter":
             return self._call_openai_compatible(messages)
         return self._call_ollama(messages)
+
+    # --- Anthropic OAuth token cache ---
+    _anthropic_token: Optional[str] = None
+    _anthropic_token_expiry: float = 0.0
+    _anthropic_direct_blocked: bool = False  # True if OAuth token can't access model via direct API
+
+    def _get_anthropic_token(self) -> str:
+        """Get Anthropic API token. Priority: env var > Claude Code OAuth.
+
+        Reads and caches the OAuth token from ~/.claude/.credentials.json,
+        re-reading if expired. This uses the Claude Code Max subscription
+        for zero-cost API access.
+        """
+        # 1. Explicit API key (env var or config)
+        if self.config.api_key:
+            return self.config.api_key
+
+        # 2. Cached OAuth token (if not expired)
+        now = time.time() * 1000  # ms
+        if self._anthropic_token and now < self._anthropic_token_expiry - 60_000:
+            return self._anthropic_token
+
+        # 3. Read from Claude Code credentials
+        creds_path = os.path.expanduser("~/.claude/.credentials.json")
+        if not os.path.exists(creds_path):
+            raise RuntimeError(
+                "No ANTHROPIC_API_KEY set and ~/.claude/.credentials.json not found. "
+                "Either set ANTHROPIC_API_KEY or log in to Claude Code."
+            )
+        with open(creds_path) as f:
+            creds = json.load(f)
+        oauth = creds.get("claudeAiOauth", {})
+        token = oauth.get("accessToken", "")
+        if not token:
+            raise RuntimeError(
+                "No accessToken in ~/.claude/.credentials.json. "
+                "Log in to Claude Code first."
+            )
+        MazeGenerator._anthropic_token = token
+        MazeGenerator._anthropic_token_expiry = float(oauth.get("expiresAt", 0))
+        logger.info(f"Loaded Anthropic OAuth token (expires {oauth.get('expiresAt', '?')})")
+        return token
+
+    def _call_anthropic(self, messages: List[Dict]) -> tuple:
+        """Call the Anthropic Messages API directly.
+
+        Uses either ANTHROPIC_API_KEY env var or the Claude Code OAuth
+        token from ~/.claude/.credentials.json (Max subscription = zero cost).
+
+        Auto-fallback: if the OAuth token can't access the requested model
+        (e.g. Sonnet/Opus on Max subscription), falls back to `claude -p` CLI
+        which has full model access. The fallback is remembered so subsequent
+        calls skip the direct API attempt.
+
+        Returns:
+            (content, thinking) tuple.
+        """
+        # Skip direct API if we know it's blocked for this model
+        if MazeGenerator._anthropic_direct_blocked:
+            return self._call_claude_code(messages)
+
+        token = self._get_anthropic_token()
+
+        # Anthropic API: system prompt is top-level, not in messages
+        system = ""
+        api_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system = m["content"]
+            else:
+                api_messages.append({"role": m["role"], "content": m["content"]})
+
+        headers = {
+            "x-api-key": token,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        payload = {
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "messages": api_messages,
+            "temperature": self.config.temperature,
+        }
+        if system:
+            payload["system"] = system
+
+        # Extended thinking
+        if self.config.thinking:
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.config.thinking_budget,
+            }
+            payload["max_tokens"] = max(
+                self.config.max_tokens,
+                self.config.thinking_budget + 1000,
+            )
+            payload["temperature"] = 1.0  # required for thinking
+
+        url = f"{self.config.base_url}/messages"
+        try:
+            logger.debug(f"Calling Anthropic API with model={self.config.model}")
+            resp = requests.post(
+                url, json=payload, headers=headers, timeout=self.config.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Parse content blocks
+            content_parts = []
+            thinking_parts = []
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    content_parts.append(block["text"])
+                elif block.get("type") == "thinking":
+                    thinking_parts.append(block.get("thinking", ""))
+
+            content = "\n".join(content_parts).strip()
+            thinking = "\n".join(thinking_parts).strip() or None
+
+            # Fallback: if content is empty but thinking has output
+            if not content and thinking:
+                logger.info("Content was empty, using thinking as fallback")
+                content = thinking
+                thinking = None
+
+            # Log token usage
+            usage = data.get("usage", {})
+            in_tok = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
+            if in_tok or out_tok:
+                print(f"[LLM] Anthropic API tokens: {in_tok} in, {out_tok} out", flush=True)
+
+            if thinking:
+                logger.info(f"Model reasoning ({len(thinking)} chars)")
+            return content, thinking
+
+        except requests.exceptions.HTTPError as e:
+            # Auto-fallback: OAuth tokens from Max subscription may not have
+            # direct API access for Sonnet/Opus (returns 400). Fall back to
+            # claude CLI which has full access via the subscription.
+            status = e.response.status_code if e.response is not None else 0
+            is_oauth = token.startswith("sk-ant-oat")
+            if status == 400 and is_oauth:
+                body = e.response.text[:200] if e.response is not None else ""
+                print(
+                    f"[LLM] Direct API returned 400 for {self.config.model} with OAuth token. "
+                    f"Falling back to claude CLI (full model access via subscription). "
+                    f"Body: {body}",
+                    flush=True,
+                )
+                logger.info("Marking direct API as blocked; using claude CLI for all subsequent calls")
+                MazeGenerator._anthropic_direct_blocked = True
+                return self._call_claude_code(messages)
+
+            err_msg = f"Anthropic API error: {e}"
+            if e.response is not None:
+                err_msg += f" | status={status} body={e.response.text[:500]}"
+            logger.error(err_msg)
+            print(f"[LLM ERROR] {err_msg}", flush=True)
+            return None, None
+        except requests.exceptions.RequestException as e:
+            err_msg = f"Anthropic API error: {e}"
+            logger.error(err_msg)
+            print(f"[LLM ERROR] {err_msg}", flush=True)
+            return None, None
+        except (KeyError, IndexError) as e:
+            logger.error(f"Unexpected Anthropic response format: {e}")
+            print(f"[LLM ERROR] Unexpected response format: {e}", flush=True)
+            return None, None
 
     def _call_ollama(self, messages: List[Dict]) -> tuple:
         """Call the Ollama cloud API (/api/chat endpoint).
@@ -410,6 +590,8 @@ class MazeGenerator:
                 "~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude"
             )) + _glob.glob(os.path.expanduser(
                 "~/.vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude"
+            )) + _glob.glob(os.path.expanduser(
+                "~/.vscode-extensions/anthropic.claude-code-*/resources/native-binary/claude"
             ))
             if candidates:
                 claude_bin = sorted(candidates)[-1]  # latest version
@@ -432,8 +614,10 @@ class MazeGenerator:
         try:
             logger.debug(f"Calling claude CLI with model={self.config.model}")
             # Set env var so user hooks can skip notifications for subprocess calls
+            # Unset CLAUDECODE to allow nested CLI invocations (e.g. from within a Claude Code session)
             env = os.environ.copy()
             env["CLAUDE_CODE_SUBPROCESS"] = "1"
+            env.pop("CLAUDECODE", None)
             proc = subprocess.run(
                 cmd,
                 env=env,
@@ -446,9 +630,12 @@ class MazeGenerator:
                 err_msg = f"claude CLI exited with code {proc.returncode}"
                 if proc.stderr:
                     err_msg += f" | stderr: {proc.stderr[:500]}"
-                logger.error(err_msg)
-                print(f"[LLM ERROR] {err_msg}", flush=True)
-                return None, None
+                logger.warning(err_msg)
+                # Don't bail immediately — hook failures cause exit code 1
+                # but the LLM response may still be in stdout. Try to parse.
+                if not proc.stdout or not proc.stdout.strip():
+                    print(f"[LLM ERROR] {err_msg} (no stdout)", flush=True)
+                    return None, None
 
             # Parse stream-json output: extract text from assistant messages,
             # fall back to result field for older CLI versions.
@@ -807,6 +994,7 @@ class MazeGenerator:
         max_diversity_retries: int = 2,
         n_rollouts: int = 100,
         cenie_model=None,
+        session_grids: Optional[List[str]] = None,
     ) -> GenerationResult:
         """Generate a maze with full metric feedback loop.
 
@@ -830,6 +1018,8 @@ class MazeGenerator:
             diversity_thresholds: DiversityThresholds instance (or None for defaults)
             max_diversity_retries: Max times to retry after diversity gate failure
             n_rollouts: Number of agent rollouts per maze
+            session_grids: Optional list of ASCII grids for mazes already generated
+                this session (wave-accepted). Shown grid-only for deduplication.
 
         Returns:
             GenerationResult with additional gate_result attribute
@@ -856,6 +1046,7 @@ class MazeGenerator:
             instruction=instruction,
             target_metrics=target_metrics,
             solvability_checker=solvability_checker,
+            session_grids=session_grids,
         )
 
         if not result.success:
@@ -1123,6 +1314,7 @@ class MazeGenerator:
                 target_metrics=target_metrics,
                 solvability_checker=solvability_checker,
                 prior_messages=diversity_history,
+                session_grids=session_grids,
             )
 
             # Carry forward the history from previous attempts
@@ -1167,33 +1359,44 @@ class MazeGenerator:
         max_diversity_retries: int = 2,
         n_rollouts: int = 100,
         cenie_model=None,
+        max_session_refs: int = 6,
     ) -> List[GenerationResult]:
         """Generate multiple mazes with metric feedback loop.
 
-        Each accepted maze is added to the reference set so subsequent
-        generations are diverse from both the buffer AND previously
-        generated mazes in this batch.
+        Each accepted maze is added to the reference set for gate diversity
+        computation AND shown as a grid-only session reference in the prompt
+        to prevent structural repetition within the same batch.
+
+        Buffer references (with full metrics) stay fixed. Session-accepted
+        mazes appear grid-only in a separate prompt section.
 
         Args:
             n: Number of mazes to generate
+            max_session_refs: Max session grids to show in prompt (most recent)
             (other args same as generate_with_feedback())
 
         Returns:
             List of GenerationResult objects
         """
         # Copy reference lists so we can grow them without mutating the originals
+        # These grow for the GATE (diversity computation needs trajectories)
         ref_trajs = list(reference_trajectories) if reference_trajectories else []
         ref_labels = list(reference_labels) if reference_labels else []
-        refs = list(references) if references else []
+
+        # Session grids grow for the PROMPT (grid-only visual deduplication)
+        session_grids: List[str] = []
 
         results = []
         for i in range(n):
-            logger.info(f"Generating maze {i+1}/{n} (with feedback, {len(ref_labels)} references)...")
+            logger.info(
+                f"Generating maze {i+1}/{n} (with feedback, "
+                f"{len(ref_labels)} gate refs, {len(session_grids)} session refs)..."
+            )
             result = self.generate_with_feedback(
                 agent_evaluator=agent_evaluator,
                 reference_trajectories=ref_trajs,
                 reference_labels=ref_labels,
-                references=refs,
+                references=references,  # buffer refs only (unchanged)
                 pairwise_metrics=pairwise_metrics,
                 global_metrics=global_metrics,
                 instruction=instruction,
@@ -1203,40 +1406,24 @@ class MazeGenerator:
                 max_diversity_retries=max_diversity_retries,
                 n_rollouts=n_rollouts,
                 cenie_model=cenie_model,
+                session_grids=session_grids[-max_session_refs:] if session_grids else None,
             )
             results.append(result)
 
-            # Add accepted maze to reference set for subsequent generations
+            # Add accepted maze to gate references AND session grids
             if result.success and result.level is not None:
                 gen_label = f"Gen {i + 1}"
                 logger.info(f"Adding {gen_label} to reference set for next generation")
 
-                # Run agent to get trajectory for the new reference
+                # Run agent to get trajectory for GATE diversity computation
                 gen_traj = agent_evaluator.evaluate_level_multi_rollout(
                     result.level, n_rollouts=n_rollouts,
                 )
                 ref_trajs.append(gen_traj)
                 ref_labels.append(gen_label)
 
-                # Build a minimal ReferenceMaze for the prompt
-                gen_ref = ReferenceMaze(
-                    grid=result.grid,
-                    label=gen_label,
-                    metrics=[MetricEntry(
-                        name="Scalar Regret",
-                        value=result.gate_metrics.get("regret", 0.0) if result.gate_metrics else 0.0,
-                        description="Previously generated maze",
-                        metric_key="scalar_regret",
-                    )],
-                )
-                # Add path overlay if possible
-                try:
-                    from metrics.utils import truncate_at_done
-                    ep_pos = truncate_at_done(gen_traj["positions"], gen_traj["dones"])
-                    gen_ref.path_overlay = overlay_path_on_grid(result.grid, ep_pos)
-                except Exception:
-                    pass
-                refs.append(gen_ref)
+                # Add grid-only for PROMPT deduplication
+                session_grids.append(result.grid)
 
         successes = sum(1 for r in results if r.success)
         logger.info(f"Feedback batch complete: {successes}/{n} successful")
