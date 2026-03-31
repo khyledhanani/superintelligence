@@ -123,6 +123,46 @@ See `examples/gymnax/gymnax_plr.py` to run gymnax environments, currently suppor
 
 The `examples/gymnax/gymnax_plr.py` can be modified to add additional environments as well.
 
+## LLM Injection Extension
+
+This fork extends JaxUED with an **LLM-guided curriculum learning pipeline** that periodically injects LLM-generated mazes into the PLR training buffer. The idea: use an LLM to propose novel, difficult mazes that complement what the agent is already training on.
+
+### How it works
+
+1. A pre-trained agent + PLR buffer serve as the starting point
+2. LLM seeds are generated (stored in `llm/generated_levels/`)
+3. Seeds are mutated via wall-flip (or VAE-based) strategies to amplify the pool
+4. Candidate levels are scored by agent learnability (SFL) and filtered by difficulty/diversity gates
+5. Accepted levels are injected into the buffer at configurable percentages (5-25%)
+6. Training resumes from the injected buffer with ACCEL + PLR
+
+### Directory guide
+
+| Directory | What's inside |
+|-----------|---------------|
+| [`llm/`](llm/) | LLM maze generation pipeline (prompt building, API calls, gating logic) |
+| [`experiments/`](experiments/) | Injection experiment runner, mutation strategies, evaluation scripts, GPU launch scripts |
+| [`vae/`](vae/) | Variational Autoencoder for latent-space level analysis and VAE-based mutations |
+| [`examples/`](examples/) | Training (`maze_plr.py`), evaluation, and cross-evaluation scripts |
+
+Each directory has its own README with full details. Start with [`experiments/README.md`](experiments/README.md) for the end-to-end pipeline.
+
+### Quick start (injection experiment)
+
+```bash
+# 1. Install
+pip install -e ".[examples]"
+pip install requests pyyaml
+
+# 2. Run the full pipeline for seed 0 (prepare seeds, mutate, train at 5-25%)
+bash experiments/gpu_scripts/run_llm_injection_seed0.sh
+
+# 3. Or run the wall-flip baseline for comparison
+bash experiments/gpu_scripts/run_wallflip.sh
+```
+
+Results are logged to WandB project `JAXUED_LLM_INJECTION`.
+
 ## See Also
 Here are some other libraries that also leverage Jax to obtain massive speedups in RL, which acted as inspiration for JaxUED.
 
