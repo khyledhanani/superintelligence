@@ -54,9 +54,35 @@ class TrainState(BaseTrainState):
     num_mutation_updates: int
     dr_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     replay_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
+    replay_last_level_inds: chex.Array = struct.field(pytree_node=True)
     mutation_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
 
 # region PPO helper functions
+def compute_insertion_embeddings(
+    hstates: chex.Array,
+    actions: chex.Array,
+    dones: chex.Array,
+) -> chex.Array:
+    """Compute per-level mean [hstate(256), action(1)] embedding, masked to first episode.
+
+    Args:
+        hstates: (NUM_STEPS, NUM_ENVS, 256) — LSTM output hidden states
+        actions: (NUM_STEPS, NUM_ENVS) — discrete actions
+        dones: (NUM_STEPS, NUM_ENVS) — episode termination flags
+
+    Returns:
+        (NUM_ENVS, 257) — mean state-action embedding per level
+    """
+    # Mask: 1 for all timesteps up to and including the first done, 0 after
+    pre_done = jnp.concatenate([jnp.zeros((1,) + dones.shape[1:]), dones[:-1]], axis=0)
+    episode_mask = (jnp.cumsum(pre_done, axis=0) == 0).astype(jnp.float32)  # (T, num_envs)
+    ep_lengths = jnp.maximum(episode_mask.sum(axis=0), 1.0)  # (num_envs,) avoid div by zero
+
+    mean_h = (hstates * episode_mask[..., None]).sum(axis=0) / ep_lengths[..., None]  # (num_envs, 256)
+    mean_a = (actions.astype(jnp.float32) * episode_mask).sum(axis=0) / ep_lengths  # (num_envs,)
+    return jnp.concatenate([mean_h, mean_a[:, None]], axis=-1)  # (num_envs, 257)
+
+
 def compute_td_errors(
     gamma: float,
     last_value: chex.Array,
@@ -512,7 +538,8 @@ def main(config=None, project="JAXUED_TEST"):
     print("=" * 60)
 
     wb_group = config.get("wandb_group") or config["run_name"]
-    run = wandb.init(config=config, project=project, group=wb_group, tags=tags)
+    wb_entity = config.get("wandb_entity") or None
+    run = wandb.init(config=config, project=project, entity=wb_entity, group=wb_group, tags=tags)
     config = wandb.config
     
     wandb.define_metric("num_updates")
@@ -571,9 +598,11 @@ def main(config=None, project="JAXUED_TEST"):
         print(f"Logging update: {stats['update_count']}")
         
         # generic stats
-        env_steps = stats["update_count"] * config["num_train_envs"] * config["num_steps"]
+        _offset = config.get("wandb_update_offset", 0)
+        effective_update = stats["update_count"] + _offset
+        env_steps = effective_update * config["num_train_envs"] * config["num_steps"]
         log_dict = {
-            "num_updates": stats["update_count"],
+            "num_updates": effective_update,
             "num_env_steps": env_steps,
             "sps": env_steps / stats['time_delta'],
         }
@@ -638,6 +667,31 @@ def main(config=None, project="JAXUED_TEST"):
             all_inds = np.array(stats["replay_level_inds"])  # (eval_freq, num_train_envs)
             valid_mask = all_inds >= 0  # -1 = DR or mutation step (no replay)
             valid_inds = all_inds[valid_mask].flatten()
+
+            # Buffer-level provenance counts
+            size = int(runner_state[1].sampler["size"])
+            origins_slice = _buffer_origins[:size]
+            n_buf_original = int((origins_slice == 1).sum())   # direct LLM seeds
+            n_buf_descendants = int((origins_slice == 2).sum()) # mutation descendants
+            n_buf_lineage = n_buf_original + n_buf_descendants
+            log_dict["provenance/buffer_original_injected"] = n_buf_original
+            log_dict["provenance/buffer_descendants"] = n_buf_descendants
+            log_dict["provenance/buffer_lineage_total"] = n_buf_lineage
+            log_dict["provenance/buffer_lineage_pct"] = n_buf_lineage / max(size, 1)
+
+            # Per-ancestor counts: how many descendants each LLM seed has in buffer
+            if _buffer_ancestor_ids is not None:
+                ancestor_slice = _buffer_ancestor_ids[:size]
+                lineage_ancestors = ancestor_slice[origins_slice > 0]
+                if len(lineage_ancestors) > 0 and (lineage_ancestors >= 0).any():
+                    unique_a, counts_a = np.unique(
+                        lineage_ancestors[lineage_ancestors >= 0], return_counts=True)
+                    log_dict["provenance/n_active_ancestors"] = len(unique_a)
+                    for a_id, cnt in zip(unique_a, counts_a):
+                        log_dict[f"provenance/ancestor_{a_id}_count"] = int(cnt)
+                else:
+                    log_dict["provenance/n_active_ancestors"] = 0
+
             if len(valid_inds) > 0:
                 # Count replays by origin type
                 replayed_origins = _buffer_origins[valid_inds]
@@ -758,6 +812,7 @@ def main(config=None, project="JAXUED_TEST"):
             num_mutation_updates=0,
             dr_last_level_batch=pholder_level_batch,
             replay_last_level_batch=pholder_level_batch,
+            replay_last_level_inds=jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
             mutation_last_level_batch=pholder_level_batch,
         )
 
@@ -822,7 +877,10 @@ def main(config=None, project="JAXUED_TEST"):
                     fresh_es_state, es_state
                 )
 
-            sampler, _ = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+            sampler, dr_inserted_inds = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+
+            # Stale embedding: mean [hstate(256), action(1)] over first episode
+            dr_embeddings = compute_insertion_embeddings(hstates, actions, dones)
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -854,7 +912,11 @@ def main(config=None, project="JAXUED_TEST"):
                 "td_error/std": td_errors.std(),
                 "td_error/abs_mean": jnp.abs(td_errors).mean(),
                 "td_error/max": jnp.abs(td_errors).max(),
-                "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),  # no replay this step
+                "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+                "mutation_parent_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+                "mutation_child_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+                "insertion_inds": dr_inserted_inds,  # (num_train_envs,) -1 if not inserted
+                "insertion_embeddings": dr_embeddings,  # (num_train_envs, 257)
             }
 
             # CMA-ES monitoring metrics
@@ -936,6 +998,10 @@ def main(config=None, project="JAXUED_TEST"):
                 "td_error/abs_mean": jnp.abs(td_errors).mean(),
                 "td_error/max": jnp.abs(td_errors).max(),
                 "replay_level_inds": level_inds,  # (num_train_envs,) for provenance tracking
+                "mutation_parent_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+                "mutation_child_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+                "insertion_inds": level_inds,  # replay slots to update embeddings for
+                "insertion_embeddings": compute_insertion_embeddings(hstates, actions, dones),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -951,9 +1017,10 @@ def main(config=None, project="JAXUED_TEST"):
                 es_state=train_state.es_state,
                 num_replay_updates=train_state.num_replay_updates + 1,
                 replay_last_level_batch=levels,
+                replay_last_level_inds=level_inds,
             )
             return (rng, train_state), metrics
-        
+
         def on_mutate_levels(rng: chex.PRNGKey, train_state: TrainState):
             """
                 This mutates the previous batch of replay levels and potentially adds them to the level buffer.
@@ -986,7 +1053,10 @@ def main(config=None, project="JAXUED_TEST"):
             max_returns = compute_max_returns(dones, rewards)
             rng, rng_score = jax.random.split(rng)
             scores = compute_level_scores(rng_score, train_state, child_levels, dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+            sampler, mutation_inserted_inds = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+
+            # Stale embedding: mean [hstate(256), action(1)] over first episode
+            mutation_embeddings = compute_insertion_embeddings(hstates, actions, dones)
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -1018,7 +1088,12 @@ def main(config=None, project="JAXUED_TEST"):
                 "td_error/std": td_errors.std(),
                 "td_error/abs_mean": jnp.abs(td_errors).mean(),
                 "td_error/max": jnp.abs(td_errors).max(),
-                "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),  # mutation step, parent was previous replay
+                "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+                # Lineage tracking: parent buffer indices and where their children landed
+                "mutation_parent_inds": train_state.replay_last_level_inds,  # (num_train_envs,)
+                "mutation_child_inds": mutation_inserted_inds,  # (num_train_envs,) -1 if not inserted
+                "insertion_inds": mutation_inserted_inds,
+                "insertion_embeddings": mutation_embeddings,  # (num_train_envs, 257)
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -1167,10 +1242,16 @@ def main(config=None, project="JAXUED_TEST"):
             print(f"[Resume] WARNING: Failed to load params from {resume_dir}, starting fresh")
 
     # --- Provenance tracking (numpy, outside JAX) ---
-    # origins: 0=organic, 1=LLM seed, 2=LLM mutation
+    # origins: 0=organic, 1=LLM seed, 2=LLM mutation descendant
     # origin_ids: uint64 hash per level for matching across dumps
+    # ancestor_ids: int32 per slot — which LLM seed (0-indexed) this slot descends from
+    #   -1 = organic (no LLM ancestor), 0 = 1st LLM seed, 1 = 2nd, etc.
     _buffer_origins = None      # np.ndarray (capacity,) int32
     _buffer_origin_ids = None   # np.ndarray (capacity,) uint64
+    _buffer_ancestor_ids = None # np.ndarray (capacity,) int32  — LLM seed index (-1=organic)
+    _prev_buffer_hashes = None  # np.ndarray (capacity,) uint64 — snapshot before each eval step
+    # Stale embeddings: mean [hstate(256), action(1)] at insertion time
+    _buffer_embeddings = None   # np.ndarray (capacity, 257) float32
 
     # --- Preload buffer from merged .npz ---
     if config.get("preload_buffer_npz"):
@@ -1207,28 +1288,47 @@ def main(config=None, project="JAXUED_TEST"):
         # Load provenance arrays
         _buffer_origins = np.zeros(capacity, dtype=np.int32)
         _buffer_origin_ids = np.zeros(capacity, dtype=np.uint64)
+        _buffer_ancestor_ids = np.full(capacity, -1, dtype=np.int32)
+        _buffer_embeddings = np.zeros((capacity, 257), dtype=np.float32)
         if "origins" in preload:
             n = min(len(preload["origins"]), capacity)
             _buffer_origins[:n] = preload["origins"][:n]
         if "origin_ids" in preload:
             n = min(len(preload["origin_ids"]), capacity)
             _buffer_origin_ids[:n] = preload["origin_ids"][:n]
+        if "ancestor_ids" in preload:
+            n = min(len(preload["ancestor_ids"]), capacity)
+            _buffer_ancestor_ids[:n] = preload["ancestor_ids"][:n]
+        else:
+            # Backward compat: assign unique ancestor IDs to each injected level
+            # based on its unique origin_id hash
+            injected_mask = _buffer_origins[:pre_size] > 0
+            if injected_mask.any():
+                unique_hashes = np.unique(_buffer_origin_ids[:pre_size][injected_mask])
+                hash_to_id = {h: i for i, h in enumerate(unique_hashes)}
+                for slot in range(pre_size):
+                    if _buffer_origins[slot] > 0:
+                        _buffer_ancestor_ids[slot] = hash_to_id[_buffer_origin_ids[slot]]
+                print(f"[Preload] Inferred {len(unique_hashes)} unique LLM ancestor IDs from origin_ids")
+        if "embeddings" in preload:
+            n = min(len(preload["embeddings"]), capacity)
+            _buffer_embeddings[:n] = preload["embeddings"][:n]
 
         n_injected = int((_buffer_origins[:pre_size] > 0).sum())
-        print(f"[Preload] Loaded {pre_size} levels ({n_injected} injected, "
-              f"{pre_size - n_injected} organic)")
+        unique_ancestors = len(set(_buffer_ancestor_ids[:pre_size][_buffer_origins[:pre_size] > 0].tolist()))
+        print(f"[Preload] Loaded {pre_size} levels ({n_injected} injected from "
+              f"{unique_ancestors} LLM ancestors, {pre_size - n_injected} organic)")
 
     runner_state = (rng_train, train_state)
 
     def dump_buffer(train_state, update_num):
         """Save PLR buffer as .npy (VAE token format) + .npz (full metadata).
 
-        If provenance tracking is active (_buffer_origin_ids is set), computes
-        which injected levels are still present by matching token hashes, and
-        saves origins/origin_ids + survival stats alongside the dump.
+        If provenance tracking is active, saves origins array with exact
+        lineage: 0=organic, 1=original LLM seed, 2=mutation descendant.
+        Ancestor IDs track which specific LLM seed each descendant traces to.
         """
-        import hashlib as _hl
-        nonlocal _buffer_origins, _buffer_origin_ids
+        nonlocal _buffer_origins, _buffer_origin_ids, _buffer_ancestor_ids
 
         sampler = train_state.sampler
         size = int(sampler["size"])
@@ -1247,33 +1347,41 @@ def main(config=None, project="JAXUED_TEST"):
             "update_num": update_num,
         }
 
-        # --- Provenance: match current buffer against injected origin_ids ---
-        if _buffer_origin_ids is not None:
-            # Compute current token hashes
-            current_hashes = np.array([
-                int(_hl.md5(tokens_np[i].tobytes()).hexdigest()[:16], 16)
-                for i in range(size)
-            ], dtype=np.uint64)
+        # --- Provenance: use live-tracked _buffer_origins ---
+        if _buffer_origins is not None:
+            current_origins = _buffer_origins[:size].copy()
+            current_origin_ids = _buffer_origin_ids[:size].copy() if _buffer_origin_ids is not None else np.zeros(size, dtype=np.uint64)
 
-            # Match: which current slots have an origin_id that was injected?
-            injected_ids = set(_buffer_origin_ids[_buffer_origins > 0])
-            current_origins = np.zeros(size, dtype=np.int32)
-            current_origin_ids = current_hashes.copy()
-            for i in range(size):
-                if current_hashes[i] in injected_ids:
-                    current_origins[i] = _buffer_origins[
-                        np.where(_buffer_origin_ids == current_hashes[i])[0][0]
-                    ] if current_hashes[i] in set(_buffer_origin_ids) else 0
-
-            n_survived = int((current_origins > 0).sum())
-            n_original = int((_buffer_origins[:size] > 0).sum()) if _buffer_origins is not None else 0
+            n_original = int((current_origins == 1).sum())
+            n_descendants = int((current_origins == 2).sum())
+            n_lineage = n_original + n_descendants
 
             dump_data["origins"] = current_origins
             dump_data["origin_ids"] = current_origin_ids
-            dump_data["n_injected_survived"] = n_survived
             dump_data["n_injected_original"] = n_original
+            dump_data["n_injected_descendants"] = n_descendants
+            dump_data["n_injected_lineage"] = n_lineage
 
-            print(f"  [Provenance] {n_survived}/{n_original} injected levels still in buffer")
+            # Ancestor IDs: which LLM seed each descendant traces back to
+            if _buffer_ancestor_ids is not None:
+                current_ancestor_ids = _buffer_ancestor_ids[:size].copy()
+                dump_data["ancestor_ids"] = current_ancestor_ids
+                # Per-ancestor breakdown
+                lineage_ancestors = current_ancestor_ids[current_origins > 0]
+                if len(lineage_ancestors) > 0:
+                    unique, counts = np.unique(lineage_ancestors[lineage_ancestors >= 0], return_counts=True)
+                    ancestor_str = ", ".join(f"LLM#{a}:{c}" for a, c in zip(unique, counts))
+                else:
+                    ancestor_str = "none"
+            else:
+                ancestor_str = "n/a"
+
+            # Stale embeddings: 257D [hstate(256), action(1)] at insertion time
+            if _buffer_embeddings is not None:
+                dump_data["embeddings"] = _buffer_embeddings[:size].copy()
+
+            print(f"  [Provenance] {n_original} original + {n_descendants} descendants = "
+                  f"{n_lineage} lineage levels in buffer | ancestors: {ancestor_str}")
 
         if config.get("output_dir"):
             dump_dir = os.path.join(config["output_dir"], "buffer_dumps")
@@ -1291,6 +1399,129 @@ def main(config=None, project="JAXUED_TEST"):
             gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
             _upload_to_gcs(tokens_path, config["gcs_bucket"], f"{gcs_base}/buffer_tokens{tag}.npy")
             _upload_to_gcs(dump_path, config["gcs_bucket"], f"{gcs_base}/buffer_dump{tag}.npz")
+
+    def _compute_buffer_hashes(train_state):
+        """Compute MD5 hashes of all buffer level tokens (numpy, outside JAX)."""
+        import hashlib as _hl
+        sampler = train_state.sampler
+        size = int(sampler["size"])
+        buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
+        tokens = np.asarray(jax.vmap(level_to_tokens)(buffer_levels))
+        hashes = np.zeros(sampler["scores"].shape[0], dtype=np.uint64)
+        for i in range(size):
+            hashes[i] = int(_hl.md5(tokens[i].tobytes()).hexdigest()[:16], 16)
+        return hashes
+
+    def _update_lineage(train_state, metrics):
+        """Exact lineage tracking for mutation descendants of injected levels.
+
+        Uses mutation_parent_inds and mutation_child_inds from the JIT scan
+        to trace exact parent→child relationships. For each mutation step:
+        - mutation_parent_inds[i] = buffer index of parent level
+        - mutation_child_inds[i] = buffer index where child was inserted (-1 if not)
+
+        If parent had origin > 0 (injected/descendant), mark child as origin=2.
+        Also clears origin for any slot whose level was replaced by a non-descendant.
+        """
+        nonlocal _buffer_origins, _buffer_origin_ids, _buffer_ancestor_ids, _prev_buffer_hashes
+        if _buffer_origins is None or _prev_buffer_hashes is None:
+            return
+
+        new_hashes = _compute_buffer_hashes(train_state)
+        size = int(train_state.sampler["size"])
+
+        # Save pre-update origins and ancestors (from BEFORE this window)
+        old_origins = _buffer_origins.copy()
+        old_ancestors = _buffer_ancestor_ids.copy()
+
+        # Detect changed slots (level was evicted and replaced)
+        changed_mask = (new_hashes[:size] != _prev_buffer_hashes[:size])
+        changed_slots = set(np.where(changed_mask)[0].tolist())
+
+        # First: apply exact lineage from mutation parent→child pairs.
+        # We process these BEFORE clearing changed slots, because a changed
+        # slot might be a mutation child that should inherit lineage.
+        # metrics arrays have shape (eval_freq, num_train_envs)
+        parent_inds = np.array(metrics["mutation_parent_inds"])
+        child_inds = np.array(metrics["mutation_child_inds"])
+
+        # Track which changed slots were assigned lineage via mutation
+        lineage_assigned = set()
+
+        n_new_descendants = 0
+        n_mutations_from_lineage = 0
+        n_total_mutations = 0
+
+        for step in range(parent_inds.shape[0]):
+            for env in range(parent_inds.shape[1]):
+                p_idx = int(parent_inds[step, env])
+                c_idx = int(child_inds[step, env])
+                if p_idx < 0 or c_idx < 0:
+                    continue  # not a mutation step, or child wasn't inserted
+                n_total_mutations += 1
+                if old_origins[p_idx] > 0:
+                    n_mutations_from_lineage += 1
+                    n_new_descendants += 1
+                    old_origins[c_idx] = 2
+                    old_ancestors[c_idx] = old_ancestors[p_idx]  # inherit ancestor ID
+                    lineage_assigned.add(c_idx)
+                else:
+                    # Parent was organic; if child landed in a slot that
+                    # previously held lineage, that lineage is now gone
+                    old_origins[c_idx] = 0
+                    old_ancestors[c_idx] = -1
+
+        # Now set final _buffer_origins and _buffer_ancestor_ids:
+        # - Changed slots with lineage assigned → origin=2, ancestor inherited
+        # - Changed slots without lineage → origin=0, ancestor=-1 (evicted)
+        # - Unchanged slots → keep existing origin and ancestor
+        for slot in changed_slots:
+            if slot in lineage_assigned:
+                _buffer_origins[slot] = 2
+                _buffer_ancestor_ids[slot] = old_ancestors[slot]
+            else:
+                _buffer_origins[slot] = 0
+                _buffer_ancestor_ids[slot] = -1
+
+        # Update hashes
+        _buffer_origin_ids[:size] = new_hashes[:size]
+        _prev_buffer_hashes = new_hashes
+
+        n_original = int((_buffer_origins[:size] == 1).sum())
+        n_descendants = int((_buffer_origins[:size] == 2).sum())
+        n_total_lineage = n_original + n_descendants
+
+        # Per-ancestor breakdown
+        lineage_mask = _buffer_origins[:size] > 0
+        lineage_ancestors = _buffer_ancestor_ids[:size][lineage_mask]
+        if len(lineage_ancestors) > 0 and (lineage_ancestors >= 0).any():
+            unique_a, counts_a = np.unique(lineage_ancestors[lineage_ancestors >= 0], return_counts=True)
+            ancestor_breakdown = ", ".join(f"#{a}:{c}" for a, c in zip(unique_a, counts_a))
+        else:
+            ancestor_breakdown = "none"
+
+        print(f"  [Lineage] {n_original} original + {n_descendants} descendants = "
+              f"{n_total_lineage} lineage ({len(changed_slots)} slots changed, "
+              f"{n_new_descendants} new descendants from "
+              f"{n_mutations_from_lineage}/{n_total_mutations} lineage mutations)")
+        print(f"  [Lineage] Per-ancestor: {ancestor_breakdown}")
+
+    def _update_embeddings(metrics):
+        """Store stale 257D embeddings for levels inserted during this eval window."""
+        nonlocal _buffer_embeddings
+        if _buffer_embeddings is None:
+            return
+
+        ins_inds = np.array(metrics["insertion_inds"])      # (eval_freq, num_train_envs)
+        ins_embs = np.array(metrics["insertion_embeddings"]) # (eval_freq, num_train_envs, 257)
+
+        n_stored = 0
+        for step in range(ins_inds.shape[0]):
+            for env in range(ins_inds.shape[1]):
+                slot = int(ins_inds[step, env])
+                if slot >= 0:
+                    _buffer_embeddings[slot] = ins_embs[step, env]
+                    n_stored += 1
 
     # LLM injection setup
     llm_config = LLMInjectionConfig.from_config_dict(config)
@@ -1402,11 +1633,21 @@ def main(config=None, project="JAXUED_TEST"):
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
+
+    # Initialize lineage snapshot if provenance tracking is active
+    if _buffer_origins is not None:
+        _prev_buffer_hashes = _compute_buffer_hashes(runner_state[1])
+
     for eval_step in range(config["num_updates"] // config["eval_freq"]):
         start_time = time.time()
         runner_state, metrics = train_and_eval_step(runner_state, None)
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
+
+        # Update lineage tracking (must run before log_eval so provenance counts are current)
+        _update_lineage(runner_state[1], metrics)
+        _update_embeddings(metrics)
+
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
 
         # Pairwise diversity logging
@@ -1414,6 +1655,7 @@ def main(config=None, project="JAXUED_TEST"):
 
         # LLM injection hook
         if llm_injector is not None:
+            llm_injector._buffer_embeddings = _buffer_embeddings
             runner_state = llm_injector.maybe_inject(runner_state, eval_step)
 
         if config["checkpoint_save_interval"] > 0:
@@ -1472,7 +1714,10 @@ def main(config=None, project="JAXUED_TEST"):
     print(f"  Unsolved (0%): {(solve_rates == 0).sum()} | Fully solved (100%): {(solve_rates == 1.0).sum()}")
 
     # Save evaluation results
-    dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+    if config.get("output_dir"):
+        dump_dir = os.path.join(config["output_dir"], "buffer_dumps")
+    else:
+        dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
     os.makedirs(dump_dir, exist_ok=True)
     gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
     eval_path = os.path.join(dump_dir, "buffer_eval.npz")
@@ -1556,7 +1801,10 @@ def main(config=None, project="JAXUED_TEST"):
                 return mean
 
             # Collect all periodic buffer dumps + final
-            dump_dir_pca = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
+            if config.get("output_dir"):
+                dump_dir_pca = os.path.join(config["output_dir"], "buffer_dumps")
+            else:
+                dump_dir_pca = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
             snapshot_labels = []
             snapshot_latents = []
             snapshot_scores = []
@@ -1640,6 +1888,10 @@ if __name__=="__main__":
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--wandb_group", type=str, default=None,
                         help="Wandb run group (defaults to run_name if not set)")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Wandb entity/team (default: use wandb default)")
+    parser.add_argument("--wandb_update_offset", type=int, default=0,
+                        help="Offset added to num_updates in wandb logs (e.g. 10000 for warmstart)")
     parser.add_argument("--seed", type=int, default=0)
     # === Train vs Eval ===
     parser.add_argument("--mode", type=str, default='train')
@@ -1787,7 +2039,7 @@ if __name__=="__main__":
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])
-    config["group_name"] = ''.join([str(config[key]) for key in sorted([a.dest for a in parser._action_groups[2]._group_actions])])
+    config["group_name"] = config.get("wandb_group") or config.get("run_name") or ""
     
     if config['mode'] == 'eval':
         os.environ['WANDB_MODE'] = 'disabled'

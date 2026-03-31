@@ -150,6 +150,8 @@ def evaluate_candidate(
     stored_max_return: Optional[float] = None,
     baseline_stats: Optional[dict] = None,
     cenie_model: Optional[object] = None,
+    ref_embeddings: Optional[np.ndarray] = None,
+    buffer_embeddings: Optional[np.ndarray] = None,
 ) -> GateResult:
     """Evaluate a candidate maze's trajectory against reference mazes.
 
@@ -200,6 +202,43 @@ def evaluate_candidate(
 
     compute_diversity = thresholds.min_diversity is not None
     is_cenie = thresholds.diversity_metric == "cenie"
+    is_embedding_l2 = thresholds.diversity_metric == "embedding_l2"
+
+    # --- Embedding L2 diversity (min L2 distance to buffer/ref embeddings) ---
+    # Always compute if embedding_l2 is selected, even when min_diversity is null
+    # (so we can log distance stats for calibration)
+    if is_embedding_l2:
+        from metrics.standalone.cenie import extract_state_action_pairs
+        pairs = extract_state_action_pairs(candidate_trajectory)  # (T_ep, 257)
+        if pairs is not None and len(pairs) > 0:
+            cand_emb = pairs.mean(axis=0)  # mean 257D embedding
+            # Compare against buffer embeddings first, then ref embeddings
+            all_embs = []
+            if buffer_embeddings is not None:
+                # Filter out zero rows (empty slots)
+                nonzero_mask = np.any(buffer_embeddings != 0, axis=1)
+                if nonzero_mask.any():
+                    all_embs.append(buffer_embeddings[nonzero_mask])
+            if ref_embeddings is not None:
+                all_embs.append(ref_embeddings)
+            if all_embs:
+                all_embs = np.concatenate(all_embs, axis=0)
+                distances = np.linalg.norm(all_embs - cand_emb[None, :], axis=1)
+                min_dist = float(distances.min())
+                mean_dist = float(distances.mean())
+                max_dist = float(distances.max())
+                median_dist = float(np.median(distances))
+            else:
+                min_dist = float("inf")
+                mean_dist = float("inf")
+                max_dist = float("inf")
+                median_dist = float("inf")
+            result.summary["min_diversity"] = min_dist
+            result.summary["mean_diversity"] = mean_dist
+            result.summary["max_diversity"] = max_dist
+            result.summary["median_diversity"] = median_dist
+            result.summary["embedding_l2_n_compared"] = len(all_embs) if isinstance(all_embs, np.ndarray) else 0
+            result.summary["diversity_metric"] = "embedding_l2"
 
     # --- CENIE novelty (standalone, uses pre-fitted GMM) ---
     if compute_diversity and is_cenie:
@@ -212,8 +251,8 @@ def evaluate_candidate(
             result.summary["mean_diversity"] = novelty_info.novelty
             result.summary["diversity_metric"] = "cenie"
 
-    # --- Pairwise metrics (only compute what's needed, skip for CENIE) ---
-    if not is_cenie:
+    # --- Pairwise metrics (only compute what's needed, skip for CENIE/embedding_l2) ---
+    if not is_cenie and not is_embedding_l2:
         for ref, label in zip(reference_trajectories, reference_labels):
             pair = PairGateMetrics(ref_label=label)
 
@@ -258,7 +297,18 @@ def evaluate_candidate(
         elif result.regret_info is not None:
             check_regret(result.regret_info, thresholds.difficulty_threshold, issues)
 
-    if compute_diversity and is_cenie:
+    if compute_diversity and is_embedding_l2:
+        min_dist = result.summary.get("min_diversity", float("inf"))
+        if min_dist < thresholds.min_diversity:
+            issues.append(
+                f"Maze produces experiences too similar to existing buffer levels "
+                f"(embedding L2 distance = {min_dist:.4f}, "
+                f"need > {thresholds.min_diversity:.4f}).\n"
+                f"  The agent's LSTM hidden state trajectory on this maze is too close "
+                f"to an existing level in the buffer.\n"
+                f"  Design a maze that forces the agent into distinctly different states."
+            )
+    elif compute_diversity and is_cenie:
         novelty = result.summary.get("cenie_novelty", 0.0)
         if novelty < thresholds.min_diversity:
             issues.append(

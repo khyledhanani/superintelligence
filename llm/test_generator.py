@@ -239,7 +239,7 @@ def select_references_diverse(
         idx = int(pool_indices[s])
         logger.info(
             f"  Diverse ref {i+1}: buffer idx={idx}, "
-            f"regret={float(active_scores[idx]):.4f}, "
+            f"score={float(active_scores[idx]):.4f}, "
             f"min_dist={min(dist[s, o] for o in selected if o != s):.4f}"
         )
 
@@ -1127,8 +1127,11 @@ def run_test(args):
     """Run the maze generation test."""
 
     # Load buffer
+    import time as _time
+    _t_setup = _time.time()
     logger.info(f"Loading buffer from {args.buffer_path}...")
     buf = load_buffer(args.buffer_path)
+    print(f"[TIMING] Buffer load: {_time.time() - _t_setup:.1f}s", flush=True)
     size = int(buf["size"])
     tokens = buf["tokens"]
     scores = buf["scores"]
@@ -1138,7 +1141,9 @@ def run_test(args):
     if args.inject_metrics or args.strategy == "diverse":
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
+        _t_agent = _time.time()
         evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
+        print(f"[TIMING] Agent load: {_time.time() - _t_agent:.1f}s", flush=True)
 
     # Select reference mazes
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
@@ -1160,7 +1165,9 @@ def run_test(args):
             ref_levels.append(tokens_to_level_obj(tok))
 
         logger.info(f"Rolling out agent on {len(ref_levels)} reference levels...")
+        _t_ref = _time.time()
         ref_trajectories = evaluator.evaluate_levels(ref_levels)
+        print(f"[TIMING] Reference rollouts ({len(ref_levels)} levels): {_time.time() - _t_ref:.1f}s", flush=True)
         logger.info("Reference trajectories collected")
 
     # Build references with metrics (configurable via prompt_metrics/pairwise_metrics)
@@ -1192,6 +1199,7 @@ def run_test(args):
     global_metrics = None
     if args.inject_buffer_stats:
         active_scores = scores[:size]
+        score_label = "Learnability (SFL)" if args.difficulty_metric == "sfl" else "Regret"
         global_metrics = [
             MetricEntry(
                 name="Buffer Size",
@@ -1199,19 +1207,19 @@ def run_test(args):
                 description="Number of levels in the replay buffer",
             ),
             MetricEntry(
-                name="Mean Regret",
+                name=f"Mean {score_label}",
                 value=float(np.mean(active_scores)),
-                description="Average regret across all buffer levels",
+                description=f"Average {score_label.lower()} across all buffer levels",
             ),
             MetricEntry(
-                name="Max Regret",
+                name=f"Max {score_label}",
                 value=float(np.max(active_scores)),
-                description="Highest regret level in buffer",
+                description=f"Highest {score_label.lower()} level in buffer",
             ),
             MetricEntry(
-                name="Score Std Dev",
+                name=f"{score_label} Std Dev",
                 value=float(np.std(active_scores)),
-                description="Spread of regret scores",
+                description=f"Spread of {score_label.lower()} scores",
             ),
         ]
 
@@ -1301,6 +1309,24 @@ def run_test(args):
                     logger.info(f"CENIE trajectories collected ({n_cenie_levels} levels)")
                 cenie_model = fit_cenie_model(cenie_trajs)
 
+        # Compute reference embeddings for embedding_l2 diversity metric
+        ref_embeddings = None
+        buffer_embeddings = None
+        if args.diversity_metric == "embedding_l2" and ref_trajectories:
+            from metrics.standalone.cenie import extract_state_action_pairs
+            ref_embs = []
+            for traj in ref_trajectories:
+                pairs = extract_state_action_pairs(traj)
+                if pairs is not None and len(pairs) > 0:
+                    ref_embs.append(pairs.mean(axis=0))
+            if ref_embs:
+                ref_embeddings = np.stack(ref_embs)
+                logger.info(f"Computed {len(ref_embs)} reference embeddings for L2 diversity")
+            # Also compute buffer-wide embeddings from stored data if available
+            if "embeddings" in buf:
+                buffer_embeddings = np.array(buf["embeddings"][:size])
+                logger.info(f"Loaded {size} buffer embeddings for L2 diversity")
+
         results = generator.generate_batch_with_feedback(
             n=args.n,
             agent_evaluator=evaluator,
@@ -1314,6 +1340,8 @@ def run_test(args):
             max_diversity_retries=args.max_diversity_retries,
             n_rollouts=args.n_rollouts,
             cenie_model=cenie_model,
+            ref_embeddings=ref_embeddings,
+            buffer_embeddings=buffer_embeddings,
         )
     else:
         print("\n" + "=" * 60)
@@ -1546,9 +1574,9 @@ def main():
                         default=gate_cfg.get("min_diversity", cfg.get("min_diversity")),
                         help="Min mean pairwise diversity vs references (null = disabled)")
     parser.add_argument("--diversity-metric",
-                        choices=["td_error_emd", "experience_divergence", "position_dtw", "cenie"],
+                        choices=["td_error_emd", "experience_divergence", "position_dtw", "cenie", "embedding_l2"],
                         default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "td_error_emd")),
-                        help="Diversity metric: pairwise (td_error_emd, experience_divergence, position_dtw) or buffer-wide (cenie)")
+                        help="Diversity metric: pairwise (td_error_emd, experience_divergence, position_dtw), buffer-wide (cenie), or embedding_l2")
     parser.add_argument("--embedding-metric",
                         choices=["td_error_emd"],
                         default=cfg.get("embedding_metric", "td_error_emd"),

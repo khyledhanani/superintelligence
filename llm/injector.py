@@ -323,6 +323,25 @@ class LLMInjectionManager:
                 ref_trajectories.append(traj)
                 ref_labels.append(ref.label)
 
+        # Fit CENIE model if using cenie diversity metric
+        # Precompute reference embeddings for L2 embedding diversity
+        ref_embeddings = None
+        if gate_active and self.config.diversity_metric == "embedding_l2" and ref_trajectories:
+            from metrics.standalone.cenie import extract_state_action_pairs
+            ref_embs = []
+            for traj in ref_trajectories:
+                pairs = extract_state_action_pairs(traj)  # (T_ep, 257)
+                if pairs is not None and len(pairs) > 0:
+                    ref_embs.append(pairs.mean(axis=0))  # mean 257D embedding
+            if ref_embs:
+                ref_embeddings = np.stack(ref_embs)  # (n_refs, 257)
+                logger.info(f"[LLM] Computed {len(ref_embs)} reference embeddings for L2 diversity")
+            else:
+                logger.warning("[LLM] No reference embeddings computed — diversity gate disabled")
+
+        # Also pass buffer embeddings if available for broader coverage
+        buffer_embeddings = getattr(self, '_buffer_embeddings', None)
+
         # Build DiversityThresholds from config (gate path)
         # Compute effective difficulty threshold based on gate mode
         buffer_size = int(np.asarray(sampler["size"]))
@@ -384,6 +403,11 @@ class LLMInjectionManager:
         gate_rejected = 0
         diversity_scores = []
         difficulty_scores = []
+        # Per-accepted-seed embedding L2 distance stats
+        emb_min_dists = []
+        emb_mean_dists = []
+        emb_max_dists = []
+        emb_median_dists = []
 
         for i in range(seeds_generated):
             if gate_active:
@@ -397,6 +421,8 @@ class LLMInjectionManager:
                     diversity_thresholds=thresholds,
                     max_diversity_retries=self.config.max_diversity_retries,
                     n_rollouts=self.config.n_rollouts_gate,
+                    ref_embeddings=ref_embeddings,
+                    buffer_embeddings=buffer_embeddings,
                 )
                 if not result.success:
                     error_detail = "; ".join(result.errors) if result.errors else "unknown error"
@@ -416,6 +442,12 @@ class LLMInjectionManager:
                     diversity_scores.append(float(gate_metrics.get("mean_diversity", 0.0)))
                     difficulty_scores.append(float(gate_metrics.get("regret", 0.0)))
                     seed_sfl_scores.append(float(gate_metrics.get("learnability", 0.0)))
+                    # Embedding L2 distance stats
+                    if "min_diversity" in gate_metrics and gate_metrics.get("diversity_metric") == "embedding_l2":
+                        emb_min_dists.append(float(gate_metrics["min_diversity"]))
+                        emb_mean_dists.append(float(gate_metrics.get("mean_diversity", 0.0)))
+                        emb_max_dists.append(float(gate_metrics.get("max_diversity", 0.0)))
+                        emb_median_dists.append(float(gate_metrics.get("median_diversity", 0.0)))
                 else:
                     gate_rejected += 1
                     logger.info(f"[LLM] Seed {i+1} gate rejected: {result.diversity_issues}")
@@ -641,6 +673,15 @@ class LLMInjectionManager:
             "llm/difficulty_gate_mode": mode,
             "llm/diversity_gate_mode": div_mode,
         }
+
+        # Embedding L2 distance stats across accepted seeds
+        if emb_min_dists:
+            log_payload["llm/emb_l2_min_of_mins"] = float(np.min(emb_min_dists))
+            log_payload["llm/emb_l2_mean_of_mins"] = float(np.mean(emb_min_dists))
+            log_payload["llm/emb_l2_max_of_mins"] = float(np.max(emb_min_dists))
+            log_payload["llm/emb_l2_mean_of_means"] = float(np.mean(emb_mean_dists))
+            log_payload["llm/emb_l2_mean_of_medians"] = float(np.mean(emb_median_dists))
+            log_payload["llm/emb_l2_mean_of_maxs"] = float(np.mean(emb_max_dists))
 
         # Add wall_map hash table to log_payload for audit trail (EXPT-02)
         # Guard against empty list to avoid logging empty WandB tables.

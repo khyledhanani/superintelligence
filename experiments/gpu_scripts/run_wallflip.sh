@@ -13,7 +13,7 @@ export WANDB_ENTITY=romain-hautier-university-college-london-ucl-
 
 TARGET_ELIGIBLE=${1:-1000}; shift || true
 INJECT_PCTS=${1:-5,10,15,20,25}; shift || true
-NUM_EDITS=${1:-3}; shift || true
+NUM_EDITS=${1:-5}; shift || true
 SEEDS=("${@}")
 if [ ${#SEEDS[@]} -eq 0 ]; then SEEDS=(0 1 2); fi
 
@@ -24,9 +24,9 @@ REPO_ROOT=/cs/student/msc/csml/2025/rhautier/Documents/jaxued/jaxued
 GCS_BUCKET="ucl-ued-project-bucket"
 GCS_PROJECT="ucl-ued-project"
 GCS_PREFIX="llm-exp/injection"
-LOCAL_DATA="/tmp/injection_data"
+LOCAL_DATA="/cs/student/project_msc/2025/csml/rhautier/injection_data"
 TRAIN_UPDATES=10000
-WANDB_GROUP="wallflip_e${NUM_EDITS}_t${TARGET_ELIGIBLE}"
+# WANDB_GROUP is set per injection % inside the loop
 
 # --- Step 0: Fetch data from GCS ---
 echo "=== Fetching data from GCS ==="
@@ -78,9 +78,10 @@ for SEED in "${SEEDS[@]}"; do
         PCT_TAG=$(basename "$PCT_FILE" .npz | sed 's/merged_buffer_//')
         TRAIN_RUN="inject_wallflip_e${NUM_EDITS}_${PCT_TAG}_seed${SEED}"
         TRAIN_OUT="${OUTPUT_DIR}/training_${PCT_TAG}"
+        WANDB_GROUP="wallflip_e${NUM_EDITS}_${PCT_TAG}"
 
         echo ""
-        echo "--- [Step 2] Training: $TRAIN_RUN ---"
+        echo "--- [Step 2] Training: $TRAIN_RUN (group: $WANDB_GROUP) ---"
         $PY $SCRIPT \
             --n_walls 25 \
             --use_accel \

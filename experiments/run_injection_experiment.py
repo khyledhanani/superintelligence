@@ -128,6 +128,37 @@ def score_levels_sfl(evaluator, levels, n_rollouts=10):
     return scores
 
 
+def compute_embedding(evaluator, level, n_rollouts=10):
+    """Compute 257D behavior embedding for a level: mean LSTM hstate (256) + mean action (1)."""
+    traj = evaluator.evaluate_level_multi_rollout(level, n_rollouts=n_rollouts)
+    hstates = traj["hstates"]   # (T,) -> actually (T, 256) from best rollout
+    actions = traj["actions"]   # (T,)
+    dones = traj["dones"]       # (T,)
+
+    # Mask to first episode only
+    done_idx = np.where(dones)[0]
+    end = done_idx[0] + 1 if len(done_idx) > 0 else len(dones)
+    h_mean = hstates[:end].mean(axis=0)  # (256,)
+    a_mean = np.array([actions[:end].astype(np.float32).mean()])  # (1,)
+    return np.concatenate([h_mean, a_mean]), traj
+
+
+def score_and_embed_levels(evaluator, levels, n_rollouts=10):
+    """Score levels by SFL and compute 257D embeddings in a single pass.
+
+    Returns (scores, embeddings) — avoids double rollouts when both are needed.
+    """
+    n = len(levels)
+    scores = np.zeros(n)
+    embeddings = np.zeros((n, 257), dtype=np.float32)
+    for i, level in enumerate(levels):
+        emb, traj = compute_embedding(evaluator, level, n_rollouts=n_rollouts)
+        p = traj["solve_rate"]
+        scores[i] = p * (1.0 - p)
+        embeddings[i] = emb
+    return scores, embeddings
+
+
 def token_hash(tokens_array):
     """Deterministic 64-bit hash of a token array for provenance tracking."""
     return int(hashlib.md5(tokens_array.tobytes()).hexdigest()[:16], 16)
@@ -140,6 +171,21 @@ def token_hash(tokens_array):
 def run_experiment(args):
     t0 = time.time()
     inject_pcts = [float(x) / 100.0 for x in args.inject_pcts]
+
+    # --- wandb ---
+    if not args.no_wandb:
+        import wandb
+        wandb_config = vars(args).copy()
+        wandb_config["inject_pcts"] = inject_pcts
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            group=args.wandb_group,
+            name=args.wandb_name or f"{args.mutation_strategy}_div{args.min_embedding_diversity}_seed{args.seed}",
+            config=wandb_config,
+        )
+    else:
+        wandb = None
 
     print(f"\n{'='*60}")
     print(f"Injection Experiment: {args.mutation_strategy}")
@@ -185,10 +231,18 @@ def run_experiment(args):
     eligible_levels = []
     eligible_scores = []
     eligible_seed_indices = []
+    eligible_embeddings = []  # 257D embeddings for diversity gating
     total_generated = 0
     total_scored = 0
+    total_diversity_rejected = 0
     round_num = 0
     batch_per_seed = args.batch_per_seed  # mutants per seed per round
+    min_emb_div = args.min_embedding_diversity  # L2 threshold (0 = disabled)
+
+    if min_emb_div > 0:
+        print(f"  Embedding diversity gate ENABLED: min L2 distance = {min_emb_div:.3f}")
+    else:
+        print(f"  Embedding diversity gate DISABLED")
 
     while len(eligible_levels) < args.target_eligible and round_num < args.max_rounds:
         round_num += 1
@@ -209,20 +263,54 @@ def run_experiment(args):
         batch_levels = [pair[0] for pair in mutant_pairs]
         batch_seed_idx = np.array([pair[1] for pair in mutant_pairs])
 
-        print(f"  Scoring {n_gen} mutants ({args.n_scoring_rollouts} rollouts each)...")
-        batch_scores = score_levels_sfl(evaluator, batch_levels, n_rollouts=args.n_scoring_rollouts)
+        # Score + compute embeddings in a single pass (no double rollouts)
+        if min_emb_div > 0:
+            print(f"  Scoring + embedding {n_gen} mutants ({args.n_scoring_rollouts} rollouts each)...")
+            batch_scores, batch_embeddings = score_and_embed_levels(
+                evaluator, batch_levels, n_rollouts=args.n_scoring_rollouts)
+        else:
+            print(f"  Scoring {n_gen} mutants ({args.n_scoring_rollouts} rollouts each)...")
+            batch_scores = score_levels_sfl(evaluator, batch_levels, n_rollouts=args.n_scoring_rollouts)
+            batch_embeddings = None
         total_scored += n_gen
 
-        # Filter eligible
-        mask = batch_scores > buffer_min_score
+        # Filter by SFL score
+        sfl_mask = batch_scores > buffer_min_score
+        n_sfl_pass = int(sfl_mask.sum())
+
+        # Filter by embedding diversity (greedy: each accepted must be > threshold from all prior)
+        n_div_rejected = 0
+        mask = sfl_mask.copy()
+        if min_emb_div > 0 and n_sfl_pass > 0:
+            # Pre-stack accepted embeddings once (updated within batch as we accept)
+            accepted_arr = np.stack(eligible_embeddings) if eligible_embeddings else None
+            for i in np.where(sfl_mask)[0]:
+                emb_i = batch_embeddings[i]
+                if accepted_arr is not None:
+                    dists = np.linalg.norm(accepted_arr - emb_i, axis=1)
+                    min_dist = dists.min()
+                    if min_dist < min_emb_div:
+                        mask[i] = False
+                        n_div_rejected += 1
+                        continue
+                # Accepted — append to running array for within-batch checks
+                accepted_arr = (np.vstack([accepted_arr, emb_i[None]])
+                                if accepted_arr is not None
+                                else emb_i[None])
+
+            total_diversity_rejected += n_div_rejected
+
         n_new = int(mask.sum())
+        div_str = f", {n_div_rejected} diversity-rejected" if min_emb_div > 0 else ""
         print(f"  Eligible this round: {n_new}/{n_gen} "
-              f"(yield {n_new/max(n_gen,1):.0%})")
+              f"(SFL pass: {n_sfl_pass}{div_str}, yield {n_new/max(n_gen,1):.0%})")
 
         for i in np.where(mask)[0]:
             eligible_levels.append(batch_levels[i])
             eligible_scores.append(batch_scores[i])
             eligible_seed_indices.append(batch_seed_idx[i])
+            if min_emb_div > 0:
+                eligible_embeddings.append(batch_embeddings[i])
 
         # Per-seed breakdown this round
         for s in range(n_seeds):
@@ -240,6 +328,19 @@ def run_experiment(args):
     print(f"  Rounds: {round_num}, total generated: {total_generated}, "
           f"total scored: {total_scored}")
     print(f"  Eligible: {n_eligible} (overall yield {n_eligible/max(total_scored,1):.0%})")
+    if min_emb_div > 0:
+        print(f"  Diversity-rejected: {total_diversity_rejected} "
+              f"(threshold: {min_emb_div:.3f} L2)")
+
+    if wandb is not None:
+        wandb.log({
+            "generation/rounds": round_num,
+            "generation/total_generated": total_generated,
+            "generation/total_scored": total_scored,
+            "generation/n_eligible": n_eligible,
+            "generation/yield_pct": n_eligible / max(total_scored, 1),
+            "generation/total_diversity_rejected": total_diversity_rejected,
+        })
 
     if n_eligible == 0:
         print("  WARNING: No eligible mutants found! Saving empty results.")
@@ -255,14 +356,33 @@ def run_experiment(args):
             "seed": args.seed,
             "elapsed_s": time.time() - t0,
         }, open(os.path.join(args.output_dir, "experiment_log.json"), "w"), indent=2)
+        if wandb is not None:
+            wandb.finish()
         return
 
     if n_eligible > 0:
         print(f"  Eligible SFL: mean={eligible_scores.mean():.4f}, "
               f"range=[{eligible_scores.min():.4f}, {eligible_scores.max():.4f}]")
 
-    # Rank all eligible by score (best first)
-    rank_order = np.argsort(eligible_scores)[::-1]
+    # Round-robin per-ancestor selection (best SFL first within each ancestor)
+    # This ensures equal representation across LLM seeds rather than letting
+    # one high-scoring ancestor dominate the mutation pool.
+    unique_ancestors = np.unique(eligible_seed_indices)
+    per_ancestor = {}
+    for a in unique_ancestors:
+        mask = eligible_seed_indices == a
+        a_indices = np.where(mask)[0]
+        # Sort this ancestor's mutations by score (best first)
+        a_sorted = a_indices[np.argsort(eligible_scores[a_indices])[::-1]]
+        per_ancestor[a] = list(a_sorted)
+
+    rank_order = []
+    while any(len(v) > 0 for v in per_ancestor.values()):
+        for a in unique_ancestors:
+            if per_ancestor[a]:
+                rank_order.append(per_ancestor[a].pop(0))
+    rank_order = np.array(rank_order)
+
     eligible_levels = [eligible_levels[i] for i in rank_order]
     eligible_scores = eligible_scores[rank_order]
     eligible_seed_indices = eligible_seed_indices[rank_order]
@@ -274,14 +394,20 @@ def run_experiment(args):
     # Save full eligible pool
     eligible_tokens = np.stack([np.asarray(level_to_tokens(l)) for l in eligible_levels])
     eligible_origin_ids = np.array([token_hash(eligible_tokens[i]) for i in range(len(eligible_tokens))])
-    np.savez(
-        os.path.join(args.output_dir, "eligible_pool.npz"),
+    pool_data = dict(
         tokens=eligible_tokens,
         scores=eligible_scores,
         seed_indices=eligible_seed_indices,
         origin_ids=eligible_origin_ids,
     )
-    print(f"  Saved eligible_pool.npz: {n_eligible} levels")
+    if eligible_embeddings:
+        pool_data["embeddings"] = np.stack(eligible_embeddings)
+    np.savez(
+        os.path.join(args.output_dir, "eligible_pool.npz"),
+        **pool_data,
+    )
+    print(f"  Saved eligible_pool.npz: {n_eligible} levels"
+          f"{' (with embeddings)' if eligible_embeddings else ''}")
 
     # Original buffer tokens + origins
     orig_tokens = buffer_raw["tokens"].copy()
@@ -289,6 +415,15 @@ def run_experiment(args):
     orig_timestamps = buffer_raw.get("timestamps", np.zeros(len(orig_scores), dtype=np.int32))
     orig_origins = np.zeros(len(orig_scores), dtype=np.int32)  # 0 = organic
     orig_origin_ids = np.zeros(len(orig_scores), dtype=np.uint64)
+    orig_ancestor_ids = np.full(len(orig_scores), -1, dtype=np.int32)  # -1 = organic
+
+    # Score original LLM seeds so they can also be injected
+    print(f"\n  Scoring {n_seeds} original LLM seeds...")
+    seed_tokens = np.stack([np.asarray(level_to_tokens(s)) for s in seeds])
+    seed_scores = score_levels_sfl(evaluator, seeds, n_rollouts=args.n_scoring_rollouts)
+    seed_origin_ids = np.array([token_hash(seed_tokens[i]) for i in range(n_seeds)])
+    print(f"  LLM seed SFL: mean={seed_scores.mean():.4f}, "
+          f"range=[{seed_scores.min():.4f}, {seed_scores.max():.4f}]")
 
     # Sorted buffer indices (worst first) for replacement
     sorted_buf_idx = np.argsort(orig_scores[:buffer_size])
@@ -296,15 +431,10 @@ def run_experiment(args):
     injection_summary = {}
 
     for pct in inject_pcts:
-        n_inject = min(int(pct * buffer_size), n_eligible)
-        if n_inject == 0:
-            print(f"  {pct:.0%}: skipped (not enough eligible)")
+        n_inject_total = int(pct * buffer_size)
+        if n_inject_total == 0:
+            print(f"  {pct:.0%}: skipped (zero slots)")
             continue
-
-        # Take top n_inject from ranked eligible pool
-        inj_tokens = eligible_tokens[:n_inject]
-        inj_scores = eligible_scores[:n_inject]
-        inj_origin_ids = eligible_origin_ids[:n_inject]
 
         # Copy buffer and replace worst slots
         merged_tokens = orig_tokens.copy()
@@ -312,14 +442,38 @@ def run_experiment(args):
         merged_timestamps = orig_timestamps.copy()
         merged_origins = orig_origins.copy()
         merged_origin_ids = orig_origin_ids.copy()
+        merged_ancestor_ids = orig_ancestor_ids.copy()
 
-        replace_indices = sorted_buf_idx[:n_inject]
-        for i, idx in enumerate(replace_indices):
+        # First inject original LLM seeds (origin=1)
+        n_originals = min(n_seeds, n_inject_total)
+        replace_idx = 0
+        for i in range(n_originals):
+            idx = sorted_buf_idx[replace_idx]
+            merged_tokens[idx] = seed_tokens[i]
+            merged_scores[idx] = float(seed_scores[i])
+            merged_origins[idx] = 1  # 1 = LLM seed (original)
+            merged_origin_ids[idx] = seed_origin_ids[i]
+            merged_ancestor_ids[idx] = i  # seed index
+            replace_idx += 1
+
+        # Then inject mutations (origin=2) in remaining slots
+        n_mutations = min(n_inject_total - n_originals, n_eligible)
+        inj_tokens = eligible_tokens[:n_mutations]
+        inj_scores = eligible_scores[:n_mutations]
+        inj_origin_ids_mut = eligible_origin_ids[:n_mutations]
+        inj_seed_indices = eligible_seed_indices[:n_mutations]
+
+        for i in range(n_mutations):
+            idx = sorted_buf_idx[replace_idx]
             merged_tokens[idx] = inj_tokens[i]
             merged_scores[idx] = float(inj_scores[i])
             merged_origins[idx] = 2  # 2 = LLM mutation
-            merged_origin_ids[idx] = inj_origin_ids[i]
+            merged_origin_ids[idx] = inj_origin_ids_mut[i]
+            merged_ancestor_ids[idx] = int(inj_seed_indices[i])
+            replace_idx += 1
 
+        n_injected = n_originals + n_mutations
+        all_inj_scores = np.concatenate([seed_scores[:n_originals], inj_scores])
         pct_tag = f"{int(pct * 100)}pct"
         merged_path = os.path.join(args.output_dir, f"merged_buffer_{pct_tag}.npz")
         np.savez_compressed(
@@ -329,21 +483,25 @@ def run_experiment(args):
             timestamps=merged_timestamps,
             origins=merged_origins,
             origin_ids=merged_origin_ids,
+            ancestor_ids=merged_ancestor_ids,
             size=buffer_size,
             update_num=buffer_raw.get("update_num", 0),
         )
 
         injection_summary[pct_tag] = {
             "inject_pct": pct,
-            "n_injected": n_inject,
-            "injected_score_mean": float(inj_scores.mean()),
-            "injected_score_min": float(inj_scores.min()),
-            "replaced_score_max": float(orig_scores[replace_indices].max()),
+            "n_injected": n_injected,
+            "n_originals": n_originals,
+            "n_mutations": n_mutations,
+            "injected_score_mean": float(all_inj_scores.mean()),
+            "injected_score_min": float(all_inj_scores.min()),
+            "replaced_score_max": float(orig_scores[sorted_buf_idx[:n_injected]].max()),
             "path": merged_path,
         }
-        print(f"  {pct:.0%}: injected {n_inject} levels "
-              f"(SFL [{inj_scores.min():.4f}, {inj_scores.max():.4f}], "
-              f"replaced buffer slots with score ≤ {orig_scores[replace_indices].max():.4f})")
+        print(f"  {pct:.0%}: injected {n_injected} levels "
+              f"({n_originals} originals + {n_mutations} mutations, "
+              f"SFL [{all_inj_scores.min():.4f}, {all_inj_scores.max():.4f}], "
+              f"replaced buffer slots with score ≤ {orig_scores[sorted_buf_idx[:n_injected]].max():.4f})")
 
     # --- Save experiment log ---
     elapsed = time.time() - t0
@@ -363,6 +521,8 @@ def run_experiment(args):
         "eligible_score_mean": float(eligible_scores.mean()),
         "eligible_score_std": float(eligible_scores.std()),
         "injections": injection_summary,
+        "min_embedding_diversity": min_emb_div,
+        "total_diversity_rejected": total_diversity_rejected,
         "n_scoring_rollouts": args.n_scoring_rollouts,
         "agent_checkpoint": args.agent_checkpoint_dir,
         "buffer_npz": args.buffer_npz,
@@ -372,6 +532,10 @@ def run_experiment(args):
     }
     with open(os.path.join(args.output_dir, "experiment_log.json"), "w") as f:
         json.dump(experiment_log, f, indent=2)
+
+    if wandb is not None:
+        wandb.log(experiment_log)
+        wandb.finish()
 
     print(f"\n[Done] {elapsed:.1f}s")
     print(f"  Output: {args.output_dir}")
@@ -422,13 +586,29 @@ if __name__ == "__main__":
     parser.add_argument("--vae_sigma", type=float, default=0.5,
                         help="Noise sigma for VAE mutation strategies")
 
-    # Scoring
+    # Scoring & diversity
     parser.add_argument("--n_scoring_rollouts", type=int, default=10,
                         help="Rollouts per mutant for SFL scoring")
+    parser.add_argument("--min_embedding_diversity", type=float, default=0.35,
+                        help="Min L2 distance in 257D embedding space between accepted "
+                             "mutations. Set to 0 to disable. Default 0.35 matches organic "
+                             "buffer 1-NN p25.")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="experiments/results/default")
     parser.add_argument("--seed", type=int, default=0)
+
+    # wandb
+    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="JAXUED_LLM_INJECTION",
+                        help="wandb project name")
+    parser.add_argument("--wandb_entity", type=str,
+                        default="romain-hautier-university-college-london-ucl-",
+                        help="wandb entity/team")
+    parser.add_argument("--wandb_group", type=str, default=None,
+                        help="wandb group name (e.g. 'diversity_gate_v1')")
+    parser.add_argument("--wandb_name", type=str, default=None,
+                        help="wandb run name (auto-generated if omitted)")
 
     # GCS
     parser.add_argument("--gcs_bucket", type=str, default=None,

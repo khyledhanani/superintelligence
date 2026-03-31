@@ -97,7 +97,7 @@ class WallFlipMutator(MutationStrategy):
     n_per_seed solvable mutants are found (with a safety cap).
     """
 
-    def __init__(self, num_edits: int = 3, max_rounds: int = 10):
+    def __init__(self, num_edits: int = 5, max_rounds: int = 10):
         self.num_edits = num_edits
         self.max_rounds = max_rounds
         self._mutate_fn = make_level_mutator_minimax(100)

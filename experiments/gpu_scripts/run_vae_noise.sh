@@ -26,7 +26,7 @@ GCS_PROJECT="ucl-ued-project"
 GCS_PREFIX="llm-exp/injection"
 LOCAL_DATA="/tmp/injection_data"
 TRAIN_UPDATES=10000
-WANDB_GROUP="vaenoise_s${SIGMA}_t${TARGET_ELIGIBLE}"
+# WANDB_GROUP is set per injection % inside the loop
 
 VAE_CKPT="${REPO_ROOT}/vae/runs/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/checkpoints/checkpoint_500000.pkl"
 VAE_CONFIG="${REPO_ROOT}/vae/runs/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/config.yaml"
@@ -83,6 +83,7 @@ for SEED in "${SEEDS[@]}"; do
         PCT_TAG=$(basename "$PCT_FILE" .npz | sed 's/merged_buffer_//')
         TRAIN_RUN="inject_vaenoise_s${SIGMA}_${PCT_TAG}_seed${SEED}"
         TRAIN_OUT="${OUTPUT_DIR}/training_${PCT_TAG}"
+        WANDB_GROUP="vaenoise_s${SIGMA}_${PCT_TAG}"
 
         echo ""
         echo "--- [Step 2] Training: $TRAIN_RUN ---"

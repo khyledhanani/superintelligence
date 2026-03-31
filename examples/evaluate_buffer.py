@@ -93,6 +93,7 @@ def load_checkpoint(checkpoint_dir, checkpoint_step, config):
         num_mutation_updates=0,
         dr_last_level_batch=pholder_level_batch,
         replay_last_level_batch=pholder_level_batch,
+        replay_last_level_inds=jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
         mutation_last_level_batch=pholder_level_batch,
     )
 
