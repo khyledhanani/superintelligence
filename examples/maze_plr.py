@@ -125,6 +125,7 @@ class TrainState(BaseTrainState):
     num_mutation_updates: int
     dr_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
     replay_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
+    replay_last_level_inds: chex.Array = struct.field(pytree_node=True)
     mutation_last_level_batch: chex.ArrayTree = struct.field(pytree_node=True)
 
 # region PPO helper functions
@@ -542,6 +543,37 @@ def compute_score(config, dones, values, max_returns, advantages):
     else:
         raise ValueError(f"Unknown score function: {config['score_function']}")
 
+def slerp_batch(z1, z2, alpha):
+    """Spherical linear interpolation for batched latent vectors.
+
+    Args:
+        z1: (N, D) first latent vectors
+        z2: (N, D) second latent vectors
+        alpha: (N, 1) interpolation coefficients (0 → z1, 1 → z2)
+
+    Returns:
+        (N, D) interpolated vectors preserving norm via SLERP direction + linear norm.
+    """
+    norm1 = jnp.linalg.norm(z1, axis=-1, keepdims=True)  # (N, 1)
+    norm2 = jnp.linalg.norm(z2, axis=-1, keepdims=True)  # (N, 1)
+    z1_n = z1 / jnp.maximum(norm1, 1e-8)
+    z2_n = z2 / jnp.maximum(norm2, 1e-8)
+    # Cosine similarity per row
+    cos_omega = jnp.sum(z1_n * z2_n, axis=-1, keepdims=True)  # (N, 1)
+    cos_omega = jnp.clip(cos_omega, -1.0, 1.0)
+    omega = jnp.arccos(cos_omega)  # (N, 1)
+    sin_omega = jnp.sin(omega)
+    # When vectors are nearly parallel, fall back to linear interpolation
+    safe = sin_omega > 1e-6
+    s1 = jnp.where(safe, jnp.sin((1 - alpha) * omega) / sin_omega, 1 - alpha)
+    s2 = jnp.where(safe, jnp.sin(alpha * omega) / sin_omega, alpha)
+    # Interpolate direction via SLERP, norm via linear
+    z_dir = s1 * z1_n + s2 * z2_n
+    norm_interp = (1 - alpha) * norm1 + alpha * norm2
+    z_dir_norm = jnp.linalg.norm(z_dir, axis=-1, keepdims=True)
+    return z_dir * (norm_interp / jnp.maximum(z_dir_norm, 1e-8))
+
+
 def main(config=None, project="JAXUED_TEST"):
     tags = []
     if not config["exploratory_grad_updates"]:
@@ -554,6 +586,8 @@ def main(config=None, project="JAXUED_TEST"):
         tags.append("CMA-ES")
     if config.get("use_dred"):
         tags.append("DRED")
+    if config.get("use_latent_mutations"):
+        tags.append("LatentMut")
     if config.get("score_function") == "sfl":
         tags.append("SFL")
     elif config.get("score_function") == "cenie":
@@ -580,10 +614,12 @@ def main(config=None, project="JAXUED_TEST"):
     vae_decode_fn = None
     vae_encode_fn = None
     cmaes_mgr = None
-    _needs_vae = config["use_cmaes"] or config.get("use_dred")
+    _needs_vae = config["use_cmaes"] or config.get("use_dred") or config.get("use_latent_mutations")
+    if config.get("use_latent_mutations"):
+        assert config["use_accel"], "--use_latent_mutations requires --use_accel (it replaces the mutation step)"
     if _needs_vae:
-        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes or --use_dred"
-        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes or --use_dred"
+        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes, --use_dred, or --use_latent_mutations"
+        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes, --use_dred, or --use_latent_mutations"
 
         # Load VAE config
         with open(config["vae_config_path"]) as f:
@@ -689,8 +725,30 @@ def main(config=None, project="JAXUED_TEST"):
                     log_dict["cmaes/buffer_score_mean"] = float(np.array(stats["cmaes/buffer_score_mean"])[dr_mask].mean())
                     log_dict["cmaes/buffer_score_max"] = float(np.array(stats["cmaes/buffer_score_max"])[dr_mask].mean())
 
+        # Provenance breakdown
+        buf_size = int(np.sum(_buffer_origins >= 0))
+        if buf_size > 0:
+            valid = _buffer_origins[:len(_buffer_origins)]
+            n_dr = int(np.sum(valid == 0))
+            n_cmaes = int(np.sum(valid == 1))
+            n_mut_dr = int(np.sum(valid == 2))
+            n_mut_cmaes = int(np.sum(valid == 3))
+            log_dict["provenance/n_dr"] = n_dr
+            log_dict["provenance/n_cmaes"] = n_cmaes
+            log_dict["provenance/n_mut_dr"] = n_mut_dr
+            log_dict["provenance/n_mut_cmaes"] = n_mut_cmaes
+            log_dict["provenance/pct_cmaes_lineage"] = (n_cmaes + n_mut_cmaes) / buf_size * 100
+
+        # Insertion rates (per eval window)
+        if _insertion_stats["new_attempted"] > 0:
+            log_dict["provenance/new_insertion_rate"] = _insertion_stats["new_inserted"] / _insertion_stats["new_attempted"]
+            log_dict["provenance/new_inserted"] = _insertion_stats["new_inserted"]
+        if _insertion_stats["mut_attempted"] > 0:
+            log_dict["provenance/mut_insertion_rate"] = _insertion_stats["mut_inserted"] / _insertion_stats["mut_attempted"]
+            log_dict["provenance/mut_inserted"] = _insertion_stats["mut_inserted"]
+
         wandb.log(log_dict)
-    
+
     # Setup the environment
     env = Maze(max_height=config["maze_height"], max_width=config["maze_width"], agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
@@ -785,6 +843,7 @@ def main(config=None, project="JAXUED_TEST"):
 
         cmaes_latent_dim = int(active_dims.shape[0])
     else:
+        _original_decode_fn = vae_decode_fn  # no KL filtering, same as wrapped
         cmaes_latent_dim = vae_cfg["latent_dim"] if _needs_vae else None
 
     # --- PCA dimensionality reduction (overrides KL filtering if both set) ---
@@ -1103,6 +1162,7 @@ def main(config=None, project="JAXUED_TEST"):
             num_mutation_updates=0,
             dr_last_level_batch=pholder_level_batch,
             replay_last_level_batch=pholder_level_batch,
+            replay_last_level_inds=jnp.full((config["num_train_envs"],), -1, dtype=jnp.int32),
             mutation_last_level_batch=pholder_level_batch,
         )
 
@@ -1205,8 +1265,12 @@ def main(config=None, project="JAXUED_TEST"):
                     alpha = jax.random.uniform(rng_alpha, (N, 1))
 
                     # Interpolate latent distributions
-                    mean_interp = alpha * mean_a + (1 - alpha) * mean_b
-                    logvar_interp = alpha * logvar_a + (1 - alpha) * logvar_b
+                    if config.get("use_slerp"):
+                        mean_interp = slerp_batch(mean_a, mean_b, alpha)
+                        logvar_interp = alpha * logvar_a + (1 - alpha) * logvar_b
+                    else:
+                        mean_interp = alpha * mean_a + (1 - alpha) * mean_b
+                        logvar_interp = alpha * logvar_a + (1 - alpha) * logvar_b
 
                     # Sample from interpolated distribution
                     std_interp = jnp.exp(0.5 * logvar_interp)
@@ -1338,7 +1402,7 @@ def main(config=None, project="JAXUED_TEST"):
                 is_solvable = max_returns > 0
                 scores = jnp.where(is_solvable, scores, -jnp.inf)
 
-            sampler, _ = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+            sampler, new_inserted_inds = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -1359,10 +1423,26 @@ def main(config=None, project="JAXUED_TEST"):
             # Validity check for generated levels (CMA-ES or random)
             is_valid = jax.vmap(lambda l: l.is_well_formatted())(new_levels)
 
+            # Provenance: flag whether this batch was CMA-ES (1) or DR (0)
+            if config["use_cmaes"]:
+                if config.get("cmaes_delayed_start"):
+                    # Delayed start: CMA-ES only active once buffer is full
+                    _is_cmaes = jnp.where(sampler["size"] >= config["level_buffer_capacity"],
+                                           jnp.float32(1.0), jnp.float32(0.0))
+                else:
+                    _is_cmaes = jnp.float32(1.0)
+            else:
+                _is_cmaes = jnp.float32(0.0)
+
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid.mean() * 100,
+                "provenance/branch": jnp.int32(0),
+                "provenance/is_cmaes": _is_cmaes,
+                "provenance/new_inserted_inds": new_inserted_inds,
+                "provenance/mutation_parent_inds": jnp.full((config["num_train_envs"],), -1, dtype=jnp.int32),
+                "provenance/mutation_inserted_inds": jnp.full((config["num_train_envs"],), -1, dtype=jnp.int32),
             }
 
             # DRED monitoring metrics
@@ -1471,6 +1551,11 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": jnp.float32(0.0),  # no new levels generated
+                "provenance/branch": jnp.int32(1),
+                "provenance/is_cmaes": jnp.float32(0.0),
+                "provenance/new_inserted_inds": jnp.full((config["num_train_envs"],), -1, dtype=jnp.int32),
+                "provenance/mutation_parent_inds": jnp.full((config["num_train_envs"],), -1, dtype=jnp.int32),
+                "provenance/mutation_inserted_inds": jnp.full((config["num_train_envs"],), -1, dtype=jnp.int32),
             }
             if config.get("use_dred"):
                 metrics["dred/valid_structure_pct"] = jnp.float32(0.0)
@@ -1498,6 +1583,7 @@ def main(config=None, project="JAXUED_TEST"):
                 es_state=train_state.es_state,
                 num_replay_updates=train_state.num_replay_updates + 1,
                 replay_last_level_batch=levels,
+                replay_last_level_inds=level_inds,
             )
             return (rng, train_state), metrics
 
@@ -1508,10 +1594,60 @@ def main(config=None, project="JAXUED_TEST"):
             """
             sampler = train_state.sampler
             rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
-            
+
             # mutate
-            parent_levels = train_state.replay_last_level_batch
-            child_levels = jax.vmap(mutate_level, (0, 0, None))(jax.random.split(rng_mutate, config["num_train_envs"]), parent_levels, config["num_edits"])
+            if config.get("use_latent_mutations"):
+                # Latent interpolation mutation: take top-K scored buffer levels,
+                # pair them, interpolate in VAE latent space, decode to new levels.
+                N = config["num_train_envs"]
+                K = config.get("latent_mutation_top_k", 64)
+                alpha = config.get("latent_mutation_alpha", 0.5)
+
+                def _latent_mutate(rng):
+                    rng, rng_shuffle, rng_decode = jax.random.split(rng, 3)
+                    # Get top-K levels by score
+                    mask = jnp.arange(level_sampler.capacity) < sampler["size"]
+                    masked_scores = jnp.where(mask, sampler["scores"], -jnp.inf)
+                    top_k_indices = jnp.argsort(-masked_scores)[:K]
+
+                    # Shuffle and split into pairs
+                    shuffled = jax.random.permutation(rng_shuffle, top_k_indices)
+                    idx_a = shuffled[:N]
+                    idx_b = shuffled[N:2*N]
+
+                    # Extract levels and encode to latent space
+                    levels_a = jax.tree_util.tree_map(lambda x: x[idx_a], sampler["levels"])
+                    levels_b = jax.tree_util.tree_map(lambda x: x[idx_b], sampler["levels"])
+                    tokens_a = jax.vmap(_l2t)(levels_a)
+                    tokens_b = jax.vmap(_l2t)(levels_b)
+                    mean_a, _ = vae_encode_fn(tokens_a)
+                    mean_b, _ = vae_encode_fn(tokens_b)
+
+                    # Interpolate in latent space
+                    if config.get("use_slerp"):
+                        alpha_broad = jnp.full((N, 1), alpha)
+                        z_child = slerp_batch(mean_a, mean_b, alpha_broad)
+                    else:
+                        z_child = alpha * mean_a + (1 - alpha) * mean_b
+
+                    # Decode to levels (use _original_decode_fn if KL filtering is
+                    # active, since z_child is already in full latent space)
+                    _lat_decode = _original_decode_fn if active_dims is not None else vae_decode_fn
+                    return _d2l(_lat_decode, z_child, rng_decode)
+
+                def _wall_flip_mutate(rng):
+                    parent_levels = train_state.replay_last_level_batch
+                    return jax.vmap(mutate_level, (0, 0, None))(
+                        jax.random.split(rng, config["num_train_envs"]),
+                        parent_levels, config["num_edits"])
+
+                # Fall back to wall-flip when buffer has fewer than K levels
+                child_levels = jax.lax.cond(
+                    sampler["size"] >= K,
+                    _latent_mutate, _wall_flip_mutate, rng_mutate)
+            else:
+                parent_levels = train_state.replay_last_level_batch
+                child_levels = jax.vmap(mutate_level, (0, 0, None))(jax.random.split(rng_mutate, config["num_train_envs"]), parent_levels, config["num_edits"])
             init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), child_levels, env_params)
 
             # rollout
@@ -1534,7 +1670,7 @@ def main(config=None, project="JAXUED_TEST"):
             rng, rng_score = jax.random.split(rng)
             scores = compute_level_scores(rng_score, train_state, child_levels, obs, actions,
                                           dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+            sampler, mutation_inserted_inds = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -1559,6 +1695,11 @@ def main(config=None, project="JAXUED_TEST"):
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid_mut.mean() * 100,
+                "provenance/branch": jnp.int32(2),
+                "provenance/is_cmaes": jnp.float32(0.0),
+                "provenance/new_inserted_inds": jnp.full((config["num_train_envs"],), -1, dtype=jnp.int32),
+                "provenance/mutation_parent_inds": train_state.replay_last_level_inds,
+                "provenance/mutation_inserted_inds": mutation_inserted_inds,
             }
             if config.get("use_dred"):
                 metrics["dred/valid_structure_pct"] = jnp.float32(0.0)
@@ -1648,6 +1789,8 @@ def main(config=None, project="JAXUED_TEST"):
         """
         rng, rng_reset = jax.random.split(rng)
         levels = Level.load_prefabs(config["eval_levels"])
+        # Pad eval levels to match env dimensions so renderer doesn't crash
+        levels = levels.pad_to_shape(config["maze_width"], config["maze_height"])
         num_levels = len(config["eval_levels"])
         init_obs, init_env_state = jax.vmap(eval_env.reset_to_level, (0, 0, None))(jax.random.split(rng_reset, num_levels), levels, env_params)
         states, rewards, episode_lengths = evaluate_rnn(
@@ -1832,6 +1975,61 @@ def main(config=None, project="JAXUED_TEST"):
 
     runner_state = (rng_train, train_state)
 
+    # === Provenance tracking arrays (Python-side, outside JAX) ===
+    # Origin types:
+    #   0 = DR (random new level)
+    #   1 = CMA-ES (new level from VAE latent search)
+    #   2 = mutation child of DR level (wall-flip or latent interp)
+    #   3 = mutation child of CMA-ES level
+    _buffer_origins = np.full(level_sampler.capacity, -1, dtype=np.int32)  # -1 = empty
+    _buffer_insert_step = np.zeros(level_sampler.capacity, dtype=np.int32)
+
+    # Insertion rate accumulators (reset each eval window)
+    _insertion_stats = {"new_attempted": 0, "new_inserted": 0, "mut_attempted": 0, "mut_inserted": 0}
+
+    def _update_provenance(metrics, total_updates):
+        """Update provenance arrays and insertion rate stats."""
+        branches = np.asarray(metrics["provenance/branch"])  # (eval_freq,)
+        is_cmaes = np.asarray(metrics["provenance/is_cmaes"])  # (eval_freq,)
+        new_inds = np.asarray(metrics["provenance/new_inserted_inds"])  # (eval_freq, num_train_envs)
+        mut_parent_inds = np.asarray(metrics["provenance/mutation_parent_inds"])  # (eval_freq, num_train_envs)
+        mut_child_inds = np.asarray(metrics["provenance/mutation_inserted_inds"])  # (eval_freq, num_train_envs)
+
+        # Reset insertion stats for this eval window
+        _insertion_stats["new_attempted"] = 0
+        _insertion_stats["new_inserted"] = 0
+        _insertion_stats["mut_attempted"] = 0
+        _insertion_stats["mut_inserted"] = 0
+
+        base_step = total_updates - len(branches)
+        for t in range(len(branches)):
+            step = base_step + t + 1
+            if branches[t] == 0:  # on_new_levels
+                n_env = len(new_inds[t])
+                n_ins = int(np.sum(new_inds[t] >= 0))
+                _insertion_stats["new_attempted"] += n_env
+                _insertion_stats["new_inserted"] += n_ins
+                origin = 1 if is_cmaes[t] > 0.5 else 0
+                for idx in new_inds[t]:
+                    if idx >= 0:
+                        _buffer_origins[idx] = origin
+                        _buffer_insert_step[idx] = step
+            elif branches[t] == 2:  # on_mutate_levels
+                n_env = len(mut_child_inds[t])
+                n_ins = int(np.sum(mut_child_inds[t] >= 0))
+                _insertion_stats["mut_attempted"] += n_env
+                _insertion_stats["mut_inserted"] += n_ins
+                for i in range(n_env):
+                    child_idx = mut_child_inds[t][i]
+                    parent_idx = mut_parent_inds[t][i]
+                    if child_idx >= 0:
+                        # Inherit origin from parent: DR parent -> 2, CMA-ES parent -> 3
+                        if parent_idx >= 0 and _buffer_origins[parent_idx] in (1, 3):
+                            _buffer_origins[child_idx] = 3  # child of CMA-ES lineage
+                        else:
+                            _buffer_origins[child_idx] = 2  # child of DR lineage
+                        _buffer_insert_step[child_idx] = step
+
     def dump_buffer(train_state, update_num):
         """Save PLR buffer as .npy (VAE token format) + .npz (full metadata). Uploads to GCS."""
         sampler = train_state.sampler
@@ -1846,18 +2044,20 @@ def main(config=None, project="JAXUED_TEST"):
             "tokens": np.asarray(tokens),
             "scores": np.asarray(sampler["scores"][:size]),
             "timestamps": np.asarray(sampler["timestamps"][:size]),
+            "origins": _buffer_origins[:size].copy(),
+            "insert_steps": _buffer_insert_step[:size].copy(),
             "size": size,
             "update_num": update_num,
         }
 
         dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
         os.makedirs(dump_dir, exist_ok=True)
-        tag = f"_{update_num}k" if update_num > 0 else "_final"
+        tag = f"_{update_num}" if update_num > 0 else "_final"
         tokens_path = os.path.join(dump_dir, f"buffer_tokens{tag}.npy")
         dump_path = os.path.join(dump_dir, f"buffer_dump{tag}.npz")
         np.save(tokens_path, np.asarray(tokens))
         np.savez_compressed(dump_path, **dump_data)
-        print(f"[Buffer dump @ {update_num}k] {size} levels -> {tokens_path}")
+        print(f"[Buffer dump @ {update_num}] {size} levels -> {tokens_path}")
 
         if config.get("gcs_bucket"):
             gcs_base = f"{config['gcs_prefix']}/buffer_dumps/{config['run_name']}/{config['seed']}"
@@ -1876,6 +2076,11 @@ def main(config=None, project="JAXUED_TEST"):
         runner_state, metrics = train_and_eval_step(runner_state, None)
         curr_time = time.time()
         metrics['time_delta'] = curr_time - start_time
+
+        # Update provenance tracking arrays
+        total_updates = (eval_step + 1) * config["eval_freq"]
+        _update_provenance(metrics, total_updates)
+
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
         if config["checkpoint_save_interval"] > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
@@ -2039,10 +2244,9 @@ def main(config=None, project="JAXUED_TEST"):
                 else:
                     print(f"[PCA refit] Skipped — buffer too small ({buf_size} < {config['cmaes_pca_dims']})")
 
-        # Periodic buffer dump at configured intervals
+        # Buffer dump every eval step
         updates_so_far = (eval_step + 1) * config["eval_freq"]
-        if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
-            dump_buffer(runner_state[1], updates_so_far // 1000)
+        dump_buffer(runner_state[1], updates_so_far)
 
     # === End-of-run buffer dump ===
     final_train_state = runner_state[1]
@@ -2277,6 +2481,8 @@ if __name__=="__main__":
         "StandardMaze",
         "StandardMaze2",
         "StandardMaze3",
+        "SmallCorridor",
+        "SimpleCrossing",
     ])
     group = parser.add_argument_group('Training params')
     # === PPO === 
@@ -2321,6 +2527,12 @@ if __name__=="__main__":
     # === ACCEL ===
     group.add_argument("--use_accel", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--num_edits", type=int, default=5)
+    group.add_argument("--use_latent_mutations", action=argparse.BooleanOptionalAction, default=False,
+                       help="Replace ACCEL wall-flip mutations with VAE latent-space interpolation of top buffer levels")
+    group.add_argument("--latent_mutation_alpha", type=float, default=0.5,
+                       help="Interpolation coefficient for latent mutations (0.5 = midpoint)")
+    group.add_argument("--latent_mutation_top_k", type=int, default=64,
+                       help="Number of top-scoring levels to select for pairing")
     # === ENV CONFIG ===
     group.add_argument("--maze_height", type=int, default=13)
     group.add_argument("--maze_width", type=int, default=13)
@@ -2330,6 +2542,8 @@ if __name__=="__main__":
     # === DRED CONFIG ===
     group.add_argument("--use_dred", action=argparse.BooleanOptionalAction, default=False,
                        help="Use DRED: generate new levels by interpolating buffer levels in VAE latent space")
+    group.add_argument("--use_slerp", action=argparse.BooleanOptionalAction, default=False,
+                       help="Use SLERP instead of linear interpolation for DRED and latent mutations")
     # === CMA-ES + VAE CONFIG ===
     group.add_argument("--use_cmaes", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--vae_checkpoint_path", type=str, default=None,
