@@ -89,10 +89,14 @@ def load_agent(checkpoint_dir, checkpoint_step=-1):
     )
 
     pholder_level = sample_random_level(jax.random.PRNGKey(0))
-    sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
+    sampler = level_sampler.initialize(pholder_level, {
+        "max_return": -jnp.inf,
+        "ancestor_id": jnp.int32(-1),
+    })
     pholder_level_batch = jax.tree_util.tree_map(
         lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0), pholder_level
     )
+    max_anc = config.get("max_llm_ancestors", 256)
 
     template_state = TrainState.create(
         apply_fn=network.apply,
@@ -101,6 +105,9 @@ def load_agent(checkpoint_dir, checkpoint_step=-1):
         sampler=sampler,
         update_state=0,
         es_state=None,
+        seed_embeddings=jnp.zeros((max_anc, 257), dtype=jnp.float32),
+        proximity_thresholds=jnp.full(max_anc, jnp.inf, dtype=jnp.float32),
+        n_seeds=jnp.int32(0),
         num_dr_updates=0,
         num_replay_updates=0,
         num_mutation_updates=0,

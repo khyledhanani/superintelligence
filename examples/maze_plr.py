@@ -48,6 +48,10 @@ class TrainState(BaseTrainState):
     sampler: core.FrozenDict[str, chex.ArrayTree] = struct.field(pytree_node=True)
     update_state: UpdateState = struct.field(pytree_node=True)
     es_state: chex.ArrayTree = struct.field(pytree_node=True)
+    # === Proximity gate for LLM-lineage mutations (JIT-visible) ===
+    seed_embeddings: chex.Array = struct.field(pytree_node=True)      # (max_ancestors, 257)
+    proximity_thresholds: chex.Array = struct.field(pytree_node=True)  # (max_ancestors,)
+    n_seeds: int = struct.field(pytree_node=True)                      # number of registered seeds
     # === Below is used for logging ===
     num_dr_updates: int
     num_replay_updates: int
@@ -81,6 +85,24 @@ def compute_insertion_embeddings(
     mean_h = (hstates * episode_mask[..., None]).sum(axis=0) / ep_lengths[..., None]  # (num_envs, 256)
     mean_a = (actions.astype(jnp.float32) * episode_mask).sum(axis=0) / ep_lengths  # (num_envs,)
     return jnp.concatenate([mean_h, mean_a[:, None]], axis=-1)  # (num_envs, 257)
+
+
+def _sample_masked_level(level_sampler_obj, sampler, rng, mask):
+    """Sample one replay level from slots where mask is True.
+
+    Like sample_replay_level but zeros out weights for masked-out slots.
+    """
+    weights = level_sampler_obj.level_weights(sampler)
+    weights = jnp.where(mask, weights, 0.0)
+    weights = weights / jnp.maximum(weights.sum(), 1e-8)
+    idx = jax.random.choice(rng, level_sampler_obj.capacity, p=weights)
+    new_episode_count = sampler["episode_count"] + 1
+    sampler = {
+        **sampler,
+        "timestamps": sampler["timestamps"].at[idx].set(new_episode_count),
+        "episode_count": new_episode_count,
+    }
+    return sampler, (idx, jax.tree_util.tree_map(lambda x: x[idx], sampler["levels"]))
 
 
 def compute_td_errors(
@@ -553,7 +575,8 @@ def main(config=None, project="JAXUED_TEST"):
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
     wandb.define_metric("diversity/*", step_metric="num_updates")
-    wandb.define_metric("td_error/*", step_metric="num_updates")
+    wandb.define_metric("emb/*", step_metric="num_updates")
+    wandb.define_metric("prox_gate/*", step_metric="num_updates")
     wandb.define_metric("interp_compare/*", step_metric="num_updates")
     if config.get("use_llm"):
         wandb.define_metric("llm/*", step_metric="num_updates")
@@ -674,13 +697,53 @@ def main(config=None, project="JAXUED_TEST"):
                 log_dict["cmaes/pop_spread"] = float(np.array(stats["cmaes/pop_spread"])[dr_mask].mean())
                 log_dict["cmaes/mean_z_norm"] = float(np.array(stats["cmaes/mean_z_norm"])[dr_mask].mean())
 
-        # TD error stats (averaged over eval_freq training steps)
-        if "td_error/mean" in stats:
-            td_mean = np.array(stats["td_error/mean"])
-            log_dict["td_error/mean"] = float(td_mean.mean())
-            log_dict["td_error/std"] = float(np.array(stats["td_error/std"]).mean())
-            log_dict["td_error/abs_mean"] = float(np.array(stats["td_error/abs_mean"]).mean())
-            log_dict["td_error/max"] = float(np.array(stats["td_error/max"]).mean())
+        # Embedding-space metrics (buffer-level, computed from _buffer_embeddings)
+        if _buffer_embeddings is not None and _buffer_ancestor_ids is not None:
+            size = int(runner_state[1].sampler["size"])
+            emb_buf = _buffer_embeddings[:size]
+            anc_buf = _buffer_ancestor_ids[:size]
+            llm_mask = anc_buf >= 0
+            org_mask = anc_buf < 0
+            n_llm = int(llm_mask.sum())
+            n_org = int(org_mask.sum())
+
+            log_dict["emb/n_llm_in_buffer"] = n_llm
+            log_dict["emb/llm_buffer_pct"] = n_llm / max(size, 1)
+
+            if n_org > 0 and n_llm > 0:
+                org_centroid = emb_buf[org_mask].mean(axis=0)
+                llm_centroid = emb_buf[llm_mask].mean(axis=0)
+                # Per-LLM-level distance to organic centroid
+                llm_to_org = np.linalg.norm(emb_buf[llm_mask] - org_centroid, axis=1)
+                log_dict["emb/llm_organic_centroid_dist"] = float(llm_to_org.mean())
+                # Distance between cluster centroids
+                log_dict["emb/inter_cluster_dist"] = float(np.linalg.norm(llm_centroid - org_centroid))
+
+                # Per-LLM-level distance to its ancestor seed embedding
+                seed_embs_np = np.asarray(runner_state[1].seed_embeddings)
+                llm_anc = anc_buf[llm_mask]
+                safe_anc = np.clip(llm_anc, 0, seed_embs_np.shape[0] - 1)
+                llm_to_seed = np.linalg.norm(emb_buf[llm_mask] - seed_embs_np[safe_anc], axis=1)
+                log_dict["emb/llm_seed_dist_mean"] = float(llm_to_seed.mean())
+
+                # Intra-LLM spread (subsample for speed)
+                if n_llm > 1:
+                    n_sub = min(200, n_llm)
+                    sub_idx = np.random.choice(n_llm, n_sub, replace=False)
+                    from scipy.spatial.distance import pdist
+                    intra_dists = pdist(emb_buf[llm_mask][sub_idx])
+                    log_dict["emb/intra_llm_spread"] = float(intra_dists.mean())
+
+        # Proximity gate stats (aggregated over eval_freq steps)
+        if "prox_gate/n_blocked" in stats:
+            blocked = np.array(stats["prox_gate/n_blocked"])
+            llm_parents = np.array(stats["prox_gate/n_llm_parents"])
+            total_blocked = int(blocked.sum())
+            total_llm = int(llm_parents.sum())
+            log_dict["prox_gate/total_blocked"] = total_blocked
+            log_dict["prox_gate/total_llm_parents"] = total_llm
+            log_dict["prox_gate/block_rate"] = total_blocked / max(total_llm, 1)
+            log_dict["prox_gate/mean_dist"] = float(np.array(stats["prox_gate/mean_dist"]).mean())
 
         # Provenance-aware replay rate tracking
         if _buffer_origins is not None and "replay_level_inds" in stats:
@@ -817,8 +880,12 @@ def main(config=None, project="JAXUED_TEST"):
             # optax.adam(learning_rate=config["lr"], eps=1e-5),
         )
         pholder_level = sample_random_level(jax.random.PRNGKey(0))
-        sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
+        sampler = level_sampler.initialize(pholder_level, {
+            "max_return": -jnp.inf,
+            "ancestor_id": jnp.int32(-1),
+        })
         pholder_level_batch = jax.tree_util.tree_map(lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0), pholder_level)
+        max_anc = config.get("max_llm_ancestors", 256)
 
         return TrainState.create(
             apply_fn=network.apply,
@@ -827,6 +894,9 @@ def main(config=None, project="JAXUED_TEST"):
             sampler=sampler,
             update_state=0,
             es_state=es_state_init,
+            seed_embeddings=jnp.zeros((max_anc, 257), dtype=jnp.float32),
+            proximity_thresholds=jnp.full(max_anc, jnp.inf, dtype=jnp.float32),
+            n_seeds=jnp.int32(0),
             num_dr_updates=0,
             num_replay_updates=0,
             num_mutation_updates=0,
@@ -897,7 +967,10 @@ def main(config=None, project="JAXUED_TEST"):
                     fresh_es_state, es_state
                 )
 
-            sampler, dr_inserted_inds = level_sampler.insert_batch(sampler, new_levels, scores, {"max_return": max_returns})
+            sampler, dr_inserted_inds = level_sampler.insert_batch(sampler, new_levels, scores, {
+                "max_return": max_returns,
+                "ancestor_id": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+            })
 
             # Stale embedding: mean [hstate(256), action(1)] over first episode
             dr_embeddings = compute_insertion_embeddings(hstates, actions, dones)
@@ -921,22 +994,18 @@ def main(config=None, project="JAXUED_TEST"):
             # Validity check for generated levels (CMA-ES or random)
             is_valid = jax.vmap(lambda l: l.is_well_formatted())(new_levels)
 
-            # TD error stats for this batch of rollouts
-            td_errors = compute_td_errors(config["gamma"], last_value, values, rewards, dones)
-
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": new_levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": is_valid.mean() * 100,
-                "td_error/mean": td_errors.mean(),
-                "td_error/std": td_errors.std(),
-                "td_error/abs_mean": jnp.abs(td_errors).mean(),
-                "td_error/max": jnp.abs(td_errors).max(),
                 "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
                 "mutation_parent_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
                 "mutation_child_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
                 "insertion_inds": dr_inserted_inds,  # (num_train_envs,) -1 if not inserted
                 "insertion_embeddings": dr_embeddings,  # (num_train_envs, 257)
+                "prox_gate/n_blocked": jnp.int32(0),
+                "prox_gate/n_llm_parents": jnp.int32(0),
+                "prox_gate/mean_dist": jnp.float32(0.0),
             }
 
             # CMA-ES monitoring metrics
@@ -965,10 +1034,34 @@ def main(config=None, project="JAXUED_TEST"):
                 This samples levels from the level buffer, and updates the policy on them.
             """
             sampler = train_state.sampler
-            
+
             # Collect trajectories on replay levels
             rng, rng_levels, rng_reset = jax.random.split(rng, 3)
-            sampler, (level_inds, levels) = level_sampler.sample_replay_levels(sampler, rng_levels, config["num_train_envs"])
+            if config.get("fixed_distribution") and config.get("_fixed_dist_n_llm", 0) > 0:
+                n_llm = config["_fixed_dist_n_llm"]
+                n_org = config["num_train_envs"] - n_llm
+                ancestor_ids_buf = sampler["levels_extra"]["ancestor_id"]
+                is_llm_mask = ancestor_ids_buf >= 0
+                is_org_mask = ancestor_ids_buf < 0
+
+                # Sample LLM-lineage levels
+                def _sample_llm(sampler, rng_k):
+                    return _sample_masked_level(level_sampler, sampler, rng_k, is_llm_mask)
+                rng_llm, rng_org = jax.random.split(rng_levels)
+                sampler, (llm_inds, llm_levels) = jax.lax.scan(
+                    _sample_llm, sampler, jax.random.split(rng_llm, n_llm), length=n_llm)
+
+                # Sample organic levels
+                def _sample_org(sampler, rng_k):
+                    return _sample_masked_level(level_sampler, sampler, rng_k, is_org_mask)
+                sampler, (org_inds, org_levels) = jax.lax.scan(
+                    _sample_org, sampler, jax.random.split(rng_org, n_org), length=n_org)
+
+                level_inds = jnp.concatenate([llm_inds, org_inds])
+                levels = jax.tree_util.tree_map(
+                    lambda a, b: jnp.concatenate([a, b]), llm_levels, org_levels)
+            else:
+                sampler, (level_inds, levels) = level_sampler.sample_replay_levels(sampler, rng_levels, config["num_train_envs"])
             init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), levels, env_params)
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
@@ -988,7 +1081,11 @@ def main(config=None, project="JAXUED_TEST"):
             max_returns = jnp.maximum(level_sampler.get_levels_extra(sampler, level_inds)["max_return"], compute_max_returns(dones, rewards))
             rng, rng_score = jax.random.split(rng)
             scores = compute_level_scores(rng_score, train_state, levels, dones, values, max_returns, advantages)
-            sampler = level_sampler.update_batch(sampler, level_inds, scores, {"max_return": max_returns})
+            existing_ancestor_ids = sampler["levels_extra"]["ancestor_id"][level_inds]
+            sampler = level_sampler.update_batch(sampler, level_inds, scores, {
+                "max_return": max_returns,
+                "ancestor_id": existing_ancestor_ids,
+            })
             
             # Update the policy using trajectories collected from replay levels
             (rng, train_state), losses = update_actor_critic_rnn(
@@ -1006,22 +1103,18 @@ def main(config=None, project="JAXUED_TEST"):
                 update_grad=True,
             )
                             
-            # TD error stats for replay rollouts
-            td_errors = compute_td_errors(config["gamma"], last_value, values, rewards, dones)
-
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
                 "mean_num_blocks": levels.wall_map.sum() / config["num_train_envs"],
                 "gen/valid_structure_pct": jnp.float32(0.0),  # no new levels generated
-                "td_error/mean": td_errors.mean(),
-                "td_error/std": td_errors.std(),
-                "td_error/abs_mean": jnp.abs(td_errors).mean(),
-                "td_error/max": jnp.abs(td_errors).max(),
                 "replay_level_inds": level_inds,  # (num_train_envs,) for provenance tracking
                 "mutation_parent_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
                 "mutation_child_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
                 "insertion_inds": level_inds,  # replay slots to update embeddings for
                 "insertion_embeddings": compute_insertion_embeddings(hstates, actions, dones),
+                "prox_gate/n_blocked": jnp.int32(0),
+                "prox_gate/n_llm_parents": jnp.int32(0),
+                "prox_gate/mean_dist": jnp.float32(0.0),
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -1045,46 +1138,165 @@ def main(config=None, project="JAXUED_TEST"):
             """
                 This mutates the previous batch of replay levels and potentially adds them to the level buffer.
                 This also updates the policy iff `config["exploratory_grad_updates"]` is True.
+
+                For LLM-lineage parents with proximity gate enabled, generates K candidate
+                mutations per parent (--llm_mutation_retries), scores them all, and picks the
+                best one that passes the gate. Organic parents get a single mutation as before.
             """
             sampler = train_state.sampler
-            rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
-            
-            # mutate
             parent_levels = train_state.replay_last_level_batch
-            child_levels = jax.vmap(mutate_level, (0, 0, None))(jax.random.split(rng_mutate, config["num_train_envs"]), parent_levels, config["num_edits"])
-            init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), child_levels, env_params)
+            parent_ancestor_ids = sampler["levels_extra"]["ancestor_id"][train_state.replay_last_level_inds]
+            is_llm_parent = parent_ancestor_ids >= 0
+            n_llm_parents = is_llm_parent.sum()
+            n_envs = config["num_train_envs"]
+            K = config.get("llm_mutation_retries", 1)
+            use_retries = config.get("proximity_gate_ratio", 0) > 0 and K > 1
 
-            # rollout
-            (
-                (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info, agent_positions, hstates),
-            ) = sample_trajectories_rnn(
-                rng,
-                env,
-                env_params,
-                train_state,
-                ActorCritic.initialize_carry((config["num_train_envs"],)),
-                init_obs,
-                init_env_state,
-                config["num_train_envs"],
-                config["num_steps"],
-            )
-            advantages, targets = compute_gae(config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
-            max_returns = compute_max_returns(dones, rewards)
-            rng, rng_score = jax.random.split(rng)
-            scores = compute_level_scores(rng_score, train_state, child_levels, dones, values, max_returns, advantages)
-            sampler, mutation_inserted_inds = level_sampler.insert_batch(sampler, child_levels, scores, {"max_return": max_returns})
+            if use_retries:
+                # Generate K mutations per parent for ALL slots (fixed shape for JIT).
+                # For organic parents we'll just use candidate 0.
+                rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
 
-            # Stale embedding: mean [hstate(256), action(1)] over first episode
-            mutation_embeddings = compute_insertion_embeddings(hstates, actions, dones)
+                # Tile parents K times: (K * n_envs,)
+                tiled_parents = jax.tree_util.tree_map(
+                    lambda x: jnp.tile(x, (K,) + (1,) * (x.ndim - 1)), parent_levels)
+                tiled_rngs = jax.random.split(rng_mutate, K * n_envs)
+                all_children = jax.vmap(mutate_level, (0, 0, None))(
+                    tiled_rngs, tiled_parents, config["num_edits"])
+
+                # Rollout on all K * n_envs candidates
+                init_obs_all, init_state_all = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(
+                    jax.random.split(rng_reset, K * n_envs), all_children, env_params)
+                (
+                    (rng, train_state, _, _, _, last_value_all),
+                    (obs_all, actions_all, rewards_all, dones_all, log_probs_all,
+                     values_all, info_all, positions_all, hstates_all),
+                ) = sample_trajectories_rnn(
+                    rng, env, env_params, train_state,
+                    ActorCritic.initialize_carry((K * n_envs,)),
+                    init_obs_all, init_state_all, K * n_envs, config["num_steps"],
+                )
+
+                # Proxy score for candidate selection: use max_return as a quick
+                # learnability signal (solved=1, unsolved=0). Full SFL scoring
+                # happens after selecting the best candidate per slot.
+                max_returns_all = compute_max_returns(dones_all, rewards_all)
+                proxy_scores_all = (max_returns_all > 0).astype(jnp.float32)
+                embs_all = compute_insertion_embeddings(hstates_all, actions_all, dones_all)
+
+                # Reshape to (K, n_envs, ...)
+                proxy_scores_K = proxy_scores_all.reshape(K, n_envs)
+                embs_K = embs_all.reshape(K, n_envs, 257)
+                max_returns_K = max_returns_all.reshape(K, n_envs)
+
+                # Proximity gate on all K candidates
+                max_anc = config["max_llm_ancestors"]
+                safe_idx = jnp.clip(parent_ancestor_ids, 0, max_anc - 1)
+                ancestor_embs = train_state.seed_embeddings[safe_idx]       # (n_envs, 257)
+                thresholds = train_state.proximity_thresholds[safe_idx]     # (n_envs,)
+                dists_K = jnp.linalg.norm(
+                    embs_K - ancestor_embs[None, :, :], axis=-1)            # (K, n_envs)
+                gate_pass_K = ~is_llm_parent[None, :] | (dists_K < thresholds[None, :])  # (K, n_envs)
+
+                # For each env slot, pick the best passing candidate (highest proxy score among passing)
+                gated_scores_K = jnp.where(gate_pass_K, proxy_scores_K, -jnp.inf)  # (K, n_envs)
+                best_k = jnp.argmax(gated_scores_K, axis=0)                   # (n_envs,)
+
+                # For organic parents, just use candidate 0
+                best_k = jnp.where(is_llm_parent, best_k, 0)
+
+                # Gather best candidate per env
+                env_idx = jnp.arange(n_envs)
+                flat_idx = best_k * n_envs + env_idx  # index into (K * n_envs,)
+                child_levels = jax.tree_util.tree_map(lambda x: x[flat_idx], all_children)
+                max_returns = max_returns_all[flat_idx]
+                mutation_embeddings = embs_all[flat_idx]
+
+                # Proper SFL scoring on the selected n_envs levels
+                rng, rng_score = jax.random.split(rng)
+                scores = compute_level_scores(
+                    rng_score, train_state, child_levels,
+                    dones_all[:, :n_envs], values_all[:, :n_envs],  # dummy, only used for non-SFL
+                    max_returns,
+                    compute_gae(config["gamma"], config["gae_lambda"],
+                                last_value_all[:n_envs], values_all[:, :n_envs],
+                                rewards_all[:, :n_envs], dones_all[:, :n_envs])[1])
+
+                # Final gate check on selected candidates (organic always pass)
+                dists_to_seed = dists_K[best_k, env_idx]
+                final_gate_pass = ~is_llm_parent | (dists_to_seed < thresholds)
+                scores = jnp.where(final_gate_pass, scores, -jnp.inf)
+
+                prox_n_blocked = jnp.sum(~final_gate_pass & is_llm_parent)
+                prox_mean_dist = jnp.where(
+                    n_llm_parents > 0,
+                    jnp.where(is_llm_parent, dists_to_seed, 0.0).sum() / jnp.maximum(n_llm_parents, 1),
+                    0.0)
+
+                # Use candidate 0's trajectory data for PPO update (all envs trained on first candidate)
+                obs = jax.tree_util.tree_map(lambda x: x[:, :n_envs], obs_all)
+                actions = actions_all[:, :n_envs]
+                rewards = rewards_all[:, :n_envs]
+                dones = dones_all[:, :n_envs]
+                log_probs = log_probs_all[:, :n_envs]
+                values = values_all[:, :n_envs]
+                hstates = hstates_all[:, :n_envs]
+                advantages, targets = compute_gae(
+                    config["gamma"], config["gae_lambda"],
+                    last_value_all[:n_envs], values, rewards, dones)
+
+            else:
+                # Standard single-mutation path
+                rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
+                child_levels = jax.vmap(mutate_level, (0, 0, None))(
+                    jax.random.split(rng_mutate, n_envs), parent_levels, config["num_edits"])
+                init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(
+                    jax.random.split(rng_reset, n_envs), child_levels, env_params)
+                (
+                    (rng, train_state, hstate, last_obs, last_env_state, last_value),
+                    (obs, actions, rewards, dones, log_probs, values, info, agent_positions, hstates),
+                ) = sample_trajectories_rnn(
+                    rng, env, env_params, train_state,
+                    ActorCritic.initialize_carry((n_envs,)),
+                    init_obs, init_env_state, n_envs, config["num_steps"],
+                )
+                advantages, targets = compute_gae(
+                    config["gamma"], config["gae_lambda"], last_value, values, rewards, dones)
+                max_returns = compute_max_returns(dones, rewards)
+                rng, rng_score = jax.random.split(rng)
+                scores = compute_level_scores(
+                    rng_score, train_state, child_levels, dones, values, max_returns, advantages)
+                mutation_embeddings = compute_insertion_embeddings(hstates, actions, dones)
+
+                # Proximity gate (single candidate)
+                prox_n_blocked = jnp.int32(0)
+                prox_mean_dist = jnp.float32(0.0)
+                if config.get("proximity_gate_ratio", 0) > 0:
+                    max_anc = config["max_llm_ancestors"]
+                    safe_idx = jnp.clip(parent_ancestor_ids, 0, max_anc - 1)
+                    ancestor_embs = train_state.seed_embeddings[safe_idx]
+                    thresholds = train_state.proximity_thresholds[safe_idx]
+                    dists_to_seed = jnp.linalg.norm(mutation_embeddings - ancestor_embs, axis=-1)
+                    gate_pass = ~is_llm_parent | (dists_to_seed < thresholds)
+                    scores = jnp.where(gate_pass, scores, -jnp.inf)
+                    prox_n_blocked = jnp.sum(~gate_pass & is_llm_parent)
+                    prox_mean_dist = jnp.where(
+                        n_llm_parents > 0,
+                        jnp.where(is_llm_parent, dists_to_seed, 0.0).sum() / jnp.maximum(n_llm_parents, 1),
+                        0.0)
+
+            sampler, mutation_inserted_inds = level_sampler.insert_batch(sampler, child_levels, scores, {
+                "max_return": max_returns,
+                "ancestor_id": parent_ancestor_ids,
+            })
 
             # Update: train_state only modified if exploratory_grad_updates is on
             (rng, train_state), losses = update_actor_critic_rnn(
                 rng,
                 train_state,
-                ActorCritic.initialize_carry((config["num_train_envs"],)),
+                ActorCritic.initialize_carry((n_envs,)),
                 (obs, actions, dones, log_probs, values, targets, advantages),
-                config["num_train_envs"],
+                n_envs,
                 config["num_steps"],
                 config["num_minibatches"],
                 config["epoch_ppo"],
@@ -1097,23 +1309,19 @@ def main(config=None, project="JAXUED_TEST"):
             # Validity check for mutated levels
             is_valid_mut = jax.vmap(lambda l: l.is_well_formatted())(child_levels)
 
-            # TD error stats for mutation rollouts
-            td_errors = compute_td_errors(config["gamma"], last_value, values, rewards, dones)
-
             metrics = {
                 "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
-                "mean_num_blocks": child_levels.wall_map.sum() / config["num_train_envs"],
+                "mean_num_blocks": child_levels.wall_map.sum() / n_envs,
                 "gen/valid_structure_pct": is_valid_mut.mean() * 100,
-                "td_error/mean": td_errors.mean(),
-                "td_error/std": td_errors.std(),
-                "td_error/abs_mean": jnp.abs(td_errors).mean(),
-                "td_error/max": jnp.abs(td_errors).max(),
-                "replay_level_inds": jnp.full(config["num_train_envs"], -1, dtype=jnp.int32),
+                "replay_level_inds": jnp.full(n_envs, -1, dtype=jnp.int32),
                 # Lineage tracking: parent buffer indices and where their children landed
-                "mutation_parent_inds": train_state.replay_last_level_inds,  # (num_train_envs,)
-                "mutation_child_inds": mutation_inserted_inds,  # (num_train_envs,) -1 if not inserted
+                "mutation_parent_inds": train_state.replay_last_level_inds,  # (n_envs,)
+                "mutation_child_inds": mutation_inserted_inds,  # (n_envs,) -1 if not inserted
                 "insertion_inds": mutation_inserted_inds,
-                "insertion_embeddings": mutation_embeddings,  # (num_train_envs, 257)
+                "insertion_embeddings": mutation_embeddings,  # (n_envs, 257)
+                "prox_gate/n_blocked": prox_n_blocked,
+                "prox_gate/n_llm_parents": n_llm_parents,
+                "prox_gate/mean_dist": prox_mean_dist,
             }
             if config["use_cmaes"]:
                 metrics["cmaes/valid_structure_pct"] = jnp.float32(0.0)
@@ -1338,6 +1546,209 @@ def main(config=None, project="JAXUED_TEST"):
         unique_ancestors = len(set(_buffer_ancestor_ids[:pre_size][_buffer_origins[:pre_size] > 0].tolist()))
         print(f"[Preload] Loaded {pre_size} levels ({n_injected} injected from "
               f"{unique_ancestors} LLM ancestors, {pre_size - n_injected} organic)")
+
+        # Write ancestor_ids into levels_extra (JIT-visible)
+        new_ancestor_id_arr = train_state.sampler["levels_extra"]["ancestor_id"].at[:pre_size].set(
+            jnp.array(_buffer_ancestor_ids[:pre_size], dtype=jnp.int32))
+        new_levels_extra = {**train_state.sampler["levels_extra"], "ancestor_id": new_ancestor_id_arr}
+        new_sampler = {**train_state.sampler, "levels_extra": new_levels_extra}
+        train_state = train_state.replace(sampler=new_sampler)
+
+        # Compute seed embeddings and proximity thresholds from preloaded buffer
+        if config.get("proximity_gate_ratio", 0) > 0 or config.get("fixed_distribution"):
+            unique_anc_ids = sorted(set(
+                int(a) for a in _buffer_ancestor_ids[:pre_size] if a >= 0))
+            n_seeds = len(unique_anc_ids)
+            max_anc = config.get("max_llm_ancestors", 256)
+
+            if n_seeds > 0:
+                print(f"[Preload] Setting up seed embeddings for {n_seeds} ancestors...")
+                seed_embs = np.zeros((max_anc, 257), dtype=np.float32)
+                prox_thresholds = np.full(max_anc, np.inf, dtype=np.float32)
+
+                if "embeddings" in preload:
+                    # Use stored embeddings
+                    org_mask = _buffer_ancestor_ids[:pre_size] == -1
+                    organic_centroid = _buffer_embeddings[:pre_size][org_mask].mean(axis=0) if org_mask.any() else np.zeros(257)
+
+                    ratio = config.get("proximity_gate_ratio", 0.5)
+                    for anc_id in unique_anc_ids:
+                        if anc_id >= max_anc:
+                            print(f"  WARNING: ancestor_id {anc_id} >= max_llm_ancestors {max_anc}, skipping")
+                            continue
+                        seed_slots = np.where(
+                            (_buffer_ancestor_ids[:pre_size] == anc_id) &
+                            (_buffer_origins[:pre_size] == 1)
+                        )[0]
+                        if len(seed_slots) == 0:
+                            seed_slots = np.where(_buffer_ancestor_ids[:pre_size] == anc_id)[0]
+                        if len(seed_slots) > 0:
+                            seed_emb = _buffer_embeddings[seed_slots].mean(axis=0)
+                            dist_to_organic = float(np.linalg.norm(seed_emb - organic_centroid))
+                            seed_embs[anc_id] = seed_emb
+                            prox_thresholds[anc_id] = ratio * dist_to_organic
+                            print(f"  Ancestor {anc_id}: dist={dist_to_organic:.4f}, thr={prox_thresholds[anc_id]:.4f}")
+                else:
+                    # No stored embeddings — compute by rolling out agent on seed levels
+                    print(f"[Preload] No embeddings in buffer, computing via agent rollouts...")
+                    # Collect seed level indices (one representative per ancestor)
+                    seed_level_list = []
+                    seed_anc_list = []
+                    for anc_id in unique_anc_ids:
+                        if anc_id >= max_anc:
+                            continue
+                        slots = np.where(
+                            (_buffer_ancestor_ids[:pre_size] == anc_id) &
+                            (_buffer_origins[:pre_size] == 1)
+                        )[0]
+                        if len(slots) == 0:
+                            slots = np.where(_buffer_ancestor_ids[:pre_size] == anc_id)[0]
+                        if len(slots) > 0:
+                            seed_level_list.append(pre_levels_list[slots[0]])
+                            seed_anc_list.append(anc_id)
+
+                    if seed_level_list:
+                        n_batch = len(seed_level_list)
+                        seed_levels_batched = Level.stack(seed_level_list)
+                        rng_emb = jax.random.PRNGKey(42)
+                        rng_emb, rng_reset, rng_rollout = jax.random.split(rng_emb, 3)
+                        init_obs_s, init_state_s = jax.vmap(
+                            env.reset_to_level, in_axes=(0, 0, None)
+                        )(jax.random.split(rng_reset, n_batch), seed_levels_batched, env_params)
+                        (_, _, _, _, _, _), traj_s = sample_trajectories_rnn(
+                            rng_rollout, env, env_params, train_state,
+                            ActorCritic.initialize_carry((n_batch,)),
+                            init_obs_s, init_state_s, n_batch,
+                            config["num_steps"],
+                        )
+                        _, actions_s, _, dones_s, _, _, _, _, hstates_s = traj_s
+                        seed_embeddings_computed = np.asarray(
+                            compute_insertion_embeddings(hstates_s, actions_s, dones_s))
+
+                        # Also compute organic centroid by rolling out on a sample of organic levels
+                        org_slots = np.where(_buffer_ancestor_ids[:pre_size] == -1)[0]
+                        n_org_sample = min(64, len(org_slots))
+                        if n_org_sample > 0:
+                            org_sample_idx = org_slots[np.random.RandomState(42).choice(len(org_slots), n_org_sample, replace=False)]
+                            org_levels_list = [pre_levels_list[i] for i in org_sample_idx]
+                            org_levels_batched = Level.stack(org_levels_list)
+                            rng_emb, rng_org_reset, rng_org_roll = jax.random.split(rng_emb, 3)
+                            init_obs_o, init_state_o = jax.vmap(
+                                env.reset_to_level, in_axes=(0, 0, None)
+                            )(jax.random.split(rng_org_reset, n_org_sample), org_levels_batched, env_params)
+                            (_, _, _, _, _, _), traj_o = sample_trajectories_rnn(
+                                rng_org_roll, env, env_params, train_state,
+                                ActorCritic.initialize_carry((n_org_sample,)),
+                                init_obs_o, init_state_o, n_org_sample,
+                                config["num_steps"],
+                            )
+                            _, actions_o, _, dones_o, _, _, _, _, hstates_o = traj_o
+                            org_embeddings = np.asarray(
+                                compute_insertion_embeddings(hstates_o, actions_o, dones_o))
+                            organic_centroid = org_embeddings.mean(axis=0)
+                        else:
+                            organic_centroid = np.zeros(257, dtype=np.float32)
+
+                        ratio = config.get("proximity_gate_ratio", 0.5)
+                        for i, anc_id in enumerate(seed_anc_list):
+                            seed_emb = seed_embeddings_computed[i]
+                            dist_to_organic = float(np.linalg.norm(seed_emb - organic_centroid))
+                            seed_embs[anc_id] = seed_emb
+                            prox_thresholds[anc_id] = ratio * dist_to_organic
+                            print(f"  Ancestor {anc_id}: dist={dist_to_organic:.4f}, thr={prox_thresholds[anc_id]:.4f}")
+
+                train_state = train_state.replace(
+                    seed_embeddings=jnp.array(seed_embs),
+                    proximity_thresholds=jnp.array(prox_thresholds),
+                    n_seeds=jnp.int32(n_seeds),
+                )
+                print(f"[Preload] Registered {n_seeds} seed embeddings for proximity gate")
+
+            # Fixed distribution: compute target LLM count for replay sampling
+            if config.get("fixed_distribution") and n_injected > 0:
+                injection_pct = n_injected / pre_size
+                n_llm = max(1, round(injection_pct * config["num_train_envs"]))
+                config["_fixed_dist_n_llm"] = n_llm
+                print(f"[Preload] Fixed distribution: {injection_pct:.1%} injection -> "
+                      f"{n_llm}/{config['num_train_envs']} LLM replay slots")
+
+    # Save seed levels for periodic embedding recomputation
+    _prox_gate_seed_levels = None  # List[(anc_id, Level)] or None
+    _prox_gate_seed_batched = None  # Batched Level or None
+    _prox_gate_seed_anc_ids = None  # list of ancestor IDs matching batch order
+
+    if config.get("proximity_gate_ratio", 0) > 0 and config.get("preload_buffer_npz"):
+        # Reconstruct seed level list from preloaded data
+        _prox_gate_seed_anc_ids = []
+        _seed_level_list = []
+        max_anc = config.get("max_llm_ancestors", 256)
+        for anc_id in sorted(set(int(a) for a in _buffer_ancestor_ids[:int(train_state.sampler["size"])] if a >= 0)):
+            if anc_id >= max_anc:
+                continue
+            slots = np.where(
+                (_buffer_ancestor_ids[:int(train_state.sampler["size"])] == anc_id) &
+                (_buffer_origins[:int(train_state.sampler["size"])] == 1)
+            )[0]
+            if len(slots) == 0:
+                slots = np.where(_buffer_ancestor_ids[:int(train_state.sampler["size"])] == anc_id)[0]
+            if len(slots) > 0:
+                _seed_level_list.append(pre_levels_list[slots[0]])
+                _prox_gate_seed_anc_ids.append(anc_id)
+        if _seed_level_list:
+            _prox_gate_seed_batched = Level.stack(_seed_level_list)
+            print(f"[ProxGate] Saved {len(_seed_level_list)} seed levels for periodic recomputation")
+
+    def _recompute_seed_embeddings(runner_state):
+        """Recompute seed embeddings and proximity thresholds using the current agent.
+
+        Called at each eval step to keep embeddings fresh as the agent evolves.
+        """
+        if _prox_gate_seed_batched is None:
+            return runner_state
+
+        rng, train_state = runner_state
+        n_batch = len(_prox_gate_seed_anc_ids)
+        max_anc = config.get("max_llm_ancestors", 256)
+        ratio = config.get("proximity_gate_ratio", 0.5)
+
+        # Roll out current agent on seed levels (read-only, don't propagate modified train_state)
+        rng, rng_reset, rng_rollout = jax.random.split(rng, 3)
+        init_obs_s, init_state_s = jax.vmap(
+            env.reset_to_level, in_axes=(0, 0, None)
+        )(jax.random.split(rng_reset, n_batch), _prox_gate_seed_batched, env_params)
+        _, traj_s = sample_trajectories_rnn(
+            rng_rollout, env, env_params, train_state,
+            ActorCritic.initialize_carry((n_batch,)),
+            init_obs_s, init_state_s, n_batch, config["num_steps"],
+        )
+        # Unpack only what we need (discard modified train_state from rollout)
+        _, actions_s, _, dones_s, _, _, _, _, hstates_s = traj_s
+        seed_embs_new = np.asarray(compute_insertion_embeddings(hstates_s, actions_s, dones_s))
+
+        # Organic centroid from current buffer embeddings
+        size = int(train_state.sampler["size"])
+        if _buffer_embeddings is not None:
+            org_mask = _buffer_ancestor_ids[:size] == -1
+            if org_mask.any():
+                organic_centroid = _buffer_embeddings[:size][org_mask].mean(axis=0)
+            else:
+                organic_centroid = np.zeros(257, dtype=np.float32)
+        else:
+            organic_centroid = np.zeros(257, dtype=np.float32)
+
+        # Update thresholds
+        seed_embs_arr = np.array(train_state.seed_embeddings, copy=True)
+        prox_thr_arr = np.array(train_state.proximity_thresholds, copy=True)
+        for i, anc_id in enumerate(_prox_gate_seed_anc_ids):
+            seed_embs_arr[anc_id] = seed_embs_new[i]
+            dist = float(np.linalg.norm(seed_embs_new[i] - organic_centroid))
+            prox_thr_arr[anc_id] = ratio * dist
+
+        train_state = train_state.replace(
+            seed_embeddings=jnp.array(seed_embs_arr),
+            proximity_thresholds=jnp.array(prox_thr_arr),
+        )
+        return (rng, train_state)
 
     runner_state = (rng_train, train_state)
 
@@ -1867,6 +2278,10 @@ def main(config=None, project="JAXUED_TEST"):
         _update_lineage(runner_state[1], metrics)
         _update_embeddings(metrics)
 
+        # Recompute seed embeddings with current agent (keeps proximity gate fresh)
+        if config.get("proximity_gate_ratio", 0) > 0:
+            runner_state = _recompute_seed_embeddings(runner_state)
+
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
 
         # Pairwise diversity logging
@@ -2174,6 +2589,18 @@ if __name__=="__main__":
     # === ACCEL ===
     group.add_argument("--use_accel", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--num_edits", type=int, default=5)
+    # === PROXIMITY GATE (LLM-lineage ACCEL mutations) ===
+    group.add_argument("--proximity_gate_ratio", type=float, default=0.0,
+                       help="Proximity gate for LLM-lineage ACCEL mutations: "
+                            "child must have dist(child_emb, seed_emb) < ratio * dist(seed_emb, organic_centroid). "
+                            "0 = disabled.")
+    group.add_argument("--max_llm_ancestors", type=int, default=256,
+                       help="Max distinct LLM ancestor seeds to track (static JAX array size)")
+    group.add_argument("--fixed_distribution", action=argparse.BooleanOptionalAction, default=False,
+                       help="Fix LLM/organic replay ratio to match initial injection percentage")
+    group.add_argument("--llm_mutation_retries", type=int, default=5,
+                       help="Number of mutation candidates per LLM-lineage parent when proximity gate is active. "
+                            "Best passing candidate is selected. Only used when --proximity_gate_ratio > 0.")
     # === ENV CONFIG ===
     group.add_argument("--maze_height", type=int, default=13)
     group.add_argument("--maze_width", type=int, default=13)
