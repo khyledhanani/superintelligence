@@ -29,6 +29,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from sklearn.manifold import TSNE
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'examples'))
@@ -342,34 +343,84 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
             is_organic = origins == 0
             is_original = origins == 1
             is_mutation = origins == 2
+            scores = data[key]["scores"]
 
-            # Organic background (grey)
-            if is_organic.sum() > 0:
-                ax.scatter(coords[is_organic, 0], coords[is_organic, 1],
-                           c='lightgrey', s=3, alpha=0.25, edgecolors='none',
-                           rasterized=True, label=f'Organic ({is_organic.sum()})')
+            if args.show_difficulty:
+                # Color by SFL learnability: yellow (0) -> red (0.25+)
+                cmap = mcolors.LinearSegmentedColormap.from_list(
+                    "sfl", ["yellow", "red"])
+                norm = mcolors.Normalize(vmin=0, vmax=0.25)
 
-            # LLM mutations (green)
-            if is_mutation.sum() > 0:
-                ax.scatter(coords[is_mutation, 0], coords[is_mutation, 1],
-                           c='green', s=8, alpha=0.5, edgecolors='none',
-                           rasterized=True, label=f'LLM mut ({is_mutation.sum()})')
+                # Organic (light/small)
+                if is_organic.sum() > 0:
+                    ax.scatter(coords[is_organic, 0], coords[is_organic, 1],
+                               c=scores[is_organic], cmap=cmap, norm=norm,
+                               s=3, alpha=0.25, edgecolors='none',
+                               rasterized=True)
 
-            # LLM originals (blue stars)
-            if is_original.sum() > 0:
-                ax.scatter(coords[is_original, 0], coords[is_original, 1],
-                           c='blue', s=35, marker='*', alpha=0.9,
-                           edgecolors='black', linewidths=0.3,
-                           label=f'LLM orig ({is_original.sum()})')
+                # LLM mutations (bold circles)
+                if is_mutation.sum() > 0:
+                    ax.scatter(coords[is_mutation, 0], coords[is_mutation, 1],
+                               c=scores[is_mutation], cmap=cmap, norm=norm,
+                               s=12, alpha=0.7, edgecolors='black', linewidths=0.3,
+                               rasterized=True)
+
+                # LLM originals (stars)
+                if is_original.sum() > 0:
+                    ax.scatter(coords[is_original, 0], coords[is_original, 1],
+                               c=scores[is_original], cmap=cmap, norm=norm,
+                               s=40, marker='*', alpha=0.9,
+                               edgecolors='black', linewidths=0.3)
+
+                # Add legend on first panel, colorbar on last panel
+                if i == 0 and j == 0:
+                    from matplotlib.lines import Line2D
+                    legend_els = [
+                        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+                               markersize=4, alpha=0.5, label='Organic'),
+                        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+                               markersize=6, markeredgecolor='black', markeredgewidth=0.3,
+                               label='LLM mutation'),
+                        Line2D([0], [0], marker='*', color='w', markerfacecolor='grey',
+                               markersize=10, markeredgecolor='black', markeredgewidth=0.3,
+                               label='LLM original'),
+                    ]
+                    ax.legend(handles=legend_els, fontsize=5, loc='upper left',
+                              framealpha=0.7)
+                if i == n_rows - 1 and j == n_cols - 1:
+                    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+                    sm.set_array([])
+                    cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+                    cb.set_label("SFL", fontsize=7)
+                    cb.ax.tick_params(labelsize=6)
+            else:
+                # Organic background (grey)
+                if is_organic.sum() > 0:
+                    ax.scatter(coords[is_organic, 0], coords[is_organic, 1],
+                               c='lightgrey', s=3, alpha=0.25, edgecolors='none',
+                               rasterized=True, label=f'Organic ({is_organic.sum()})')
+
+                # LLM mutations (green)
+                if is_mutation.sum() > 0:
+                    ax.scatter(coords[is_mutation, 0], coords[is_mutation, 1],
+                               c='green', s=8, alpha=0.5, edgecolors='none',
+                               rasterized=True, label=f'LLM mut ({is_mutation.sum()})')
+
+                # LLM originals (blue stars)
+                if is_original.sum() > 0:
+                    ax.scatter(coords[is_original, 0], coords[is_original, 1],
+                               c='blue', s=35, marker='*', alpha=0.9,
+                               edgecolors='black', linewidths=0.3,
+                               label=f'LLM orig ({is_original.sum()})')
+
+                if i == 0 and j == 0:
+                    ax.legend(fontsize=6, loc='lower left', framealpha=0.7)
 
             n_llm = is_original.sum() + is_mutation.sum()
             ax.set_title(f"Seed {seed}, {ts} upd\n"
                          f"({n_llm} LLM / {len(origins)} total)", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
-
-            if i == 0 and j == 0:
-                ax.legend(fontsize=6, loc='lower left', framealpha=0.7)
 
     pct_label = inject_pct.replace("pct", "%")
     if is_structural:
@@ -416,6 +467,9 @@ def main():
                         help="behavioral: 257D agent rollout embeddings (GPU). structural: env features (CPU)")
     parser.add_argument("--grid_size", type=int, default=13,
                         help="Maze grid size for structural features (default 13)")
+    parser.add_argument("--show_difficulty", action="store_true",
+                        help="Color points by SFL learnability (yellow=0, red=0.25) "
+                             "instead of by origin type")
     parser.add_argument("--upload_gcs", action="store_true",
                         help="Upload cache and plots to GCS after completion")
     args = parser.parse_args()
