@@ -34,41 +34,43 @@ class MazeRenderer(object):
     @partial(jax.jit, static_argnums=(0,))
     def render_state(self, env_state: EnvState, env_params: EnvParams) -> chex.Array:
         tile_size = self.tile_size
-        nrows = self.env.max_height + 2*self.render_border
-        ncols = self.env.max_width + 2*self.render_border
-        width_px = ncols * tile_size
-        height_px = nrows * tile_size
-        
+
         agent_pos = env_state.agent_pos + self.render_border
         goal_pos = env_state.goal_pos + self.render_border
-        
+
         if self.render_border:
             cells = jnp.pad(jnp.where(env_state.wall_map, 1, 0), 1, mode="constant", constant_values=True)
         else:
             cells = jnp.where(env_state.wall_map, 1, 0)
+
+        # Derive dimensions from actual wall_map, not env.max_height
+        nrows, ncols = cells.shape
+        height_px = nrows * tile_size
+        width_px = ncols * tile_size
+
         cells = jnp.where(cells, 1, 0)
         cells = cells.at[agent_pos[1], agent_pos[0]].set(3 + env_state.agent_dir)
         cells = cells.at[goal_pos[1], goal_pos[0]].set(2)
-        
+
         img = self._atlas[cells].transpose(0, 2, 1, 3, 4).reshape(height_px, width_px, 3)
-        
+
         f_vec = DIR_TO_VEC[env_state.agent_dir]
         r_vec = jnp.array([-f_vec[1], f_vec[0]])
 
         agent_view_size = self.env.agent_view_size
 
         min_bound = jnp.min(jnp.stack([
-            agent_pos, 
-            agent_pos + f_vec*(agent_view_size-1), 
-            agent_pos - r_vec*(agent_view_size//2), 
+            agent_pos,
+            agent_pos + f_vec*(agent_view_size-1),
+            agent_pos - r_vec*(agent_view_size//2),
             agent_pos + r_vec*(agent_view_size//2),
         ]), 0)
 
-        min_x = jnp.minimum(jnp.maximum(min_bound[0], 0), env_state.wall_map.shape[0] - 1 + 2*self.render_border)
-        min_y = jnp.minimum(jnp.maximum(min_bound[1], 0), env_state.wall_map.shape[1] - 1 + 2*self.render_border)
-        max_x = jnp.minimum(jnp.maximum(min_bound[0]+agent_view_size, 0), env_state.wall_map.shape[0] + 2*self.render_border)
-        max_y = jnp.minimum(jnp.maximum(min_bound[1]+agent_view_size, 0), env_state.wall_map.shape[1] + 2*self.render_border)
-        
+        min_x = jnp.minimum(jnp.maximum(min_bound[0], 0), nrows - 1)
+        min_y = jnp.minimum(jnp.maximum(min_bound[1], 0), ncols - 1)
+        max_x = jnp.minimum(jnp.maximum(min_bound[0]+agent_view_size, 0), nrows)
+        max_y = jnp.minimum(jnp.maximum(min_bound[1]+agent_view_size, 0), ncols)
+
         all_pos = jnp.arange(ncols * nrows)
         mask = \
             ((all_pos % ncols) >= min_x) & \
@@ -76,7 +78,7 @@ class MazeRenderer(object):
             ((all_pos // ncols) >= min_y) & \
             ((all_pos // ncols) < max_y)
         mask = jnp.kron(mask.reshape(nrows, ncols), jnp.ones((self.tile_size, self.tile_size)))[..., None]
-        
+
         highlight_img = (img + 0.3 * (255 - img)).astype(jnp.uint8).clip(0, 255)
         return jnp.where(mask, highlight_img, img)
     

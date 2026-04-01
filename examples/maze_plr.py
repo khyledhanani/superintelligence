@@ -554,15 +554,18 @@ def main(config=None, project="JAXUED_TEST"):
         wandb.define_metric("cmaes/*", step_metric="num_updates")
     wandb.define_metric("diversity/*", step_metric="num_updates")
     wandb.define_metric("td_error/*", step_metric="num_updates")
+    wandb.define_metric("interp_compare/*", step_metric="num_updates")
     if config.get("use_llm"):
         wandb.define_metric("llm/*", step_metric="num_updates")
 
     # --- CMA-ES + VAE setup ---
     vae_decode_fn = None
+    vae_encode_fn = None
     cmaes_mgr = None
-    if config["use_cmaes"]:
-        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes"
-        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes"
+    _need_vae = config["use_cmaes"] or config.get("interp_compare_interval", 0) > 0
+    if _need_vae:
+        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes or --interp_compare_interval"
+        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes or --interp_compare_interval"
 
         # Load VAE config
         with open(config["vae_config_path"]) as f:
@@ -574,6 +577,8 @@ def main(config=None, project="JAXUED_TEST"):
             embed_dim=vae_cfg["embed_dim"],
             latent_dim=vae_cfg["latent_dim"],
             seq_len=vae_cfg["seq_len"],
+            enc_lstm_dim=vae_cfg.get("enc_lstm_dim", 300),
+            dec_lstm_dim=vae_cfg.get("dec_lstm_dim", 400),
         )
 
         # Load checkpoint
@@ -581,18 +586,33 @@ def main(config=None, project="JAXUED_TEST"):
             vae_ckpt = pickle.load(f)
         vae_params = vae_ckpt["params"] if isinstance(vae_ckpt, dict) and "params" in vae_ckpt else vae_ckpt
 
-        # Build pure decode function: z (latent_dim,) -> logits (seq_len, vocab_size)
+        # Build pure encode/decode functions
+        def vae_encode_fn(tokens_batch):
+            mean, _ = vae.apply({"params": vae_params}, tokens_batch, train=False, method=vae.encode)
+            return mean
+
         def vae_decode_fn(z):
             return vae.apply({"params": vae_params}, z, method=vae.decode)
 
+        # VAE grid parameters (defaults match 13x13; 21x21 config overrides them)
+        _vae_grid_size = vae_cfg.get("grid_size", 13)
+        _vae_vocab_size = vae_cfg["vocab_size"]
+        _vae_max_walls = vae_cfg.get("max_walls", 50)
+
+        from functools import partial
+        level_to_tokens_vae = partial(level_to_tokens, grid_size=_vae_grid_size, max_walls=_vae_max_walls)
+        decode_latent_to_levels_vae = partial(decode_latent_to_levels, grid_size=_vae_grid_size, vocab_size=_vae_vocab_size)
+
+        print(f"[VAE] Loaded from {config['vae_checkpoint_path']}, latent_dim={vae_cfg['latent_dim']}, grid_size={_vae_grid_size}")
+
+    if config["use_cmaes"]:
         # Initialize CMA-ES manager
         cmaes_mgr = CMAESManager(
             popsize=config["num_train_envs"],
             latent_dim=vae_cfg["latent_dim"],
             sigma_init=config["cmaes_sigma_init"],
         )
-        print(f"[CMA-ES] VAE loaded from {config['vae_checkpoint_path']}")
-        print(f"[CMA-ES] latent_dim={vae_cfg['latent_dim']}, popsize={config['num_train_envs']}")
+        print(f"[CMA-ES] popsize={config['num_train_envs']}")
 
     def log_eval(stats, train_state_info):
         print(f"Logging update: {stats['update_count']}")
@@ -709,7 +729,7 @@ def main(config=None, project="JAXUED_TEST"):
         wandb.log(log_dict)
 
     # Setup the environment
-    env = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
+    env = Maze(max_height=config["maze_height"], max_width=config["maze_width"], agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
     sample_random_level = make_level_generator(env.max_height, env.max_width, config["n_walls"])
     env_renderer = MazeRenderer(env, tile_size=8)
@@ -837,7 +857,7 @@ def main(config=None, project="JAXUED_TEST"):
                 # CMA-ES: ask for candidate latent vectors, decode to levels
                 rng, rng_ask, rng_decode = jax.random.split(rng, 3)
                 z_population, es_state = cmaes_mgr.ask(rng_ask, es_state)
-                new_levels = decode_latent_to_levels(vae_decode_fn, z_population, rng_decode)
+                new_levels = decode_latent_to_levels_vae(vae_decode_fn, z_population, rng_decode)
             else:
                 new_levels = jax.vmap(sample_random_level)(jax.random.split(rng_levels, config["num_train_envs"]))
 
@@ -1336,7 +1356,8 @@ def main(config=None, project="JAXUED_TEST"):
             return
 
         buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
-        tokens = jax.vmap(level_to_tokens)(buffer_levels)
+        _l2t = level_to_tokens_vae if _need_vae else level_to_tokens
+        tokens = jax.vmap(_l2t)(buffer_levels)
         tokens_np = np.asarray(tokens)
 
         dump_data = {
@@ -1406,7 +1427,8 @@ def main(config=None, project="JAXUED_TEST"):
         sampler = train_state.sampler
         size = int(sampler["size"])
         buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
-        tokens = np.asarray(jax.vmap(level_to_tokens)(buffer_levels))
+        _l2t = level_to_tokens_vae if _need_vae else level_to_tokens
+        tokens = np.asarray(jax.vmap(_l2t)(buffer_levels))
         hashes = np.zeros(sampler["scores"].shape[0], dtype=np.uint64)
         for i in range(size):
             hashes[i] = int(_hl.md5(tokens[i].tobytes()).hexdigest()[:16], 16)
@@ -1630,6 +1652,203 @@ def main(config=None, project="JAXUED_TEST"):
             print(f"[Diversity @ {updates_so_far}] TD-EMD: mean={emd_arr.mean():.4f}, "
                   f"std={emd_arr.std():.4f}, n_pairs={len(emd_values)}")
 
+    # --- Shadow comparison: interpolation vs ACCEL mutations (logging only) ---
+    def _slerp_batch(z1, z2, alpha):
+        """Spherical linear interpolation preserving norm through direction interpolation."""
+        norm1 = jnp.linalg.norm(z1, axis=-1, keepdims=True)
+        norm2 = jnp.linalg.norm(z2, axis=-1, keepdims=True)
+        z1_n = z1 / jnp.maximum(norm1, 1e-8)
+        z2_n = z2 / jnp.maximum(norm2, 1e-8)
+        cos_omega = jnp.clip(jnp.sum(z1_n * z2_n, axis=-1, keepdims=True), -1.0, 1.0)
+        omega = jnp.arccos(cos_omega)
+        sin_omega = jnp.sin(omega)
+        safe = sin_omega > 1e-6
+        s1 = jnp.where(safe, jnp.sin((1 - alpha) * omega) / sin_omega, 1 - alpha)
+        s2 = jnp.where(safe, jnp.sin(alpha * omega) / sin_omega, alpha)
+        z_dir = s1 * z1_n + s2 * z2_n
+        norm_interp = (1 - alpha) * norm1 + alpha * norm2
+        z_dir_norm = jnp.linalg.norm(z_dir, axis=-1, keepdims=True)
+        return z_dir * (norm_interp / jnp.maximum(z_dir_norm, 1e-8))
+
+    def _pair_random(n_items, n_pairs, rng_seed):
+        """Random permutation pairing."""
+        rng = np.random.RandomState(rng_seed)
+        idx = rng.permutation(n_items)
+        return idx[:n_pairs], idx[n_pairs:2 * n_pairs]
+
+    def _pair_max_dissimilar(embeddings, n_pairs):
+        """Greedy max-dissimilarity pairing."""
+        from sklearn.metrics import pairwise_distances
+        K = len(embeddings)
+        dist_matrix = pairwise_distances(embeddings, metric="euclidean")
+        np.fill_diagonal(dist_matrix, -np.inf)
+        available = set(range(K))
+        paired_a, paired_b = [], []
+        for _ in range(n_pairs):
+            mask = np.full_like(dist_matrix, -np.inf)
+            avail = sorted(available)
+            for i in avail:
+                for j in avail:
+                    if i != j:
+                        mask[i, j] = dist_matrix[i, j]
+            flat_idx = np.argmax(mask)
+            i, j = np.unravel_index(flat_idx, mask.shape)
+            paired_a.append(i)
+            paired_b.append(j)
+            available.discard(i)
+            available.discard(j)
+        return np.array(paired_a), np.array(paired_b)
+
+    _interp_history = {"xs": [], "sfl": {}, "sr": {}, "ratio": {}}
+
+    def compare_interp_vs_accel(train_state, eval_step):
+        """Shadow comparison: score 4 interpolation methods vs ACCEL children.
+
+        Methods: random+linear, random+slerp, max_dissim+linear, max_dissim+slerp.
+        Runs outside JIT at interp_compare_interval. Does NOT modify train_state
+        or the buffer — purely for logging to wandb.
+        """
+        interval = config.get("interp_compare_interval", 0)
+        if interval <= 0 or vae_decode_fn is None:
+            return
+        updates_so_far = (eval_step + 1) * config["eval_freq"]
+        if updates_so_far % interval != 0:
+            return
+
+        sampler = train_state.sampler
+        buf_size = int(np.asarray(sampler["size"]))
+        top_k = min(config.get("interp_compare_top_k", 64), buf_size)
+        if top_k < 4:
+            return
+
+        alpha = config.get("interp_compare_alpha", 0.2)
+        num_attempts = config.get("interp_compare_num_attempts", 10)
+        n_children = top_k // 2  # 2 parents per child
+
+        # Extract top-K levels by score
+        scores_np = np.asarray(sampler["scores"][:buf_size])
+        top_k_idx = np.argsort(-scores_np)[:top_k]
+        levels_pytree = sampler["levels"]
+        top_levels_list = [jax.tree_util.tree_map(lambda x: x[i], levels_pytree) for i in top_k_idx]
+        top_levels = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *top_levels_list)
+
+        # Compute agent behavioural embeddings for top-K
+        rng_emb = jax.random.PRNGKey(eval_step + 5000)
+        rng_emb, rng_reset_emb, rng_eval_emb = jax.random.split(rng_emb, 3)
+        init_obs_emb, init_state_emb = jax.vmap(env.reset_to_level, (0, 0, None))(
+            jax.random.split(rng_reset_emb, top_k), top_levels, env_params)
+        (_, _, _, _, _, _), traj_emb = sample_trajectories_rnn(
+            rng_eval_emb, env, env_params, train_state,
+            ActorCritic.initialize_carry((top_k,)),
+            init_obs_emb, init_state_emb, top_k, config["num_steps"])
+        _, actions_emb, _, dones_emb, _, _, _, _, hstates_emb = traj_emb
+        top_embeddings = np.asarray(compute_insertion_embeddings(hstates_emb, actions_emb, dones_emb))
+
+        # Encode top-K to VAE latent space
+        top_tokens = np.asarray(jax.vmap(level_to_tokens_vae)(top_levels))
+        means = vae_encode_fn(jnp.array(top_tokens))
+
+        # Build pairings
+        idx_maxd_a, idx_maxd_b = _pair_max_dissimilar(top_embeddings, n_children)
+        idx_rand_a, idx_rand_b = _pair_random(top_k, n_children, rng_seed=eval_step)
+
+        # Generate children for all 4 methods
+        methods = {
+            "rand_linear":    alpha * means[idx_rand_a] + (1 - alpha) * means[idx_rand_b],
+            "rand_slerp":     _slerp_batch(means[idx_rand_a], means[idx_rand_b], alpha),
+            "maxd_linear":    alpha * means[idx_maxd_a] + (1 - alpha) * means[idx_maxd_b],
+            "maxd_slerp":     _slerp_batch(means[idx_maxd_a], means[idx_maxd_b], alpha),
+        }
+
+        # Decode all children and score them
+        def score_levels(levels, rng_base):
+            n = jax.tree_util.tree_flatten(levels)[0][0].shape[0]
+            max_steps = env_params.max_steps_in_episode
+            all_solved = []
+            for attempt in range(num_attempts):
+                rng = jax.random.PRNGKey(attempt + 1000 + rng_base)
+                rng, rng_r, rng_e = jax.random.split(rng, 3)
+                init_obs, init_env_state = jax.vmap(eval_env.reset_to_level, (0, 0, None))(
+                    jax.random.split(rng_r, n), levels, env_params)
+                _, rewards, _ = evaluate_rnn(
+                    rng_e, eval_env, env_params, train_state,
+                    ActorCritic.initialize_carry((n,)),
+                    init_obs, init_env_state, max_steps)
+                all_solved.append(np.asarray((rewards.sum(axis=0) > 0).astype(jnp.float32)))
+            solved = np.stack(all_solved, axis=0)
+            sr = solved.mean(axis=0)
+            sfl = sr * (1 - sr)
+            return sfl, sr
+
+        # Score all methods + ACCEL
+        method_sfl, method_sr = {}, {}
+        rng_offset = 0
+        for method_name, z_child in methods.items():
+            rng_decode = jax.random.PRNGKey(eval_step + 6000 + rng_offset)
+            levels = decode_latent_to_levels_vae(vae_decode_fn, z_child, rng_decode)
+            sfl, sr = score_levels(levels, eval_step * 100 + rng_offset)
+            method_sfl[method_name] = float(sfl.mean())
+            method_sr[method_name] = float(sr.mean())
+            rng_offset += 10
+
+        accel_parents = train_state.replay_last_level_batch
+        n_accel = config["num_train_envs"]
+        rng_accel = jax.random.PRNGKey(eval_step + 7000)
+        accel_levels = jax.vmap(mutate_level, (0, 0, None))(
+            jax.random.split(rng_accel, n_accel), accel_parents, config["num_edits"])
+        accel_sfl, accel_sr = score_levels(accel_levels, eval_step * 100 + 50)
+        method_sfl["accel"] = float(accel_sfl.mean())
+        method_sr["accel"] = float(accel_sr.mean())
+
+        # Ratios vs ACCEL
+        accel_sfl_val = max(method_sfl["accel"], 1e-8)
+        method_ratio = {m: method_sfl[m] / accel_sfl_val for m in methods}
+
+        # Accumulate history for line_series charts
+        all_methods = list(methods.keys()) + ["accel"]
+        _interp_history["xs"].append(updates_so_far)
+        for m in all_methods:
+            _interp_history["sfl"].setdefault(m, []).append(method_sfl[m])
+            _interp_history["sr"].setdefault(m, []).append(method_sr[m])
+        for m in methods:
+            _interp_history["ratio"].setdefault(m, []).append(method_ratio[m])
+
+        # Log combined line_series charts (one plot per metric type)
+        xs_list = _interp_history["xs"]
+        wandb.log({
+            "num_updates": updates_so_far,
+            "interp_compare/sfl_all": wandb.plot.line_series(
+                xs=xs_list,
+                ys=[_interp_history["sfl"][m] for m in all_methods],
+                keys=all_methods,
+                title="SFL by Method",
+                xname="num_updates",
+            ),
+            "interp_compare/solve_rate_all": wandb.plot.line_series(
+                xs=xs_list,
+                ys=[_interp_history["sr"][m] for m in all_methods],
+                keys=all_methods,
+                title="Solve Rate by Method",
+                xname="num_updates",
+            ),
+            "interp_compare/sfl_ratio_all": wandb.plot.line_series(
+                xs=xs_list,
+                ys=[_interp_history["ratio"][m] for m in methods],
+                keys=list(methods.keys()),
+                title="SFL Ratio vs ACCEL (>1 = better)",
+                xname="num_updates",
+            ),
+        })
+
+        best_method = max(methods.keys(), key=lambda m: method_sfl[m])
+        print(f"[InterpCompare @ {updates_so_far}] "
+              f"Best: {best_method} SFL={method_sfl[best_method]:.4f} | "
+              f"ACCEL SFL={method_sfl['accel']:.4f} | "
+              f"rand_lin={method_sfl['rand_linear']:.4f} "
+              f"rand_slp={method_sfl['rand_slerp']:.4f} "
+              f"maxd_lin={method_sfl['maxd_linear']:.4f} "
+              f"maxd_slp={method_sfl['maxd_slerp']:.4f}")
+
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:
         checkpoint_manager = setup_checkpointing(config, train_state, env, env_params)
@@ -1652,6 +1871,9 @@ def main(config=None, project="JAXUED_TEST"):
 
         # Pairwise diversity logging
         compute_buffer_diversity(runner_state[1], eval_step)
+
+        # Shadow comparison: interpolation vs ACCEL mutations
+        compare_interp_vs_accel(runner_state[1], eval_step)
 
         # LLM injection hook
         if llm_injector is not None:
@@ -1676,7 +1898,8 @@ def main(config=None, project="JAXUED_TEST"):
 
     buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
     buffer_scores = np.asarray(sampler["scores"][:size])
-    tokens = jax.vmap(level_to_tokens)(buffer_levels)
+    _l2t = level_to_tokens_vae if _need_vae else level_to_tokens
+    tokens = jax.vmap(_l2t)(buffer_levels)
 
     # === Post-training: evaluate agent on buffer levels ===
     if config.get("skip_post_eval"):
@@ -1685,7 +1908,7 @@ def main(config=None, project="JAXUED_TEST"):
         return
 
     print(f"\n[Post-training] Evaluating agent on {size} buffer levels...")
-    eval_env_post = Maze(max_height=13, max_width=13, agent_view_size=config["agent_view_size"], normalize_obs=True)
+    eval_env_post = Maze(max_height=config["maze_height"], max_width=config["maze_width"], agent_view_size=config["agent_view_size"], normalize_obs=True)
     max_steps = env_params.max_steps_in_episode
     num_eval_attempts = 5
 
@@ -1952,6 +2175,8 @@ if __name__=="__main__":
     group.add_argument("--use_accel", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--num_edits", type=int, default=5)
     # === ENV CONFIG ===
+    group.add_argument("--maze_height", type=int, default=13)
+    group.add_argument("--maze_width", type=int, default=13)
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)
@@ -1984,6 +2209,16 @@ if __name__=="__main__":
                        help="Compute diversity metrics every N eval steps (0 to disable)")
     group.add_argument("--diversity_sample_size", type=int, default=20,
                        help="Number of buffer levels to subsample for pairwise diversity metrics")
+    # === INTERP vs ACCEL SHADOW COMPARISON ===
+    group.add_argument("--interp_compare_interval", type=int, default=0,
+                       help="Log interp vs ACCEL mutation comparison every N updates (0 to disable). "
+                            "Requires --use_cmaes (VAE). Does NOT affect training.")
+    group.add_argument("--interp_compare_top_k", type=int, default=64,
+                       help="Top-K buffer levels to use for interpolation comparison")
+    group.add_argument("--interp_compare_alpha", type=float, default=0.2,
+                       help="Interpolation alpha for shadow comparison")
+    group.add_argument("--interp_compare_num_attempts", type=int, default=10,
+                       help="Number of rollout attempts for scoring in shadow comparison")
 
     # === LLM INJECTION CONFIG ===
     llm_group = parser.add_argument_group('LLM Injection')

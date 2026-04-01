@@ -31,6 +31,8 @@ class CluttrVAE(nn.Module):
     embed_dim: int = 300
     latent_dim: int = 64
     seq_len: int = 52
+    enc_lstm_dim: int = 300
+    dec_lstm_dim: int = 400
 
     def setup(self):
         # Encoder
@@ -39,8 +41,8 @@ class CluttrVAE(nn.Module):
         self.enc_hw1 = HighwayStage(self.embed_dim)
         self.enc_hw2 = HighwayStage(self.embed_dim)
         self.enc_bilstm = nn.Bidirectional(
-            nn.RNN(nn.LSTMCell(300)),
-            nn.RNN(nn.LSTMCell(300)),
+            nn.RNN(nn.LSTMCell(self.enc_lstm_dim)),
+            nn.RNN(nn.LSTMCell(self.enc_lstm_dim)),
         )
         self.enc_drop2 = nn.Dropout(rate=0.1)
         self.mean_layer = nn.Dense(self.latent_dim)
@@ -48,10 +50,10 @@ class CluttrVAE(nn.Module):
 
         # Decoder
         self.dec_bilstm1 = nn.Bidirectional(
-            nn.RNN(nn.LSTMCell(400)), nn.RNN(nn.LSTMCell(400)),
+            nn.RNN(nn.LSTMCell(self.dec_lstm_dim)), nn.RNN(nn.LSTMCell(self.dec_lstm_dim)),
         )
         self.dec_bilstm2 = nn.Bidirectional(
-            nn.RNN(nn.LSTMCell(400)), nn.RNN(nn.LSTMCell(400)),
+            nn.RNN(nn.LSTMCell(self.dec_lstm_dim)), nn.RNN(nn.LSTMCell(self.dec_lstm_dim)),
         )
         self.dec_output = nn.Dense(self.vocab_size)
 
@@ -71,8 +73,8 @@ class CluttrVAE(nn.Module):
         outputs = self.enc_bilstm(x)
         outputs = self.enc_drop2(outputs, deterministic=not train)
 
-        fwd_out = outputs[:, :, :300]
-        bwd_out = outputs[:, :, 300:]
+        fwd_out = outputs[:, :, :self.enc_lstm_dim]
+        bwd_out = outputs[:, :, self.enc_lstm_dim:]
         h = jnp.concatenate([fwd_out[:, -1, :], bwd_out[:, 0, :]], axis=-1)
 
         mean = jnp.tanh(self.mean_layer(h)) * 6.0
