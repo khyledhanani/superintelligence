@@ -147,8 +147,8 @@ def load_agent(checkpoint_dir, checkpoint_step=-1):
     # Try standard restore first; fall back to tensorstore for TPU->CPU
     try:
         restored = checkpoint_manager.restore(step)
-    except ValueError as e:
-        if "was not found in jax.local_devices()" in str(e) or "Topology mismatch" in str(e):
+    except (ValueError, FileNotFoundError) as e:
+        if "was not found in jax.local_devices()" in str(e) or "Topology mismatch" in str(e) or "Checkpoint structure file does not exist" in str(e):
             print("[Agent] TPU checkpoint detected, restoring params via tensorstore...")
             restored = {"params": _restore_params_from_ocdbt(
                 os.path.join(models_dir, str(step), "default"),

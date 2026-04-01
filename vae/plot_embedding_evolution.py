@@ -24,16 +24,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'examples'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.dirname(__file__))
 
-DATA_ROOT = "/cs/student/project_msc/2025/csml/rhautier/injection_data/results"
+DEFAULT_DATA_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "gcs_artifacts", "plot_data",
+)
 
 SEEDS = [0, 1, 2]
 PCTS = ["5pct", "10pct", "15pct", "20pct", "25pct"]
 PCT_LABELS = ["5%", "10%", "15%", "20%", "25%"]
 
 
-def load_merged_buffer(seed, pct):
+def load_merged_buffer(seed, pct, data_root=None):
     """Load pre-training merged buffer (tokens + origins, no embeddings)."""
-    path = os.path.join(DATA_ROOT, f"llm_inject_seed{seed}", f"merged_buffer_{pct}.npz")
+    root = data_root or DEFAULT_DATA_ROOT
+    path = os.path.join(root, f"llm_inject_seed{seed}", f"merged_buffer_{pct}.npz")
     d = np.load(path)
     size = int(d["size"]) if "size" in d else len(d["tokens"])
     return {
@@ -99,6 +103,8 @@ def main():
     parser.add_argument("--pcts", type=str, default="5pct,10pct,15pct,20pct,25pct")
     parser.add_argument("--tsne_perplexity", type=float, default=40)
     parser.add_argument("--output_dir", type=str, default="vae/plots/embedding_evolution")
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Root dir with llm_inject_seed{s}/ layout (default: gcs_artifacts/plot_data)")
     parser.add_argument("--cache_dir", type=str, default=None,
                         help="Cache computed embeddings to avoid recomputation")
     args = parser.parse_args()
@@ -106,6 +112,7 @@ def main():
     seeds = [int(s) for s in args.seeds.split(",")]
     pcts = args.pcts.split(",")
     pct_labels = [p.replace("pct", "%") for p in pcts]
+    data_root = args.data_root
 
     os.makedirs(args.output_dir, exist_ok=True)
     if args.cache_dir:
@@ -137,7 +144,7 @@ def main():
                     }
                     continue
 
-            buf = load_merged_buffer(seed, pct)
+            buf = load_merged_buffer(seed, pct, data_root=data_root)
             n_org = (buf["origins"] == 0).sum()
             n_orig = (buf["origins"] == 1).sum()
             n_mut = (buf["origins"] == 2).sum()

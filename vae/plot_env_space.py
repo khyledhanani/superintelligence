@@ -30,7 +30,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'examples'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.dirname(__file__))
 
-DATA_ROOT = "/cs/student/project_msc/2025/csml/rhautier/injection_data/results"
+DEFAULT_DATA_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "gcs_artifacts", "plot_data",
+)
 GRID_SIZE = 13
 
 
@@ -70,15 +73,17 @@ def tokens_to_structural_features(tokens_batch):
     return features
 
 
-def load_merged_buffer(seed, pct):
-    path = os.path.join(DATA_ROOT, f"llm_inject_seed{seed}", f"merged_buffer_{pct}.npz")
+def load_merged_buffer(seed, pct, data_root=None):
+    root = data_root or DEFAULT_DATA_ROOT
+    path = os.path.join(root, f"llm_inject_seed{seed}", f"merged_buffer_{pct}.npz")
     d = np.load(path)
     size = int(d["size"]) if "size" in d else len(d["tokens"])
     return {"tokens": d["tokens"][:size], "origins": d["origins"][:size], "size": size}
 
 
-def load_buffer_dump(seed, pct, update):
-    path = os.path.join(DATA_ROOT, f"llm_inject_seed{seed}",
+def load_buffer_dump(seed, pct, update, data_root=None):
+    root = data_root or DEFAULT_DATA_ROOT
+    path = os.path.join(root, f"llm_inject_seed{seed}",
                         f"training_{pct}", "buffer_dumps", f"buffer_dump_{update}.npz")
     d = np.load(path)
     size = int(d["size"])
@@ -182,6 +187,8 @@ def main():
     parser.add_argument("--method", type=str, default="both",
                         choices=["pca", "tsne", "both"])
     parser.add_argument("--tsne_perplexity", type=float, default=40)
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Root dir with llm_inject_seed{s}/ layout (default: gcs_artifacts/plot_data)")
     parser.add_argument("--output_dir", type=str, default="vae/plots/env_space")
     args = parser.parse_args()
 
@@ -190,6 +197,7 @@ def main():
     pct_labels = [p.replace("pct", "%") for p in pcts]
     updates = [int(u) for u in args.updates.split(",")]
     methods = ["pca", "tsne"] if args.method == "both" else [args.method]
+    data_root = args.data_root
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -203,13 +211,17 @@ def main():
         origins_dict = {}
         for seed in seeds:
             for pct in pcts:
-                buf = load_merged_buffer(seed, pct)
-                feats = tokens_to_structural_features(buf["tokens"])
-                features_dict[(seed, pct)] = feats
-                origins_dict[(seed, pct)] = buf["origins"]
-                all_features_for_pca.append(feats)
-                print(f"  initial s{seed}/{pct}: {buf['size']} levels")
-        snapshots.append(("initial", features_dict, origins_dict))
+                try:
+                    buf = load_merged_buffer(seed, pct, data_root=data_root)
+                    feats = tokens_to_structural_features(buf["tokens"])
+                    features_dict[(seed, pct)] = feats
+                    origins_dict[(seed, pct)] = buf["origins"]
+                    all_features_for_pca.append(feats)
+                    print(f"  initial s{seed}/{pct}: {buf['size']} levels")
+                except FileNotFoundError:
+                    print(f"  WARNING: missing initial s{seed}/{pct}")
+        if features_dict:
+            snapshots.append(("initial", features_dict, origins_dict))
 
     if args.source in ("training", "both"):
         for update in updates:
@@ -218,7 +230,7 @@ def main():
             for seed in seeds:
                 for pct in pcts:
                     try:
-                        buf = load_buffer_dump(seed, pct, update)
+                        buf = load_buffer_dump(seed, pct, update, data_root=data_root)
                         feats = tokens_to_structural_features(buf["tokens"])
                         features_dict[(seed, pct)] = feats
                         origins_dict[(seed, pct)] = buf["origins"]

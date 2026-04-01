@@ -24,13 +24,17 @@ from matplotlib.lines import Line2D
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-DATA_ROOT = "/cs/student/project_msc/2025/csml/rhautier/injection_data/results"
+DEFAULT_DATA_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "gcs_artifacts", "plot_data",
+)
 
 
-def load_buffer_dump(seed, pct, update):
+def load_buffer_dump(seed, pct, update, data_root=None):
     """Load training buffer dump with embeddings and origins."""
+    root = data_root or DEFAULT_DATA_ROOT
     path = os.path.join(
-        DATA_ROOT, f"llm_inject_seed{seed}",
+        root, f"llm_inject_seed{seed}",
         f"training_{pct}", "buffer_dumps", f"buffer_dump_{update}.npz")
     d = np.load(path)
     size = int(d["size"])
@@ -77,7 +81,7 @@ def _plot_cell(ax, coords, origins, pct_label, seed, show_xlabel=False, show_yla
         ax.set_ylabel(ylabel, fontsize=9)
 
 
-def make_grid_pca(seeds, pcts, pct_labels, update, pca_model, output_dir):
+def make_grid_pca(seeds, pcts, pct_labels, update, pca_model, output_dir, data_root=None):
     """Create a PCA grid plot for one training update step."""
     n_rows = len(seeds)
     n_cols = len(pcts)
@@ -87,7 +91,7 @@ def make_grid_pca(seeds, pcts, pct_labels, update, pca_model, output_dir):
 
     for i, seed in enumerate(seeds):
         for j, pct in enumerate(pcts):
-            buf = load_buffer_dump(seed, pct, update)
+            buf = load_buffer_dump(seed, pct, update, data_root=data_root)
             coords = pca_model.transform(buf["embeddings"])
             _plot_cell(axes[i][j], coords, buf["origins"], pct_labels[j], seed,
                        show_xlabel=(i == n_rows - 1), show_ylabel=(j == 0),
@@ -97,7 +101,7 @@ def make_grid_pca(seeds, pcts, pct_labels, update, pca_model, output_dir):
                          os.path.join(output_dir, f"grid_pca_u{update}.png"))
 
 
-def make_grid_tsne(seeds, pcts, pct_labels, update, output_dir, perplexity=40):
+def make_grid_tsne(seeds, pcts, pct_labels, update, output_dir, perplexity=40, data_root=None):
     """Create a t-SNE grid plot for one training update step."""
     n_rows = len(seeds)
     n_cols = len(pcts)
@@ -106,7 +110,7 @@ def make_grid_tsne(seeds, pcts, pct_labels, update, output_dir, perplexity=40):
 
     for i, seed in enumerate(seeds):
         for j, pct in enumerate(pcts):
-            buf = load_buffer_dump(seed, pct, update)
+            buf = load_buffer_dump(seed, pct, update, data_root=data_root)
             print(f"    t-SNE: seed {seed}, {pct}...")
             perp = min(perplexity, buf["size"] - 1)
             tsne = TSNE(n_components=2, perplexity=perp, random_state=42,
@@ -148,6 +152,8 @@ def main():
     parser.add_argument("--method", type=str, default="both",
                         choices=["pca", "tsne", "both"])
     parser.add_argument("--tsne_perplexity", type=float, default=40)
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Root dir with llm_inject_seed{s}/ layout (default: gcs_artifacts/plot_data)")
     parser.add_argument("--output_dir", type=str,
                         default="vae/plots/embedding_training")
     args = parser.parse_args()
@@ -156,6 +162,7 @@ def main():
     pcts = args.pcts.split(",")
     pct_labels = [p.replace("pct", "%") for p in pcts]
     updates = [int(u) for u in args.updates.split(",")]
+    data_root = args.data_root
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -166,7 +173,7 @@ def main():
         for seed in seeds:
             for pct in pcts:
                 try:
-                    buf = load_buffer_dump(seed, pct, update)
+                    buf = load_buffer_dump(seed, pct, update, data_root=data_root)
                     all_emb.append(buf["embeddings"])
                 except FileNotFoundError:
                     print(f"  WARNING: missing s{seed}/{pct}/u{update}, skipping")
@@ -183,10 +190,11 @@ def main():
         print(f"\n=== Update {update} ===")
         try:
             if args.method in ("pca", "both"):
-                make_grid_pca(seeds, pcts, pct_labels, update, pca, args.output_dir)
+                make_grid_pca(seeds, pcts, pct_labels, update, pca, args.output_dir,
+                              data_root=data_root)
             if args.method in ("tsne", "both"):
                 make_grid_tsne(seeds, pcts, pct_labels, update, args.output_dir,
-                               perplexity=args.tsne_perplexity)
+                               perplexity=args.tsne_perplexity, data_root=data_root)
         except FileNotFoundError as e:
             print(f"  Skipping update {update}: {e}")
 
