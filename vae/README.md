@@ -21,7 +21,16 @@ This directory contains a VAE for maze level encoding/decoding and scripts to an
 
 **Token format**: `[wall_indices (1-based, sorted, 0-padded), goal_idx, agent_idx]`. For 13x13: 50 wall slots + 2 = 52 tokens. For 21x21: 150 + 2 = 152.
 
-**Checkpoints**: `/cs/student/project_msc/2025/csml/rhautier/vae_checkpoints/{13x13,21x21}/`
+**Checkpoints** (local copies): `/cs/student/project_msc/2025/csml/rhautier/vae_checkpoints/{13x13,21x21}/`
+
+**GCS source** (bucket: `gs://ucl-ued-project-bucket`):
+
+| Grid | GCS checkpoint | GCS config | Training run ID |
+|------|---------------|------------|-----------------|
+| 13x13 | `vae/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/checkpoints/checkpoint_500000.pkl` | `vae/runs/20260309_091933_lr5e-05_lat64_clutr_aligned_rw1000_beta10.0/config.yaml` | `clutr_aligned_rw1000_beta10.0` |
+| 21x21 | `vae/runs/20260322_222534_lr5e-05_lat96_21x21_scale_up/checkpoints/checkpoint_final.pkl` | `vae/runs/20260322_222534_lr5e-05_lat96_21x21_scale_up/config.yaml` | `21x21_scale_up` |
+
+Training datasets also on GCS: `vae/datasets/train_1M_envs.npy` (13x13), `vae/datasets/train_21x21_2M.npy` (21x21).
 
 **Token utilities** (`vae_level_utils.py`): `level_to_tokens()`, `tokens_to_level()`, `decode_latent_to_levels()` — all parameterized by `grid_size`, `vocab_size`, `max_walls` with 13x13 defaults.
 
