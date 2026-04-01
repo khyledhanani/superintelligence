@@ -1,8 +1,11 @@
 """Visualize buffer embedding evolution during training via t-SNE.
 
-For each (seed, timestep), loads the agent checkpoint and buffer dump,
-recomputes fresh 257D embeddings by rolling out the current agent on
-all buffer levels, then plots t-SNE colored by origin:
+Supports two modes:
+  - behavioral: 257D embeddings from agent rollouts (requires GPU + checkpoints)
+  - structural: 173D env features from token layout (CPU only, no checkpoints)
+
+For each (seed, timestep), loads the buffer dump (and agent checkpoint in
+behavioral mode), computes embeddings, then plots t-SNE colored by origin:
   grey = organic ACCEL, green = LLM mutation, blue = LLM original.
 
 Grid: rows = seeds, columns = training timesteps.
@@ -10,10 +13,13 @@ Grid: rows = seeds, columns = training timesteps.
 Data is fetched from GCS if not available locally.
 
 Usage:
+    # Behavioral (default, needs GPU)
     python vae/plot_tsne_training_evolution.py \
-        --inject_pct 10pct \
-        --seeds 0,1,2 \
-        --timesteps 250,500,750,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000
+        --inject_pct 10pct --mode behavioral
+
+    # Structural (CPU only)
+    python vae/plot_tsne_training_evolution.py \
+        --inject_pct 10pct --mode structural --cache_dir vae/plots/tsne_env_cache
 """
 import argparse
 import os
@@ -29,6 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'examples'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.dirname(__file__))
 
+GRID_SIZE = 13  # default, overridable via --grid_size
 GCS_BUCKET = "ucl-ued-project-bucket"
 GCS_PROJECT = "open-endedness-ued-project"
 
@@ -84,6 +91,32 @@ def gcs_download_dir(gcs_prefix, local_dir):
     except Exception as e:
         print(f"  [GCS] Failed to download {gcs_prefix}: {e}")
         return False
+
+
+def tokens_to_structural_features(tokens_batch, grid_size=13):
+    """Convert (N, seq_len) token array to (N, grid_size^2 + 4) structural features."""
+    N = len(tokens_batch)
+    n_cells = grid_size * grid_size
+    features = np.zeros((N, n_cells + 4), dtype=np.float32)
+    for i in range(N):
+        tokens = tokens_batch[i]
+        wall_tokens = tokens[:-2]
+        goal_idx = tokens[-2]
+        agent_idx = tokens[-1]
+        wall_flat = np.zeros(n_cells, dtype=np.float32)
+        for w in wall_tokens:
+            if 0 < w <= n_cells:
+                wall_flat[int(w) - 1] = 1.0
+        features[i, :n_cells] = wall_flat
+        if agent_idx > 0:
+            a0 = int(agent_idx) - 1
+            features[i, n_cells] = (a0 % grid_size) / max(grid_size - 1, 1)
+            features[i, n_cells + 1] = (a0 // grid_size) / max(grid_size - 1, 1)
+        if goal_idx > 0:
+            g0 = int(goal_idx) - 1
+            features[i, n_cells + 2] = (g0 % grid_size) / max(grid_size - 1, 1)
+            features[i, n_cells + 3] = (g0 // grid_size) / max(grid_size - 1, 1)
+    return features
 
 
 def updates_to_ckpt_step(updates, eval_freq=250):
@@ -173,8 +206,12 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
     n_rows = len(seeds)
     n_cols = len(timesteps)
 
-    # --- Step 1: Download data from GCS and compute embeddings ---
-    print("=== Step 1: Loading data and computing embeddings ===")
+    mode = args.mode
+    is_structural = (mode == "structural")
+    cache_prefix = "env" if is_structural else "emb"
+
+    # --- Step 1: Download data and compute embeddings/features ---
+    print(f"=== Step 1: Loading data and computing {'structural features' if is_structural else 'behavioral embeddings'} ===")
     data = {}  # (seed, timestep) -> {embeddings, origins, scores}
 
     for seed in seeds:
@@ -189,12 +226,12 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
             key = (seed, ts)
             print(f"\n  Seed {seed}, update {ts}:")
 
-            # Check embedding cache
+            # Check cache
             if args.cache_dir:
                 cache_path = os.path.join(args.cache_dir,
-                                          f"emb_{inject_pct}_s{seed}_t{ts}.npz")
+                                          f"{cache_prefix}_{inject_pct}_s{seed}_t{ts}.npz")
                 if os.path.exists(cache_path):
-                    print(f"    Loading from cache: {cache_path}")
+                    print(f"    Loading from cache")
                     cached = np.load(cache_path)
                     data[key] = {
                         "embeddings": cached["embeddings"],
@@ -223,31 +260,35 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
             n_mut = (buf["origins"] == 2).sum()
             print(f"    {buf['size']} levels: organic={n_org}, LLM orig={n_orig}, LLM mut={n_mut}")
 
-            # Download checkpoint from GCS
-            ckpt_step = updates_to_ckpt_step(ts)
-            ckpt_run_dir = os.path.join(ckpt_local, run_name, str(seed))
+            if is_structural:
+                print(f"    Computing structural features (grid={args.grid_size})...")
+                embeddings = tokens_to_structural_features(buf["tokens"], grid_size=args.grid_size)
+            else:
+                # Download checkpoint from GCS
+                ckpt_step = updates_to_ckpt_step(ts)
+                ckpt_run_dir = os.path.join(ckpt_local, run_name, str(seed))
 
-            config_gcs = f"{gcs_training_prefix}/checkpoints/{run_name}/{seed}/config.json"
-            config_local = os.path.join(ckpt_run_dir, "config.json")
-            if not gcs_download(config_gcs, config_local):
-                print(f"    SKIP: config.json not found on GCS")
-                continue
+                config_gcs = f"{gcs_training_prefix}/checkpoints/{run_name}/{seed}/config.json"
+                config_local = os.path.join(ckpt_run_dir, "config.json")
+                if not gcs_download(config_gcs, config_local):
+                    print(f"    SKIP: config.json not found on GCS")
+                    continue
 
-            models_gcs = f"{gcs_training_prefix}/checkpoints/{run_name}/{seed}/models/{ckpt_step}"
-            models_local = os.path.join(ckpt_run_dir, "models", str(ckpt_step))
-            if not gcs_download_dir(models_gcs, models_local):
-                print(f"    SKIP: checkpoint step {ckpt_step} not found on GCS")
-                continue
+                models_gcs = f"{gcs_training_prefix}/checkpoints/{run_name}/{seed}/models/{ckpt_step}"
+                models_local = os.path.join(ckpt_run_dir, "models", str(ckpt_step))
+                if not gcs_download_dir(models_gcs, models_local):
+                    print(f"    SKIP: checkpoint step {ckpt_step} not found on GCS")
+                    continue
 
-            print(f"    Computing embeddings (ckpt step {ckpt_step}, {args.num_rollouts} rollouts)...")
-            embeddings = compute_embeddings(
-                buf["tokens"], ckpt_run_dir, ckpt_step,
-                batch_size=args.batch_size,
-                num_rollouts=args.num_rollouts,
-            )
-            if embeddings is None:
-                print(f"    SKIP: could not load agent")
-                continue
+                print(f"    Computing behavioral embeddings (ckpt step {ckpt_step}, {args.num_rollouts} rollouts)...")
+                embeddings = compute_embeddings(
+                    buf["tokens"], ckpt_run_dir, ckpt_step,
+                    batch_size=args.batch_size,
+                    num_rollouts=args.num_rollouts,
+                )
+                if embeddings is None:
+                    print(f"    SKIP: could not load agent")
+                    continue
 
             data[key] = {
                 "embeddings": embeddings,
@@ -260,7 +301,7 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                                     embeddings=embeddings,
                                     origins=buf["origins"],
                                     scores=buf["scores"])
-                print(f"    Cached to {cache_path}")
+                print(f"    Cached")
 
     if not data:
         print(f"No data loaded for {inject_pct}. Skipping.")
@@ -331,12 +372,17 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                 ax.legend(fontsize=6, loc='lower left', framealpha=0.7)
 
     pct_label = inject_pct.replace("pct", "%")
-    plt.suptitle(f"Buffer t-SNE Evolution — {pct_label} injection\n"
-                 f"(per-cell t-SNE, {args.num_rollouts}-rollout embeddings from current agent)",
+    if is_structural:
+        n_feat = args.grid_size * args.grid_size + 4
+        subtitle = f"({n_feat}D structural: {args.grid_size}x{args.grid_size} wall map + positions)"
+    else:
+        subtitle = f"({args.num_rollouts}-rollout behavioral embeddings from current agent)"
+    plt.suptitle(f"Buffer t-SNE Evolution — {pct_label} injection\n{subtitle}",
                  fontsize=13, y=1.01)
     plt.tight_layout()
 
-    out_path = os.path.join(args.output_dir, f"tsne_evolution_{inject_pct}.png")
+    mode_tag = "env" if is_structural else "behav"
+    out_path = os.path.join(args.output_dir, f"tsne_{mode_tag}_{inject_pct}.png")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"\nSaved: {out_path}")
@@ -366,7 +412,18 @@ def main():
                         help="Number of rollouts to average per level for stable embeddings")
     parser.add_argument("--cache_only", action="store_true",
                         help="Only plot cached embeddings, skip GCS downloads and computation")
+    parser.add_argument("--mode", type=str, default="behavioral", choices=["behavioral", "structural"],
+                        help="behavioral: 257D agent rollout embeddings (GPU). structural: env features (CPU)")
+    parser.add_argument("--grid_size", type=int, default=13,
+                        help="Maze grid size for structural features (default 13)")
+    parser.add_argument("--upload_gcs", action="store_true",
+                        help="Upload cache and plots to GCS after completion")
     args = parser.parse_args()
+
+    # Default cache to project_msc if not specified
+    if args.cache_dir is None:
+        mode_tag = "env" if args.mode == "structural" else "behavioral"
+        args.cache_dir = f"/cs/student/project_msc/2025/csml/rhautier/embedding_caches/injection_{mode_tag}"
 
     seeds = [int(s) for s in args.seeds.split(",")]
     timesteps = [int(t) for t in args.timesteps.split(",")]
@@ -387,6 +444,27 @@ def main():
     print(f"Done. {len(saved)} plots saved:")
     for p in saved:
         print(f"  {p}")
+
+    # Upload to GCS
+    if args.upload_gcs and (saved or args.cache_dir):
+        print(f"\n=== Uploading to GCS ===")
+        import glob
+        mode_tag = "env" if args.mode == "structural" else "behavioral"
+        gcs_base = f"llm-exp/embedding_caches/injection_{mode_tag}"
+        bucket = _get_bucket()
+
+        # Upload cache
+        if args.cache_dir:
+            cache_files = sorted(glob.glob(os.path.join(args.cache_dir, "*.npz")))
+            for f in cache_files:
+                bucket.blob(f"{gcs_base}/{os.path.basename(f)}").upload_from_filename(f)
+            print(f"  Uploaded {len(cache_files)} cache files to gs://{GCS_BUCKET}/{gcs_base}/")
+
+        # Upload plots
+        for p in saved:
+            fname = os.path.basename(p)
+            bucket.blob(f"{gcs_base}/plots/{fname}").upload_from_filename(p)
+            print(f"  Uploaded {fname}")
 
 
 if __name__ == "__main__":

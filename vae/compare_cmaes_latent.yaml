@@ -1,0 +1,18 @@
+title: "CMA-ES + Latent Mutations — Buffer Embeddings"
+color_by_origin: true
+grid_size: 13
+timesteps: [16000, 18000, 20000, 22000, 24000, 26000, 28000, 30000]
+
+runs:
+  - name: "Seed 0"
+    gcs_prefix: accel/cmaes_latent_mut_sfl_13x13
+    run_id: cmaes_latent_mut_sfl_13x13
+    seed: 0
+  - name: "Seed 1"
+    gcs_prefix: accel/cmaes_latent_mut_sfl_13x13
+    run_id: cmaes_latent_mut_sfl_13x13
+    seed: 1
+  - name: "Seed 2"
+    gcs_prefix: accel/cmaes_latent_mut_sfl_13x13
+    run_id: cmaes_latent_mut_sfl_13x13
+    seed: 2

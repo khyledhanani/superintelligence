@@ -108,90 +108,129 @@ An ACCEL agent was trained for 10k updates (warmstart). LLM-generated maze level
 
 ---
 
-## 5. Main analysis: t-SNE of buffer evolution during training
+## 5. t-SNE of buffer evolution during training
 
-**Script**: `plot_tsne_training_evolution.py`
+Two modes, two scripts. Both produce grids with rows = seeds/runs, columns = timesteps.
 
-**Purpose**: Visualize how the behavioral landscape of the PLR buffer evolves as the agent trains on LLM-injected levels. Shows whether injected levels remain distinct, get absorbed, or get evicted.
+### 5a. LLM injection analysis (`plot_tsne_training_evolution.py`)
 
-### What it does
+Tracks how injected LLM levels evolve within the PLR buffer during training. Supports both **behavioral** (agent rollout) and **structural** (env layout) embeddings.
 
-For each (injection_pct, seed, timestep):
-1. Downloads the **agent checkpoint** and **buffer dump** from GCS (or loads from local cache)
-2. Converts buffer tokens to Level objects
-3. Rolls out the **current trained agent** on all ~4000 buffer levels (**5 rollouts averaged** for stability)
-4. Computes fresh 257D behavioral embeddings
-5. Fits **t-SNE independently per cell** (perplexity=40)
-6. Plots: light grey = organic ACCEL, green = LLM mutations, blue stars = LLM originals
+**Modes**:
+- `--mode behavioral` (default): 257D embeddings from agent rollouts. Requires GPU + agent checkpoints.
+- `--mode structural`: 173D features from wall map + positions. CPU only, no checkpoints needed.
 
-### Output
+**What it does** (for each injection_pct × seed × timestep):
+1. Downloads the **buffer dump** from GCS (+ agent checkpoint in behavioral mode)
+2. Computes embeddings (behavioral: 5-rollout average; structural: token→feature conversion)
+3. Fits **t-SNE independently per cell**
+4. Plots colored by provenance: grey = organic ACCEL, green = LLM mutations, blue stars = LLM originals
 
-One PNG per injection percentage: `vae/plots/tsne_training_evolution/tsne_evolution_{pct}.png`
+**Output**: `vae/plots/tsne_training_evolution/tsne_{behav,env}_{pct}.png`
 
-Grid layout: **rows** = seeds (0, 1, 2), **columns** = training timesteps.
+**Cache**: Defaults to `/cs/student/project_msc/2025/csml/rhautier/embedding_caches/injection_{behavioral,env}/`. **Adapt this path** if running on a different machine — use `--cache_dir` to override.
 
-### How to run
+**GCS cache** (pre-computed, pull with `--cache_only`):
+- `gs://ucl-ued-project-bucket/llm-exp/embedding_caches/injection_behavioral/`
+- `gs://ucl-ued-project-bucket/llm-exp/embedding_caches/injection_env/`
 
 ```bash
-cd /cs/student/msc/csml/2025/rhautier/Documents/jaxued/jaxued
-conda activate jaxued_env
+# Behavioral — all pcts, GPU, auto-upload to GCS
+python vae/plot_tsne_training_evolution.py --mode behavioral --upload_gcs
 
-# === OPTION A: Full computation (requires GPU + GCS access) ===
-# Computes all 5 pcts × 3 seeds × 13 timesteps
-# Downloads checkpoints + buffer dumps from GCS, rolls out agent, caches embeddings
-python vae/plot_tsne_training_evolution.py \
-    --cache_dir vae/plots/tsne_training_cache
+# Structural — all pcts, CPU only, auto-upload
+python vae/plot_tsne_training_evolution.py --mode structural --upload_gcs
 
-# Single injection percentage only
+# Single pct, custom cache dir
 python vae/plot_tsne_training_evolution.py \
-    --inject_pct 10pct \
-    --cache_dir vae/plots/tsne_training_cache
+    --inject_pct 10pct --mode structural \
+    --cache_dir /your/path/here
 
-# === OPTION B: Plot from cached embeddings (CPU only, no GCS needed) ===
-# First pull cache from GCS if not local:
-#   python3 -c "
-#   from google.cloud import storage
-#   client = storage.Client(project='open-endedness-ued-project')
-#   bucket = client.bucket('ucl-ued-project-bucket')
-#   import os
-#   for blob in bucket.list_blobs(prefix='llm-exp/embedding_caches/tsne_training_cache/'):
-#       local = f'vae/plots/tsne_training_cache/{os.path.basename(blob.name)}'
-#       os.makedirs(os.path.dirname(local), exist_ok=True)
-#       blob.download_to_filename(local)
-#       print(local)
-#   "
-python vae/plot_tsne_training_evolution.py \
-    --cache_dir vae/plots/tsne_training_cache \
-    --cache_only
+# Plot from pre-computed cache only (no GPU, no GCS downloads)
+python vae/plot_tsne_training_evolution.py --mode behavioral --cache_only
 
-# === Customize ===
-# Fewer timesteps
+# Fewer timesteps / seeds
 python vae/plot_tsne_training_evolution.py \
-    --timesteps 250,1000,3000,5000,7000,10000 \
-    --cache_dir vae/plots/tsne_training_cache
+    --mode structural --timesteps 250,1000,5000,10000 --seeds 0,1
 
-# Specific seeds
-python vae/plot_tsne_training_evolution.py \
-    --seeds 0,1 --cache_dir vae/plots/tsne_training_cache --cache_only
-
-# Fewer rollouts (faster but noisier embeddings)
-python vae/plot_tsne_training_evolution.py \
-    --num_rollouts 3 --cache_dir vae/plots/tsne_training_cache
+# 21x21 grids (structural mode)
+python vae/plot_tsne_training_evolution.py --mode structural --grid_size 21
 ```
 
-### Upload new embeddings to GCS after computation
+### 5b. Cross-run comparison (`plot_tsne_compare_runs.py` + `plot_tsne_compare_env.py`)
 
-```python
-from google.cloud import storage
-import os, glob
+Compare buffer evolution across **different training methods** (e.g., ACCEL vs CMA-ES vs CMA-ES+LatentMut). Runs are defined in a YAML config file.
 
-client = storage.Client(project='open-endedness-ued-project')
-bucket = client.bucket('ucl-ued-project-bucket')
-for f in sorted(glob.glob('vae/plots/tsne_training_cache/*.npz')):
-    fname = os.path.basename(f)
-    bucket.blob(f'llm-exp/embedding_caches/tsne_training_cache/{fname}').upload_from_filename(f)
-    print(fname)
+- `plot_tsne_compare_runs.py` — behavioral embeddings (257D, GPU)
+- `plot_tsne_compare_env.py` — structural features (173D, CPU)
+
+Both use the same YAML config format:
+
+```yaml
+# compare_example.yaml
+title: "My Comparison"
+color_by_origin: true       # color by provenance (DR/CMA-ES/mutation)
+grid_size: 13               # for structural script
+timesteps: [16000, 18000, 20000, 22000, 24000, 26000, 28000, 30000]
+
+runs:
+  - name: "Seed 0"
+    gcs_prefix: accel/accel_sfl_13x13          # GCS path prefix
+    run_id: accel_sfl_13x13                     # subdirectory name
+    seed: 0
+  - name: "Seed 1"
+    gcs_prefix: accel/accel_sfl_13x13
+    run_id: accel_sfl_13x13
+    seed: 1
+    # ... or use local paths:
+    # checkpoint_dir: /path/to/checkpoints/run/seed/
+    # buffer_dir: /path/to/buffer_dumps/
 ```
+
+**Origin codes** (auto-detected per run):
+
+| Code | LLM injection runs | CMA-ES runs |
+|------|-------------------|-------------|
+| 0 | Organic ACCEL | DR generation |
+| 1 | LLM original seed | CMA-ES generation |
+| 2 | LLM mutation descendant | DR-lineage mutation |
+| 3 | — | CMA-ES-lineage mutation |
+
+**Pre-built configs** for ACCEL vs CMA-ES comparison (3 seeds × 8 timesteps each):
+- `compare_accel.yaml` — pure ACCEL baseline
+- `compare_cmaes_accel.yaml` — CMA-ES generation + ACCEL wall-flip mutations
+- `compare_cmaes_latent.yaml` — CMA-ES generation + VAE latent mutations
+
+**Run all three** (behavioral + structural, auto-uploads to GCS):
+```bash
+bash vae/run_cmaes_comparison.sh
+```
+
+Or individually:
+```bash
+# Behavioral (GPU)
+python vae/plot_tsne_compare_runs.py \
+    --config vae/compare_accel.yaml \
+    --cache_dir /cs/student/project_msc/2025/csml/rhautier/embedding_caches/cmaes_compare \
+    --output vae/plots/tsne_accel.png
+
+# Structural (CPU)
+python vae/plot_tsne_compare_env.py \
+    --config vae/compare_accel.yaml \
+    --cache_dir /cs/student/project_msc/2025/csml/rhautier/embedding_caches/cmaes_compare_env \
+    --output vae/plots/tsne_env_accel.png
+
+# From cache (CPU)
+python vae/plot_tsne_compare_runs.py --config vae/compare_accel.yaml --cache_only \
+    --cache_dir /cs/student/project_msc/2025/csml/rhautier/embedding_caches/cmaes_compare
+```
+
+**Note**: All `--cache_dir` and `--local_data_root` paths default to `/cs/student/project_msc/2025/csml/rhautier/...` — **adapt these** to your local filesystem if running elsewhere.
+
+**GCS cache locations**:
+- `gs://ucl-ued-project-bucket/llm-exp/embedding_caches/cmaes_compare/behavioral/`
+- `gs://ucl-ued-project-bucket/llm-exp/embedding_caches/cmaes_compare/structural/`
+- `gs://ucl-ued-project-bucket/llm-exp/embedding_caches/cmaes_compare/plots/`
 
 ---
 
@@ -201,7 +240,7 @@ for f in sorted(glob.glob('vae/plots/tsne_training_cache/*.npz')):
 |--------|-------------|------------|-------|
 | `plot_embedding_evolution.py` | PCA/t-SNE of pre-training merged buffers | Warmstart only | Shows initial buffer composition before training |
 | `plot_embedding_training.py` | PCA/t-SNE of buffer during training | Stale insertion-time embeddings | Fast but embeddings don't reflect current agent |
-| `plot_env_space.py` | t-SNE of structural features (wall layout) | None (agent-independent) | Shows if LLM levels are structurally different |
+| `plot_env_space.py` | t-SNE of structural features (wall layout) | None (agent-independent) | Original injection-hardcoded version |
 | `tsne_buffer_embeddings.py` | t-SNE/MDS of single buffer snapshot | Warmstart | Reference mazes + accepted LLM mazes highlighted |
 
 ---
@@ -211,6 +250,6 @@ for f in sorted(glob.glob('vae/plots/tsne_training_cache/*.npz')):
 ```
 scikit-learn           # PCA, t-SNE, pairwise_distances
 matplotlib             # All plotting
-pyyaml                 # VAE config loading
-google-cloud-storage   # GCS data fetching
+pyyaml                 # VAE config loading, YAML run configs
+google-cloud-storage   # GCS data fetching and uploading
 ```
