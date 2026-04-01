@@ -327,15 +327,17 @@ def main():
     for ri, run in enumerate(runs):
         run_name = run["name"]
         run_color = run.get("color", f"C{ri}")
+        run_id = run.get("run_id", run_name)
+        seed = run.get("seed", 0)
+        cache_id = f"{run_id}_s{seed}".replace(" ", "_").replace("/", "_")
 
         for ts in timesteps:
             key = (ri, ts)
-            safe_name = run_name.replace(" ", "_").replace("/", "_")
             print(f"\n  [{run_name}] update {ts}:")
 
             # Check cache
             if args.cache_dir:
-                cache_path = os.path.join(args.cache_dir, f"emb_{safe_name}_t{ts}.npz")
+                cache_path = os.path.join(args.cache_dir, f"emb_{cache_id}_t{ts}.npz")
                 if os.path.exists(cache_path):
                     print(f"    Loading from cache")
                     cached = np.load(cache_path, allow_pickle=True)

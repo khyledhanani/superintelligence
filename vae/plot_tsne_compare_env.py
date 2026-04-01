@@ -213,7 +213,9 @@ def main():
 
     for ri, run in enumerate(runs):
         run_name = run["name"]
-        safe_name = run_name.replace(" ", "_").replace("/", "_")
+        run_id = run.get("run_id", run_name)
+        seed = run.get("seed", 0)
+        cache_id = f"{run_id}_s{seed}".replace(" ", "_").replace("/", "_")
 
         for ts in timesteps:
             key = (ri, ts)
@@ -221,7 +223,7 @@ def main():
 
             # Check cache
             if args.cache_dir:
-                cache_path = os.path.join(args.cache_dir, f"env_{safe_name}_t{ts}.npz")
+                cache_path = os.path.join(args.cache_dir, f"env_{cache_id}_t{ts}.npz")
                 if os.path.exists(cache_path):
                     print(f"    Loading from cache")
                     cached = np.load(cache_path, allow_pickle=True)
