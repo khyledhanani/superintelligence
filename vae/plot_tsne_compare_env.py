@@ -109,8 +109,8 @@ def tokens_to_structural_features(tokens_batch, grid_size=13):
 def resolve_buffer_path(run_cfg, timestep, local_data_root):
     """Resolve buffer dump path for a run at a given timestep."""
     seed = run_cfg.get("seed", 0)
-    run_name = run_cfg["name"]
-    safe_name = run_name.replace(" ", "_").replace("/", "_")
+    run_id = run_cfg.get("run_id", run_cfg["name"])
+    safe_id = f"{run_id}_s{seed}".replace(" ", "_").replace("/", "_")
 
     buffer_dir = run_cfg.get("buffer_dir")
     if buffer_dir:
@@ -118,8 +118,7 @@ def resolve_buffer_path(run_cfg, timestep, local_data_root):
 
     if "gcs_prefix" in run_cfg:
         gcs_prefix = run_cfg["gcs_prefix"]
-        run_id = run_cfg.get("run_id", "")
-        local_buf_dir = os.path.join(local_data_root, safe_name, "buffer_dumps")
+        local_buf_dir = os.path.join(local_data_root, safe_id, "buffer_dumps")
 
         buf_candidates = [
             f"{gcs_prefix}/buffer_dumps/{run_id}/{seed}/buffer_dump_{timestep}.npz",

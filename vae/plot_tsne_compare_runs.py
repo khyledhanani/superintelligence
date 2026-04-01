@@ -178,8 +178,8 @@ def resolve_run_paths(run_cfg, timestep, local_data_root):
     """
     ckpt_step = updates_to_ckpt_step(timestep)
     seed = run_cfg.get("seed", 0)
-    run_name = run_cfg["name"]
-    safe_name = run_name.replace(" ", "_").replace("/", "_")
+    run_id = run_cfg.get("run_id", run_cfg["name"])
+    safe_id = f"{run_id}_s{seed}".replace(" ", "_").replace("/", "_")
 
     # Checkpoint dir
     ckpt_dir = run_cfg.get("checkpoint_dir")
@@ -187,8 +187,7 @@ def resolve_run_paths(run_cfg, timestep, local_data_root):
         pass  # local path exists
     elif "gcs_prefix" in run_cfg:
         gcs_prefix = run_cfg["gcs_prefix"]
-        # Try standard injection layout
-        ckpt_dir = os.path.join(local_data_root, safe_name, "checkpoints")
+        ckpt_dir = os.path.join(local_data_root, safe_id, "checkpoints")
 
         # Try to find the checkpoint structure
         # Layout 1: {gcs_prefix}/checkpoints/{run_id}/{seed}/
@@ -203,7 +202,6 @@ def resolve_run_paths(run_cfg, timestep, local_data_root):
                 f"{layout}/{seed}/config.json",
             ]
             # Also try run_id subdirs
-            run_id = run_cfg.get("run_id", "")
             if run_id:
                 config_candidates.insert(0, f"{layout}/{run_id}/{seed}/config.json")
 
@@ -226,10 +224,9 @@ def resolve_run_paths(run_cfg, timestep, local_data_root):
         buf_path = os.path.join(buffer_dir, f"buffer_dump_{timestep}.npz")
     elif "gcs_prefix" in run_cfg:
         gcs_prefix = run_cfg["gcs_prefix"]
-        local_buf_dir = os.path.join(local_data_root, safe_name, "buffer_dumps")
+        local_buf_dir = os.path.join(local_data_root, safe_id, "buffer_dumps")
 
         # Try common layouts
-        run_id = run_cfg.get("run_id", "")
         buf_candidates = [
             f"{gcs_prefix}/buffer_dumps/{run_id}/{seed}/buffer_dump_{timestep}.npz",
             f"{gcs_prefix}/buffer_dumps/buffer_dump_{timestep}.npz",
