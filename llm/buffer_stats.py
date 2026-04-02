@@ -5,12 +5,89 @@ for LLM prompt context. This replaces the .npz-based flow in test_generator.py
 with a live-buffer flow that reads directly from the training state.
 """
 
-from typing import List, Tuple
+import logging
+from typing import List, Optional, Tuple
 
 import jax
 import numpy as np
 
 from llm.prompt_builder import MetricEntry, ReferenceMaze
+
+logger = logging.getLogger(__name__)
+
+
+def _kmedoids_select(dist_matrix: np.ndarray, n: int, weights: Optional[np.ndarray] = None) -> list:
+    """Run PAM k-medoids on a precomputed distance matrix.
+
+    Args:
+        dist_matrix: (N, N) pairwise distance matrix
+        n: number of medoids to select
+        weights: optional (N,) per-point weights. If provided, objective is
+            weighted sum of distances (density-weighted k-medoids).
+
+    Returns:
+        List of medoid indices into the distance matrix.
+    """
+    n_valid = len(dist_matrix)
+    if n_valid <= n:
+        return list(range(n_valid))
+
+    w = weights if weights is not None else np.ones(n_valid)
+
+    # PAM BUILD: greedy initialization
+    weighted_total = (dist_matrix * w[np.newaxis, :]).sum(axis=1)
+    medoids = [int(np.argmin(weighted_total))]
+
+    nearest_medoid_dist = dist_matrix[medoids[0]].copy()
+    for _ in range(1, n):
+        gains = np.full(n_valid, -1.0)
+        for c in range(n_valid):
+            if c in medoids:
+                continue
+            improvement = np.maximum(0, nearest_medoid_dist - dist_matrix[c])
+            gains[c] = (improvement * w).sum()
+        best = int(np.argmax(gains))
+        medoids.append(best)
+        nearest_medoid_dist = np.minimum(nearest_medoid_dist, dist_matrix[best])
+
+    # PAM SWAP: iterative improvement (up to 100 iterations)
+    for iteration in range(100):
+        medoid_dists = dist_matrix[medoids]
+        assignments = np.argmin(medoid_dists, axis=0)
+
+        improved = False
+        for mi, m in enumerate(medoids):
+            cluster_members = np.where(assignments == mi)[0]
+            best_swap, best_delta = None, 0.0
+
+            for candidate in cluster_members:
+                if candidate == m:
+                    continue
+                delta = 0.0
+                for j in range(n_valid):
+                    old_d = dist_matrix[medoids[assignments[j]], j]
+                    if assignments[j] == mi:
+                        new_d = dist_matrix[candidate, j]
+                        for mk in range(len(medoids)):
+                            if mk != mi:
+                                new_d = min(new_d, dist_matrix[medoids[mk], j])
+                    else:
+                        new_d = min(old_d, dist_matrix[candidate, j])
+                    delta += (new_d - old_d) * w[j]
+
+                if delta < best_delta:
+                    best_delta = delta
+                    best_swap = candidate
+
+            if best_swap is not None:
+                medoids[mi] = best_swap
+                improved = True
+                break
+
+        if not improved:
+            break
+
+    return medoids
 
 
 class BufferStatsExtractor:
@@ -26,11 +103,20 @@ class BufferStatsExtractor:
             - "hardest": top-regret, highest score mazes shown first
             - "random": random selection from active levels
             - "diverse": spread selection across score range (quartile-based)
+            - "kmedoid": k-medoids clustering on 257D behavior embeddings
+            - "hybrid-kmedoid": density-weighted k-medoids (biased toward dense regions)
+        buffer_embeddings: Optional (capacity, 257) numpy array of behavior embeddings.
+            Required for kmedoid and hybrid-kmedoid strategies.
     """
 
-    def __init__(self, n_references: int = 5, strategy: str = "hardest") -> None:
+    def __init__(self, n_references: int = 5, strategy: str = "hardest",
+                 density_radius_frac: float = 0.5,
+                 hybrid_difficulty_percentile: float = 50.0) -> None:
         self.n_references = n_references
         self.strategy = strategy
+        self.density_radius_frac = density_radius_frac
+        self.hybrid_difficulty_percentile = hybrid_difficulty_percentile
+        self._buffer_embeddings = None  # set by injector from training loop
 
     def extract_references_with_levels(self, sampler: dict) -> Tuple[List[ReferenceMaze], list]:
         """Return both ReferenceMaze objects (for prompt) and Level objects (for rollouts).
@@ -68,10 +154,22 @@ class BufferStatsExtractor:
             sorted_idx = np.argsort(scores)
             step = max(1, len(sorted_idx) // n)
             selected_indices = sorted_idx[::step][:n]
+        elif self.strategy in ("kmedoid", "hybrid-kmedoid"):
+            # hybrid-kmedoid: filter to top X% by difficulty, then kmedoid
+            difficulty_mask = None
+            if self.strategy == "hybrid-kmedoid":
+                pct = self.hybrid_difficulty_percentile
+                threshold = float(np.percentile(scores, pct))
+                difficulty_mask = scores >= threshold
+                n_pass = int(difficulty_mask.sum())
+                logger.info(f"Hybrid difficulty filter (p{pct:.0f}): "
+                            f"{n_pass}/{size} levels above {threshold:.4f}")
+            selected_indices = self._select_kmedoid_indices(
+                scores, size, n, difficulty_mask=difficulty_mask)
         else:
             raise ValueError(
                 f"Unknown reference selection strategy: {self.strategy!r}. "
-                "Expected 'hardest', 'random', or 'diverse'."
+                "Expected 'hardest', 'random', 'diverse', 'kmedoid', or 'hybrid-kmedoid'."
             )
 
         references = []
@@ -97,6 +195,55 @@ class BufferStatsExtractor:
             level_objects.append(level)
 
         return references, level_objects
+
+    def _select_kmedoid_indices(self, scores: np.ndarray, size: int, n: int,
+                                difficulty_mask: Optional[np.ndarray] = None) -> np.ndarray:
+        """Select reference indices via k-medoids on buffer embeddings."""
+        emb = self._buffer_embeddings
+        if emb is None:
+            logger.warning("kmedoid strategy requires buffer embeddings; falling back to hardest")
+            return np.argsort(scores)[::-1][:n]
+
+        emb = emb[:size]
+        norms = np.sqrt(np.sum(emb ** 2, axis=1))
+        valid_mask = norms > 1e-6
+        if difficulty_mask is not None:
+            valid_mask &= difficulty_mask
+        valid_indices = np.where(valid_mask)[0]
+        n_valid = len(valid_indices)
+        logger.info(f"K-medoids selection: {n_valid} candidate levels from {size} active")
+
+        if n_valid <= n:
+            return valid_indices
+
+        # L2 pairwise distance matrix
+        valid_emb = emb[valid_indices]
+        dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+        chunk_size = max(1, min(500, n_valid))
+        for start in range(0, n_valid, chunk_size):
+            end = min(start + chunk_size, n_valid)
+            diff = valid_emb[start:end, np.newaxis, :] - valid_emb[np.newaxis, :, :]
+            dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+        # Density weights for hybrid-kmedoid
+        weights = None
+        if self.strategy == "hybrid-kmedoid":
+            median_dist = float(np.median(dist_matrix[np.triu_indices(n_valid, k=1)]))
+            radius = median_dist * self.density_radius_frac
+            weights = np.sum(dist_matrix < radius, axis=1).astype(np.float64)
+            weights = weights / weights.mean()
+            logger.info(f"  Density weights: radius={radius:.4f}, "
+                        f"min={weights.min():.2f}, max={weights.max():.2f}")
+
+        medoid_local = _kmedoids_select(dist_matrix, n, weights=weights)
+        selected = valid_indices[medoid_local]
+
+        for i, m in enumerate(medoid_local):
+            idx = int(selected[i])
+            min_d = float(min(dist_matrix[m, o] for o in medoid_local if o != m))
+            logger.info(f"  Medoid {i+1}: idx={idx}, score={scores[idx]:.4f}, min_dist={min_d:.4f}")
+
+        return selected
 
     def extract_references(self, sampler: dict) -> List[ReferenceMaze]:
         """Convert live sampler state to a list of ReferenceMaze objects.
