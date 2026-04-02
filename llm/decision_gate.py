@@ -42,7 +42,7 @@ class DiversityThresholds:
     diversity_metric: "td_error_emd", "experience_divergence", "position_dtw", or "cenie"
     """
     difficulty_threshold: Optional[float] = None  # Min difficulty score to accept
-    difficulty_metric: str = "regret"             # "regret" or "sfl"
+    difficulty_metric: str = "sfl"                  # "sfl" (SFL learnability p*(1-p)) or "regret"
     min_diversity: Optional[float] = 0.04         # pairwise diversity vs references
     diversity_metric: str = "td_error_emd"        # "td_error_emd", "experience_divergence", "position_dtw"
 
