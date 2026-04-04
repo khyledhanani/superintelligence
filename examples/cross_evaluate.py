@@ -108,6 +108,7 @@ def load_agent(checkpoint_dir, checkpoint_step=-1):
         seed_embeddings=jnp.zeros((max_anc, 257), dtype=jnp.float32),
         proximity_thresholds=jnp.full(max_anc, jnp.inf, dtype=jnp.float32),
         n_seeds=jnp.int32(0),
+        fixed_dist_n_llm=jnp.int32(0),
         num_dr_updates=0,
         num_replay_updates=0,
         num_mutation_updates=0,

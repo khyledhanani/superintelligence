@@ -141,6 +141,32 @@ def load_buffer_dump(local_dir, updates):
     }
 
 
+EVAL_LEVEL_NAMES = [
+    "SixteenRooms", "SixteenRooms2", "Labyrinth", "LabyrinthFlipped",
+    "Labyrinth2", "StandardMaze", "StandardMaze2", "StandardMaze3",
+]
+
+EVAL_LEVEL_SHORT = {
+    "SixteenRooms": "16R", "SixteenRooms2": "16R2",
+    "Labyrinth": "Lab", "LabyrinthFlipped": "LabF",
+    "Labyrinth2": "Lab2", "StandardMaze": "SM",
+    "StandardMaze2": "SM2", "StandardMaze3": "SM3",
+}
+
+
+def get_eval_level_tokens():
+    """Get token arrays for the 8 eval benchmark levels."""
+    from jaxued.environments.maze.level import prefabs, Level
+    from vae_level_utils import level_to_tokens
+
+    tokens_list = []
+    for name in EVAL_LEVEL_NAMES:
+        level = Level.from_str(prefabs[name])
+        tok = np.asarray(level_to_tokens(level))
+        tokens_list.append(tok)
+    return np.stack(tokens_list)
+
+
 def compute_embeddings(tokens, checkpoint_dir, ckpt_step, batch_size=256, num_rollouts=5):
     """Compute fresh 257D embeddings using agent at a specific checkpoint step.
 
@@ -239,7 +265,17 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                         "origins": cached["origins"],
                         "scores": cached["scores"],
                     }
-                    continue
+                    if "eval_embeddings" in cached:
+                        data[key]["eval_embeddings"] = cached["eval_embeddings"]
+                    elif args.show_eval_levels and not args.cache_only:
+                        # Eval embeddings not in cache — need to compute them
+                        # Fall through to computation path below
+                        print(f"    Eval embeddings not cached, will compute...")
+                        pass
+                    else:
+                        continue
+                    if "eval_embeddings" in data[key] or not args.show_eval_levels:
+                        continue
                 elif args.cache_only:
                     print(f"    SKIP: not cached (--cache_only)")
                     continue
@@ -297,11 +333,27 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                 "scores": buf["scores"],
             }
 
+            # Compute eval level embeddings if requested (behavioral mode only)
+            if args.show_eval_levels and not is_structural:
+                eval_tokens = get_eval_level_tokens()
+                print(f"    Computing eval level embeddings ({len(eval_tokens)} levels)...")
+                eval_embeddings = compute_embeddings(
+                    eval_tokens, ckpt_run_dir, ckpt_step,
+                    batch_size=args.batch_size,
+                    num_rollouts=args.num_rollouts,
+                )
+                if eval_embeddings is not None:
+                    data[key]["eval_embeddings"] = eval_embeddings
+
             if args.cache_dir:
-                np.savez_compressed(cache_path,
-                                    embeddings=embeddings,
-                                    origins=buf["origins"],
-                                    scores=buf["scores"])
+                save_data = {
+                    "embeddings": embeddings,
+                    "origins": buf["origins"],
+                    "scores": buf["scores"],
+                }
+                if "eval_embeddings" in data[key]:
+                    save_data["eval_embeddings"] = data[key]["eval_embeddings"]
+                np.savez_compressed(cache_path, **save_data)
                 print(f"    Cached")
 
     if not data:
@@ -334,11 +386,22 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
             n_done += 1
             emb = data[key]["embeddings"]
             origins = data[key]["origins"]
-            print(f"  t-SNE for seed {seed}, {ts} upd ({len(emb)} pts) [{n_done}/{n_total}]...")
 
-            tsne = TSNE(n_components=2, perplexity=min(args.tsne_perplexity, len(emb) - 1),
+            # Optionally include eval benchmark levels in the t-SNE
+            eval_emb = data[key].get("eval_embeddings", None)
+            n_eval = len(eval_emb) if eval_emb is not None else 0
+            if n_eval > 0:
+                combined = np.concatenate([emb, eval_emb], axis=0)
+                print(f"  t-SNE for seed {seed}, {ts} upd ({len(emb)}+{n_eval} eval pts) [{n_done}/{n_total}]...")
+            else:
+                combined = emb
+                print(f"  t-SNE for seed {seed}, {ts} upd ({len(emb)} pts) [{n_done}/{n_total}]...")
+
+            tsne = TSNE(n_components=2, perplexity=min(args.tsne_perplexity, len(combined) - 1),
                         random_state=42, max_iter=1000, learning_rate='auto', init='pca')
-            coords = tsne.fit_transform(emb)
+            all_coords = tsne.fit_transform(combined)
+            coords = all_coords[:len(emb)]
+            eval_coords = all_coords[len(emb):] if n_eval > 0 else None
 
             is_organic = origins == 0
             is_original = origins == 1
@@ -358,19 +421,30 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                                s=3, alpha=0.25, edgecolors='none',
                                rasterized=True)
 
-                # LLM mutations (bold circles)
+                # LLM mutations (bold circles with green edge)
                 if is_mutation.sum() > 0:
                     ax.scatter(coords[is_mutation, 0], coords[is_mutation, 1],
                                c=scores[is_mutation], cmap=cmap, norm=norm,
-                               s=12, alpha=0.7, edgecolors='black', linewidths=0.3,
-                               rasterized=True)
+                               s=15, alpha=0.8, edgecolors='green', linewidths=0.5,
+                               rasterized=True, zorder=5)
 
-                # LLM originals (stars)
+                # LLM originals (stars, larger with bright edge to stand out)
                 if is_original.sum() > 0:
                     ax.scatter(coords[is_original, 0], coords[is_original, 1],
                                c=scores[is_original], cmap=cmap, norm=norm,
-                               s=40, marker='*', alpha=0.9,
-                               edgecolors='black', linewidths=0.3)
+                               s=60, marker='*', alpha=0.95,
+                               edgecolors='blue', linewidths=0.6, zorder=8)
+
+                # Plot eval benchmark levels (small diamonds)
+                if eval_coords is not None:
+                    ax.scatter(eval_coords[:, 0], eval_coords[:, 1],
+                               c='cyan', s=20, marker='D', alpha=0.9,
+                               edgecolors='black', linewidths=0.5, zorder=10)
+                    for ei, name in enumerate(EVAL_LEVEL_NAMES[:n_eval]):
+                        ax.annotate(EVAL_LEVEL_SHORT.get(name, name),
+                                    (eval_coords[ei, 0], eval_coords[ei, 1]),
+                                    fontsize=3, ha='center', va='bottom',
+                                    xytext=(0, 3), textcoords='offset points')
 
                 # Add legend on first panel, colorbar on last panel
                 if i == 0 and j == 0:
@@ -379,12 +453,17 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                         Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
                                markersize=4, alpha=0.5, label='Organic'),
                         Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
-                               markersize=6, markeredgecolor='black', markeredgewidth=0.3,
+                               markersize=6, markeredgecolor='green', markeredgewidth=0.5,
                                label='LLM mutation'),
                         Line2D([0], [0], marker='*', color='w', markerfacecolor='grey',
-                               markersize=10, markeredgecolor='black', markeredgewidth=0.3,
+                               markersize=10, markeredgecolor='blue', markeredgewidth=0.6,
                                label='LLM original'),
                     ]
+                    if eval_coords is not None:
+                        legend_els.append(
+                            Line2D([0], [0], marker='D', color='w', markerfacecolor='cyan',
+                                   markersize=5, markeredgecolor='black', markeredgewidth=0.5,
+                                   label='Eval benchmark'))
                     ax.legend(handles=legend_els, fontsize=5, loc='upper left',
                               framealpha=0.7)
                 if i == n_rows - 1 and j == n_cols - 1:
@@ -412,6 +491,18 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                                c='blue', s=35, marker='*', alpha=0.9,
                                edgecolors='black', linewidths=0.3,
                                label=f'LLM orig ({is_original.sum()})')
+
+                # Plot eval benchmark levels
+                if eval_coords is not None:
+                    ax.scatter(eval_coords[:, 0], eval_coords[:, 1],
+                               c='cyan', s=60, marker='D', alpha=0.95,
+                               edgecolors='black', linewidths=0.8, zorder=10,
+                               label='Eval benchmark')
+                    for ei, name in enumerate(EVAL_LEVEL_NAMES[:n_eval]):
+                        ax.annotate(EVAL_LEVEL_SHORT.get(name, name),
+                                    (eval_coords[ei, 0], eval_coords[ei, 1]),
+                                    fontsize=4, ha='center', va='bottom',
+                                    xytext=(0, 4), textcoords='offset points')
 
                 if i == 0 and j == 0:
                     ax.legend(fontsize=6, loc='lower left', framealpha=0.7)
@@ -470,6 +561,9 @@ def main():
     parser.add_argument("--show_difficulty", action="store_true",
                         help="Color points by SFL learnability (yellow=0, red=0.25) "
                              "instead of by origin type")
+    parser.add_argument("--show_eval_levels", action="store_true",
+                        help="Plot eval benchmark mazes (SixteenRooms, Labyrinth, etc.) "
+                             "as diamond markers on each panel")
     parser.add_argument("--upload_gcs", action="store_true",
                         help="Upload cache and plots to GCS after completion")
     args = parser.parse_args()

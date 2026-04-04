@@ -27,28 +27,32 @@ class LLMInjectionConfig:
     config_path: str = ""              # --llm_config (path to llm/config.yaml)
 
     # Timing
-    injection_interval: int = 3000     # --llm_inject_interval (eval steps between injections)
+    injection_interval: int = 5000     # --llm_inject_interval (eval steps between injections)
     inject_start_step: int = 5000      # --llm_inject_start_step (no injection before this training step)
 
     # LLM generation
-    n_raw: int = 25                    # --llm_batch_size (mazes requested per injection)
-    reference_maze_strategy: str = "hardest"  # --llm_ref_strategy
+    n_raw: int = 25                    # --llm_batch_size (mazes requested per injection round)
+    target_buffer_pct: float = 0.0     # --llm_target_buffer_pct (0=disabled, 0.05=5%)
+    max_injection_rounds: int = 10     # --llm_max_injection_rounds (retry cap per event)
+    reference_maze_strategy: str = "hybrid-kmedoid"  # --llm_ref_strategy
     n_reference_mazes: int = 5         # --llm_n_references
+    hybrid_difficulty_percentile: float = 50.0  # --llm_hybrid_difficulty_percentile
 
     # Diversity gate (Phase 2: enabled by default; locked decisions from CONTEXT.md)
     gate_enabled: bool = True               # --llm_gate
-    difficulty_threshold: float = 0.6       # --llm_difficulty_threshold
-    difficulty_gate_mode: str = "fixed"     # --llm_difficulty_gate_mode
+    difficulty_threshold: float = 0.1       # --llm_difficulty_threshold
+    difficulty_gate_mode: str = "buffer_mean"     # --llm_difficulty_gate_mode
     #   "fixed": use difficulty_threshold as absolute floor
+    #   "buffer_min": threshold = min score in buffer (must beat weakest level)
     #   "buffer_mean": threshold = mean score across entire buffer
     #   "reference_mean": threshold = mean score of N reference mazes
     #   "competitive": no difficulty gate, insert with actual SFL score (same as ACCEL)
-    min_diversity: float = 0.02             # --llm_min_diversity
+    min_diversity: float = 0.4              # --llm_min_diversity
     diversity_gate_mode: str = "fixed"      # --llm_diversity_gate_mode
     #   "fixed": use min_diversity as absolute floor
     #   "buffer_median": threshold = median pairwise distance among N reference mazes
     #   "disabled": no diversity gate
-    diversity_metric: str = "td_error_emd"  # --llm_diversity_metric
+    diversity_metric: str = "embedding_l2"  # --llm_diversity_metric
     max_diversity_retries: int = 3          # --llm_max_diversity_retries
     n_rollouts_gate: int = 50               # --llm_n_rollouts (rollouts per candidate)
 
@@ -94,12 +98,15 @@ class LLMInjectionConfig:
             injection_interval=config.get("llm_inject_interval", 3000),
             inject_start_step=config.get("llm_inject_start_step", config.get("llm_warmup_steps", 5000)),
             n_raw=config.get("llm_batch_size", 25),
+            target_buffer_pct=config.get("llm_target_buffer_pct", 0.0),
+            max_injection_rounds=config.get("llm_max_injection_rounds", 10),
             reference_maze_strategy=config.get("llm_ref_strategy", "hardest"),
             n_reference_mazes=config.get("llm_n_references", 5),
+            hybrid_difficulty_percentile=config.get("llm_hybrid_difficulty_percentile", 50.0),
             gate_enabled=config.get("llm_gate", True),
             difficulty_threshold=config.get("llm_difficulty_threshold", 0.6),
             difficulty_gate_mode=config.get("llm_difficulty_gate_mode", "fixed"),
-            min_diversity=config.get("llm_min_diversity", 0.02),
+            min_diversity=config.get("llm_min_diversity", 0.4),
             diversity_gate_mode=config.get("llm_diversity_gate_mode", "fixed"),
             diversity_metric=config.get("llm_diversity_metric", "td_error_emd"),
             max_diversity_retries=config.get("llm_max_diversity_retries", 2),

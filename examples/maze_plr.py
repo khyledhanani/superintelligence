@@ -52,6 +52,7 @@ class TrainState(BaseTrainState):
     seed_embeddings: chex.Array = struct.field(pytree_node=True)      # (max_ancestors, 257)
     proximity_thresholds: chex.Array = struct.field(pytree_node=True)  # (max_ancestors,)
     n_seeds: int = struct.field(pytree_node=True)                      # number of registered seeds
+    fixed_dist_n_llm: int = struct.field(pytree_node=True)             # LLM replay slots for fixed distribution
     # === Below is used for logging ===
     num_dr_updates: int
     num_replay_updates: int
@@ -897,6 +898,7 @@ def main(config=None, project="JAXUED_TEST"):
             seed_embeddings=jnp.zeros((max_anc, 257), dtype=jnp.float32),
             proximity_thresholds=jnp.full(max_anc, jnp.inf, dtype=jnp.float32),
             n_seeds=jnp.int32(0),
+            fixed_dist_n_llm=jnp.int32(0),
             num_dr_updates=0,
             num_replay_updates=0,
             num_mutation_updates=0,
@@ -1037,29 +1039,52 @@ def main(config=None, project="JAXUED_TEST"):
 
             # Collect trajectories on replay levels
             rng, rng_levels, rng_reset = jax.random.split(rng, 3)
-            if config.get("fixed_distribution") and config.get("_fixed_dist_n_llm", 0) > 0:
-                n_llm = config["_fixed_dist_n_llm"]
-                n_org = config["num_train_envs"] - n_llm
+            if config.get("fixed_distribution"):
+                # Fixed distribution: sample n_llm from LLM-lineage, rest from organic.
+                # n_llm comes from train_state (dynamic, updated by injector).
+                # Use full num_train_envs scans with masked sampling, then select.
+                n_envs = config["num_train_envs"]
                 ancestor_ids_buf = sampler["levels_extra"]["ancestor_id"]
                 is_llm_mask = ancestor_ids_buf >= 0
                 is_org_mask = ancestor_ids_buf < 0
+                has_llm = jnp.any(is_llm_mask)
 
-                # Sample LLM-lineage levels
-                def _sample_llm(sampler, rng_k):
-                    return _sample_masked_level(level_sampler, sampler, rng_k, is_llm_mask)
-                rng_llm, rng_org = jax.random.split(rng_levels)
-                sampler, (llm_inds, llm_levels) = jax.lax.scan(
-                    _sample_llm, sampler, jax.random.split(rng_llm, n_llm), length=n_llm)
+                def _sample_fixed_dist(sampler_rng):
+                    sampler, rng_levels = sampler_rng
+                    n_llm = train_state.fixed_dist_n_llm
+                    rng_llm, rng_org = jax.random.split(rng_levels)
 
-                # Sample organic levels
-                def _sample_org(sampler, rng_k):
-                    return _sample_masked_level(level_sampler, sampler, rng_k, is_org_mask)
-                sampler, (org_inds, org_levels) = jax.lax.scan(
-                    _sample_org, sampler, jax.random.split(rng_org, n_org), length=n_org)
+                    # Sample n_envs from each pool, then slice
+                    def _sample_llm(sampler, rng_k):
+                        return _sample_masked_level(level_sampler, sampler, rng_k, is_llm_mask)
+                    def _sample_org(sampler, rng_k):
+                        return _sample_masked_level(level_sampler, sampler, rng_k, is_org_mask)
 
-                level_inds = jnp.concatenate([llm_inds, org_inds])
-                levels = jax.tree_util.tree_map(
-                    lambda a, b: jnp.concatenate([a, b]), llm_levels, org_levels)
+                    sampler, (llm_inds, llm_levels) = jax.lax.scan(
+                        _sample_llm, sampler, jax.random.split(rng_llm, n_envs), length=n_envs)
+                    sampler, (org_inds, org_levels) = jax.lax.scan(
+                        _sample_org, sampler, jax.random.split(rng_org, n_envs), length=n_envs)
+
+                    # Build index arrays: first n_llm from LLM pool, rest from organic pool
+                    idx = jnp.arange(n_envs)
+                    use_llm = idx < n_llm
+                    org_idx = jnp.clip(idx - n_llm, 0, n_envs - 1)
+                    level_inds = jnp.where(use_llm, llm_inds, org_inds[org_idx])
+                    def _select_level_leaf(l, o):
+                        mask = use_llm.reshape((-1,) + (1,) * (l.ndim - 1))
+                        return jnp.where(mask, l, o[org_idx])
+                    levels = jax.tree_util.tree_map(_select_level_leaf, llm_levels, org_levels)
+                    return sampler, (level_inds, levels)
+
+                def _sample_standard(sampler_rng):
+                    sampler, rng_levels = sampler_rng
+                    return level_sampler.sample_replay_levels(sampler, rng_levels, n_envs)
+
+                sampler, (level_inds, levels) = jax.lax.cond(
+                    has_llm & (train_state.fixed_dist_n_llm > 0),
+                    _sample_fixed_dist,
+                    _sample_standard,
+                    (sampler, rng_levels))
             else:
                 sampler, (level_inds, levels) = level_sampler.sample_replay_levels(sampler, rng_levels, config["num_train_envs"])
             init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), levels, env_params)
@@ -1668,7 +1693,8 @@ def main(config=None, project="JAXUED_TEST"):
             if config.get("fixed_distribution") and n_injected > 0:
                 injection_pct = n_injected / pre_size
                 n_llm = max(1, round(injection_pct * config["num_train_envs"]))
-                config["_fixed_dist_n_llm"] = n_llm
+                train_state = train_state.replace(
+                    fixed_dist_n_llm=jnp.int32(n_llm))
                 print(f"[Preload] Fixed distribution: {injection_pct:.1%} injection -> "
                       f"{n_llm}/{config['num_train_envs']} LLM replay slots")
 
@@ -1906,15 +1932,22 @@ def main(config=None, project="JAXUED_TEST"):
 
         # Now set final _buffer_origins and _buffer_ancestor_ids:
         # - Changed slots with lineage assigned → origin=2, ancestor inherited
-        # - Changed slots without lineage → origin=0, ancestor=-1 (evicted)
-        # - Unchanged slots → keep existing origin and ancestor
+        # - Changed slots that were mutation targets (child inserted) but not lineage → origin=0
+        # - Changed slots that were NOT mutation targets → keep existing origin
+        #   (their hash changed due to score/timestamp updates, not level replacement)
+        mutation_target_slots = set(int(child_inds[s, e])
+                                     for s in range(parent_inds.shape[0])
+                                     for e in range(parent_inds.shape[1])
+                                     if int(child_inds[s, e]) >= 0)
         for slot in changed_slots:
             if slot in lineage_assigned:
                 _buffer_origins[slot] = 2
                 _buffer_ancestor_ids[slot] = old_ancestors[slot]
-            else:
+            elif slot in mutation_target_slots:
+                # Slot received a new level (organic mutation) — clear lineage
                 _buffer_origins[slot] = 0
                 _buffer_ancestor_ids[slot] = -1
+            # else: hash changed but slot wasn't a mutation target — keep existing origin
 
         # Update hashes
         _buffer_origin_ids[:size] = new_hashes[:size]
@@ -1976,13 +2009,33 @@ def main(config=None, project="JAXUED_TEST"):
         level_cache = LevelCache(llm_cache_dir)
         print(f"[LLM] Level cache: {llm_cache_dir}")
 
+        # Initialize provenance tracking arrays if not already set (online-only runs)
+        if _buffer_origins is None:
+            capacity = train_state.sampler["scores"].shape[0]
+            _buffer_origins = np.zeros(capacity, dtype=np.int32)
+            _buffer_origin_ids = np.zeros(capacity, dtype=np.uint64)
+            _buffer_ancestor_ids = np.full(capacity, -1, dtype=np.int32)
+            print(f"[LLM] Initialized provenance tracking arrays (capacity={capacity})")
+
         llm_injector = LLMInjectionManager(
             config=llm_config,
             level_sampler=level_sampler,
             eval_freq=config["eval_freq"],
             agent_evaluator=agent_evaluator,
             level_cache=level_cache,
+            training_config=config,
         )
+        # Pass numpy provenance arrays so injector can update them
+        llm_injector._buffer_origins = _buffer_origins
+        llm_injector._buffer_ancestor_ids = _buffer_ancestor_ids
+
+        # Sync next_ancestor_id with preloaded ancestors to avoid ID collisions
+        if _buffer_ancestor_ids is not None:
+            max_existing = int(_buffer_ancestor_ids.max())
+            if max_existing >= 0:
+                llm_injector.next_ancestor_id = max_existing + 1
+                print(f"[LLM] Synced next_ancestor_id to {llm_injector.next_ancestor_id} "
+                      f"(from preloaded buffer)")
         gate_status = "gate=ON" if llm_config.gate_enabled else "gate=OFF"
         print(f"[LLM] Injection enabled: interval={llm_config.injection_interval}, "
               f"n_raw={llm_config.n_raw}, start_step={llm_config.inject_start_step}, {gate_status}")
@@ -2541,7 +2594,7 @@ if __name__=="__main__":
                              "Creates output_dir/checkpoints/ and output_dir/buffer_dumps/")
     # === CHECKPOINTING ===
     parser.add_argument("--checkpoint_save_interval", type=int, default=1)
-    parser.add_argument("--max_number_of_checkpoints", type=int, default=60)
+    parser.add_argument("--max_number_of_checkpoints", type=int, default=120)
     # === EVAL ===
     parser.add_argument("--eval_freq", type=int, default=250)
     parser.add_argument("--eval_num_attempts", type=int, default=10)
@@ -2662,12 +2715,20 @@ if __name__=="__main__":
     llm_group.add_argument("--llm_inject_start_step", type=int, default=5000,
                            help="Training step at which LLM injection begins (no injection before this step)")
     llm_group.add_argument("--llm_batch_size", type=int, default=25,
-                           help="Number of raw mazes requested from LLM per injection event")
+                           help="Number of raw mazes requested from LLM per injection round")
+    llm_group.add_argument("--llm_target_buffer_pct", type=float, default=0.0,
+                           help="Target LLM buffer fill %% (0=disabled, 0.05=5%%). "
+                                "Repeats injection rounds until target met or max rounds hit.")
+    llm_group.add_argument("--llm_max_injection_rounds", type=int, default=10,
+                           help="Max injection rounds per event when using target_buffer_pct")
     llm_group.add_argument("--llm_n_references", type=int, default=5,
                            help="Number of buffer mazes shown to LLM as reference context")
     llm_group.add_argument("--llm_ref_strategy", type=str, default="hardest",
-                           choices=["hardest", "random", "diverse"],
+                           choices=["hardest", "random", "diverse", "kmedoid", "hybrid-kmedoid"],
                            help="Strategy for selecting reference mazes from PLR buffer")
+    llm_group.add_argument("--llm_hybrid_difficulty_percentile", type=float, default=50,
+                           help="Percentile threshold for hybrid-kmedoid difficulty filter "
+                                "(50=above median, 75=top 25%%)")
     llm_group.add_argument("--llm_amplification", action=argparse.BooleanOptionalAction, default=True,
                            help="Enable mutation amplification of LLM seed mazes")
     llm_group.add_argument("--llm_mutations_per_seed", type=int, default=30,
@@ -2679,11 +2740,11 @@ if __name__=="__main__":
     llm_group.add_argument("--llm_difficulty_threshold", type=float, default=0.6,
                            help="Minimum difficulty score (regret) for gate acceptance")
     llm_group.add_argument("--llm_difficulty_gate_mode", type=str, default="fixed",
-                           choices=["fixed", "buffer_mean", "reference_mean", "competitive"],
+                           choices=["fixed", "buffer_min", "buffer_mean", "reference_mean", "competitive"],
                            help="How LLM difficulty threshold is set: fixed=absolute, "
                                 "buffer_mean=mean buffer score, reference_mean=mean of N references, "
                                 "competitive=actual SFL score competes with buffer (same as ACCEL)")
-    llm_group.add_argument("--llm_min_diversity", type=float, default=0.02,
+    llm_group.add_argument("--llm_min_diversity", type=float, default=0.4,
                            help="Minimum diversity score (td_error_emd) for gate acceptance")
     llm_group.add_argument("--llm_diversity_gate_mode", type=str, default="fixed",
                            choices=["fixed", "buffer_median", "disabled"],
@@ -2691,7 +2752,7 @@ if __name__=="__main__":
                                 "buffer_median=median pairwise distance among references, "
                                 "disabled=no diversity gate")
     llm_group.add_argument("--llm_diversity_metric", type=str, default="td_error_emd",
-                           choices=["td_error_emd", "experience_divergence", "position_dtw"],
+                           choices=["td_error_emd", "experience_divergence", "position_dtw", "embedding_l2", "cenie"],
                            help="Diversity metric for decision gate")
     llm_group.add_argument("--llm_max_diversity_retries", type=int, default=2,
                            help="Max LLM retries when gate rejects a maze")
