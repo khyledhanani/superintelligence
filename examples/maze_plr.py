@@ -576,7 +576,7 @@ def main(config=None, project="JAXUED_TEST"):
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
     wandb.define_metric("diversity/*", step_metric="num_updates")
-    wandb.define_metric("emb/*", step_metric="num_updates")
+    wandb.define_metric("buffer/*", step_metric="num_updates")
     wandb.define_metric("prox_gate/*", step_metric="num_updates")
     wandb.define_metric("interp_compare/*", step_metric="num_updates")
     if config.get("use_llm"):
@@ -698,7 +698,34 @@ def main(config=None, project="JAXUED_TEST"):
                 log_dict["cmaes/pop_spread"] = float(np.array(stats["cmaes/pop_spread"])[dr_mask].mean())
                 log_dict["cmaes/mean_z_norm"] = float(np.array(stats["cmaes/mean_z_norm"])[dr_mask].mean())
 
-        # Embedding-space metrics (buffer-level, computed from _buffer_embeddings)
+        # Buffer diversity metrics (unconditional — logged for all run types)
+        if _buffer_embeddings is not None:
+            size = int(runner_state[1].sampler["size"])
+            emb_buf = _buffer_embeddings[:size]
+            # Filter to non-zero embeddings (slots that have been written at least once)
+            norms = np.sqrt(np.sum(emb_buf ** 2, axis=1))
+            valid_mask = norms > 1e-6
+            n_valid = int(valid_mask.sum())
+
+            if n_valid >= 2:
+                valid_emb = emb_buf[valid_mask]
+
+                # Pairwise L2 distance (subsampled for speed)
+                from scipy.spatial.distance import pdist
+                n_sub = min(300, n_valid)
+                sub_idx = np.random.choice(n_valid, n_sub, replace=False)
+                pairwise_dists = pdist(valid_emb[sub_idx])
+                log_dict["buffer/emb_pairwise_l2_mean"] = float(pairwise_dists.mean())
+                log_dict["buffer/emb_pairwise_l2_std"] = float(pairwise_dists.std())
+
+                # Log-det covariance (log-volume of embedding space covered)
+                centered = valid_emb - valid_emb.mean(axis=0)
+                cov = (centered.T @ centered) / (n_valid - 1)
+                eigvals = np.linalg.eigvalsh(cov)
+                log_det = float(np.sum(np.log(eigvals[eigvals > 1e-10])))
+                log_dict["buffer/emb_log_det_cov"] = log_det
+
+        # LLM provenance embedding metrics (only when LLM injection is active)
         if _buffer_embeddings is not None and _buffer_ancestor_ids is not None:
             size = int(runner_state[1].sampler["size"])
             emb_buf = _buffer_embeddings[:size]
@@ -708,35 +735,31 @@ def main(config=None, project="JAXUED_TEST"):
             n_llm = int(llm_mask.sum())
             n_org = int(org_mask.sum())
 
-            log_dict["emb/n_llm_in_buffer"] = n_llm
-            log_dict["emb/llm_buffer_pct"] = n_llm / max(size, 1)
+            log_dict["provenance/n_llm_in_buffer"] = n_llm
+            log_dict["provenance/llm_buffer_pct"] = n_llm / max(size, 1)
 
             if n_org > 0 and n_llm > 0:
                 org_centroid = emb_buf[org_mask].mean(axis=0)
                 llm_centroid = emb_buf[llm_mask].mean(axis=0)
-                # Per-LLM-level distance to organic centroid
                 llm_to_org = np.linalg.norm(emb_buf[llm_mask] - org_centroid, axis=1)
-                log_dict["emb/llm_organic_centroid_dist"] = float(llm_to_org.mean())
-                # Distance between cluster centroids
-                log_dict["emb/inter_cluster_dist"] = float(np.linalg.norm(llm_centroid - org_centroid))
+                log_dict["provenance/llm_organic_centroid_dist"] = float(llm_to_org.mean())
+                log_dict["provenance/inter_cluster_dist"] = float(np.linalg.norm(llm_centroid - org_centroid))
 
-                # Per-LLM-level distance to its ancestor seed embedding
                 seed_embs_np = np.asarray(runner_state[1].seed_embeddings)
                 llm_anc = anc_buf[llm_mask]
                 safe_anc = np.clip(llm_anc, 0, seed_embs_np.shape[0] - 1)
                 llm_to_seed = np.linalg.norm(emb_buf[llm_mask] - seed_embs_np[safe_anc], axis=1)
-                log_dict["emb/llm_seed_dist_mean"] = float(llm_to_seed.mean())
+                log_dict["provenance/llm_seed_dist_mean"] = float(llm_to_seed.mean())
 
-                # Intra-LLM spread (subsample for speed)
                 if n_llm > 1:
                     n_sub = min(200, n_llm)
                     sub_idx = np.random.choice(n_llm, n_sub, replace=False)
                     from scipy.spatial.distance import pdist
                     intra_dists = pdist(emb_buf[llm_mask][sub_idx])
-                    log_dict["emb/intra_llm_spread"] = float(intra_dists.mean())
+                    log_dict["provenance/intra_llm_spread"] = float(intra_dists.mean())
 
-        # Proximity gate stats (aggregated over eval_freq steps)
-        if "prox_gate/n_blocked" in stats:
+        # Proximity gate stats (aggregated over eval_freq steps, LLM injection only)
+        if config.get("use_llm") and "prox_gate/n_blocked" in stats:
             blocked = np.array(stats["prox_gate/n_blocked"])
             llm_parents = np.array(stats["prox_gate/n_llm_parents"])
             total_blocked = int(blocked.sum())
@@ -1504,7 +1527,9 @@ def main(config=None, project="JAXUED_TEST"):
     _buffer_ancestor_ids = None # np.ndarray (capacity,) int32  — LLM seed index (-1=organic)
     _prev_buffer_hashes = None  # np.ndarray (capacity,) uint64 — snapshot before each eval step
     # Stale embeddings: mean [hstate(256), action(1)] at insertion time
-    _buffer_embeddings = None   # np.ndarray (capacity, 257) float32
+    # Allocated unconditionally so buffer dumps always contain embeddings.
+    capacity = train_state.sampler["scores"].shape[0]
+    _buffer_embeddings = np.zeros((capacity, 257), dtype=np.float32)
 
     # --- Preload buffer from merged .npz ---
     if config.get("preload_buffer_npz"):
@@ -1542,7 +1567,6 @@ def main(config=None, project="JAXUED_TEST"):
         _buffer_origins = np.zeros(capacity, dtype=np.int32)
         _buffer_origin_ids = np.zeros(capacity, dtype=np.uint64)
         _buffer_ancestor_ids = np.full(capacity, -1, dtype=np.int32)
-        _buffer_embeddings = np.zeros((capacity, 257), dtype=np.float32)
         if "origins" in preload:
             n = min(len(preload["origins"]), capacity)
             _buffer_origins[:n] = preload["origins"][:n]
@@ -1834,12 +1858,12 @@ def main(config=None, project="JAXUED_TEST"):
             else:
                 ancestor_str = "n/a"
 
-            # Stale embeddings: 257D [hstate(256), action(1)] at insertion time
-            if _buffer_embeddings is not None:
-                dump_data["embeddings"] = _buffer_embeddings[:size].copy()
-
             print(f"  [Provenance] {n_original} original + {n_descendants} descendants = "
                   f"{n_lineage} lineage levels in buffer | ancestors: {ancestor_str}")
+
+        # Stale embeddings: 257D [hstate(256), action(1)] at insertion time
+        if _buffer_embeddings is not None:
+            dump_data["embeddings"] = _buffer_embeddings[:size].copy()
 
         if config.get("output_dir"):
             dump_dir = os.path.join(config["output_dir"], "buffer_dumps")
@@ -2352,9 +2376,14 @@ def main(config=None, project="JAXUED_TEST"):
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
             checkpoint_manager.wait_until_finished()
 
-        # Periodic buffer dump at configured intervals
+        # Buffer dump: periodic interval and/or specific steps
         updates_so_far = (eval_step + 1) * config["eval_freq"]
+        should_dump = False
         if config["buffer_dump_interval"] > 0 and updates_so_far % config["buffer_dump_interval"] == 0:
+            should_dump = True
+        if config.get("_buffer_dump_steps") and updates_so_far in config["_buffer_dump_steps"]:
+            should_dump = True
+        if should_dump:
             dump_buffer(runner_state[1], updates_so_far)
 
     # === End-of-run buffer dump ===
@@ -2674,8 +2703,10 @@ if __name__=="__main__":
                        help="GCS bucket name for saving checkpoints/artifacts (e.g. 'ucl-ued-project-bucket')")
     group.add_argument("--gcs_prefix", type=str, default="accel",
                        help="Prefix path within GCS bucket")
-    group.add_argument("--buffer_dump_interval", type=int, default=250,
-                       help="Dump PLR buffer (VAE token format) every N updates. 0 to disable periodic dumps.")
+    group.add_argument("--buffer_dump_interval", type=int, default=0,
+                       help="Dump PLR buffer every N updates. 0 to disable periodic dumps.")
+    group.add_argument("--buffer_dump_steps", type=str, default=None,
+                       help="Comma-separated list of specific update steps to dump buffer (e.g. '2500,5000,10000,30000')")
     group.add_argument("--preload_buffer_npz", type=str, default=None,
                        help="Path to a merged_buffer .npz to preload into the PLR sampler at init. "
                             "Supports provenance tracking via 'origins' and 'origin_ids' arrays.")
@@ -2755,6 +2786,11 @@ if __name__=="__main__":
     if config["num_env_steps"] is not None:
         config["num_updates"] = config["num_env_steps"] // (config["num_train_envs"] * config["num_steps"])
     config["group_name"] = config.get("wandb_group") or config.get("run_name") or ""
+    # Parse --buffer_dump_steps into a set of ints
+    if config.get("buffer_dump_steps"):
+        config["_buffer_dump_steps"] = set(int(s.strip()) for s in config["buffer_dump_steps"].split(","))
+    else:
+        config["_buffer_dump_steps"] = set()
     
     if config['mode'] == 'eval':
         os.environ['WANDB_MODE'] = 'disabled'
