@@ -89,8 +89,8 @@ pairwise_metrics:
 # Test-only settings (not used during training injection)
 # ============================================================================
 n: 8                        # Number of mazes to generate in test mode
-buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
-agent_dir: gcs_artifacts/agent/accel_sfl_emb_13x13_seed0
+buffer_path: buffer_dumps/injection_training_data/inject_llm_5pct_seed0/buffer_dumps/buffer_dump_5000.npz
+agent_dir: buffer_dumps/injection_training_data/inject_llm_5pct_seed0/checkpoints/inject_llm_5pct_seed0/0
 num_steps: 250
 feedback: true
 
