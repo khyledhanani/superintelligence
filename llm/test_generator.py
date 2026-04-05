@@ -25,7 +25,6 @@ import os
 import json
 import yaml
 from datetime import datetime
-from typing import Optional
 
 import numpy as np
 import matplotlib
@@ -47,498 +46,13 @@ from llm.prompt_builder import (
     PairwiseMetricEntry,
     overlay_path_on_grid,
 )
-from metrics.standalone.per_step_entropy import compute_per_step_entropy
-from metrics.standalone.per_step_regret import compute_per_step_regret
-from metrics.standalone.per_step_action import compute_per_step_action
+from llm.buffer_stats import npz_to_sampler, BufferStatsExtractor
+from llm.reference_metrics import enrich_references_with_metrics
 from metrics.standalone.regret import compute_regret
-from metrics.standalone.learnability import compute_learnability
-from metrics.standalone.value_error import compute_value_error
-from metrics.pairwise.pos_dtw import position_trace_dtw
-from metrics.pairwise.mode_transition import mode_transition_divergence, compute_baseline_stats
-from metrics.pairwise.td_error_distribution import td_error_divergence
 from metrics.utils import downsample, format_vector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
-
-# --- Buffer loading ---
-
-def load_buffer(path: str) -> dict:
-    """Load a buffer dump .npz file.
-
-    Returns dict with keys: tokens (N, 52), scores (N,), size (int), etc.
-    """
-    data = np.load(path)
-    info = {k: data[k] for k in data.files}
-    size = int(info.get("size", len(info["tokens"])))
-    logger.info(f"Loaded buffer: {size} levels, tokens shape {info['tokens'].shape}")
-    return info
-
-
-def tokens_to_ascii(tokens: np.ndarray) -> str:
-    """Convert a 52-token sequence to ASCII maze grid via Level.to_str()."""
-    tokens_jax = jnp.array(tokens, dtype=jnp.int32)
-    level = tokens_to_level(tokens_jax)
-    return level.to_str()
-
-
-def tokens_to_level_obj(tokens: np.ndarray):
-    """Convert a 52-token sequence to a Level object."""
-    tokens_jax = jnp.array(tokens, dtype=jnp.int32)
-    return tokens_to_level(tokens_jax)
-
-
-# --- Reference maze selection ---
-
-def select_references(
-    tokens: np.ndarray,
-    scores: np.ndarray,
-    size: int,
-    n: int = 3,
-    strategy: str = "top_regret",
-    embeddings: Optional[np.ndarray] = None,
-    hybrid_difficulty_percentile: float = 50.0,
-) -> list:
-    """Select reference mazes from the buffer.
-
-    Args:
-        tokens: (capacity, 52) token array
-        scores: (capacity,) score array
-        size: number of active levels
-        n: number of references to select
-        strategy: "top_regret", "random", "diverse", "kmedoid", or "hybrid-kmedoid"
-        embeddings: (capacity, 257) behavior embeddings, required for kmedoid strategies
-        hybrid_difficulty_percentile: percentile threshold for hybrid-kmedoid difficulty filter
-
-    Returns:
-        List of (index, tokens, score) tuples
-    """
-    active_tokens = tokens[:size]
-    active_scores = scores[:size]
-
-    if strategy == "top_regret":
-        # Top n by score (regret)
-        top_indices = np.argsort(active_scores)[::-1][:n]
-    elif strategy == "random":
-        top_indices = np.random.choice(size, min(n, size), replace=False)
-    elif strategy == "diverse":
-        # Spread across score range: pick from quartiles
-        sorted_idx = np.argsort(active_scores)
-        step = max(1, len(sorted_idx) // n)
-        top_indices = sorted_idx[::step][:n]
-    elif strategy in ("kmedoid", "hybrid-kmedoid"):
-        from llm.buffer_stats import _kmedoids_select
-        if embeddings is None:
-            logger.warning("kmedoid strategy requires embeddings; falling back to top_regret")
-            return select_references(tokens, scores, size, n, strategy="top_regret")
-
-        emb = embeddings[:size]
-        norms = np.sqrt(np.sum(emb ** 2, axis=1))
-        valid_mask = norms > 1e-6
-
-        if strategy == "hybrid-kmedoid":
-            threshold = float(np.percentile(active_scores, hybrid_difficulty_percentile))
-            valid_mask &= active_scores >= threshold
-            logger.info(f"Hybrid difficulty filter (p{hybrid_difficulty_percentile:.0f}): "
-                        f"{int(valid_mask.sum())}/{size} levels above {threshold:.4f}")
-
-        valid_indices = np.where(valid_mask)[0]
-        if len(valid_indices) <= n:
-            top_indices = valid_indices
-        else:
-            valid_emb = emb[valid_indices]
-            dist_matrix = np.sqrt(((valid_emb[:, None, :] - valid_emb[None, :, :]) ** 2).sum(axis=2))
-
-            weights = None
-            if strategy == "hybrid-kmedoid":
-                median_dist = float(np.median(dist_matrix[np.triu_indices(len(valid_indices), k=1)]))
-                radius = median_dist * 0.5
-                weights = np.sum(dist_matrix < radius, axis=1).astype(np.float64)
-                weights = weights / weights.mean()
-
-            medoid_local = _kmedoids_select(dist_matrix, n, weights=weights)
-            top_indices = valid_indices[medoid_local]
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
-    refs = []
-    for idx in top_indices:
-        refs.append((int(idx), active_tokens[idx], float(active_scores[idx])))
-    return refs
-
-
-def select_references_diverse(
-    tokens: np.ndarray,
-    scores: np.ndarray,
-    size: int,
-    evaluator,
-    n: int = 3,
-    pool_size: int = 20,
-    metric: str = "td_error_emd",
-) -> list:
-    """Select maximally diverse references using pairwise trajectory metrics.
-
-    Picks a candidate pool (top by regret), runs agent rollouts, computes
-    pairwise diversity, and greedily selects N references that maximize
-    the minimum pairwise distance.
-
-    Args:
-        tokens: (capacity, 52) token array
-        scores: (capacity,) score array
-        size: number of active levels
-        evaluator: AgentEvaluator instance (already loaded)
-        n: number of references to select
-        pool_size: candidate pool size (top by regret)
-        metric: pairwise metric to maximize. One of:
-            "td_error_emd" — Earth Mover's Distance between TD error distributions
-            "experience_divergence" — KL divergence between mode transition matrices
-            "position_dtw" — spatial path DTW distance
-
-    Returns:
-        List of (index, tokens, score) tuples
-    """
-    from metrics.pairwise.td_error_distribution import td_error_divergence
-    from metrics.pairwise.mode_transition import (
-        mode_transition_divergence,
-        compute_baseline_stats,
-    )
-    from metrics.pairwise.pos_dtw import position_trace_dtw
-
-    active_scores = scores[:size]
-    pool_k = min(pool_size, size)
-
-    # Candidate pool: top by regret
-    pool_indices = np.argsort(active_scores)[::-1][:pool_k]
-    logger.info(f"Diverse selection: pool of {pool_k} candidates, metric={metric}")
-
-    # Roll out agent on candidate pool
-    pool_levels = [tokens_to_level_obj(tokens[i]) for i in pool_indices]
-    logger.info(f"Rolling out agent on {pool_k} candidate levels...")
-    pool_trajectories = evaluator.evaluate_levels(pool_levels)
-
-    # Compute baseline stats for mode transition if needed
-    baseline_stats = None
-    if metric == "experience_divergence":
-        baseline_stats = compute_baseline_stats(pool_trajectories)
-        logger.info(
-            f"Mode baseline: error_threshold={baseline_stats['error_threshold']:.3f}, "
-            f"entropy_threshold={baseline_stats['entropy_threshold']:.3f}"
-        )
-
-    # Compute pairwise distance matrix
-    dist = np.zeros((pool_k, pool_k))
-    for i in range(pool_k):
-        for j in range(i + 1, pool_k):
-            ti, tj = pool_trajectories[i], pool_trajectories[j]
-            if metric == "td_error_emd":
-                result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
-                d = result["emd"]
-            elif metric == "experience_divergence":
-                result = mode_transition_divergence(
-                    ti, ti["dones"], tj, tj["dones"],
-                    entropy_a=ti.get("entropy"), entropy_b=tj.get("entropy"),
-                    baseline_stats=baseline_stats,
-                )
-                d = result["kl_divergence"]
-            elif metric == "position_dtw":
-                result = position_trace_dtw(
-                    ti["positions"], ti["dones"],
-                    tj["positions"], tj["dones"],
-                )
-                d = result["distance"]
-            else:
-                raise ValueError(f"Unknown diverse metric: {metric}")
-            dist[i, j] = d
-            dist[j, i] = d
-
-    # Greedy selection: maximize minimum pairwise distance
-    # Start with the pair that has the highest distance
-    best_pair = np.unravel_index(np.argmax(dist), dist.shape)
-    selected = [best_pair[0], best_pair[1]]
-
-    while len(selected) < n and len(selected) < pool_k:
-        best_next = -1
-        best_min_dist = -1
-        for candidate in range(pool_k):
-            if candidate in selected:
-                continue
-            # Min distance from candidate to any already-selected
-            min_d = min(dist[candidate, s] for s in selected)
-            if min_d > best_min_dist:
-                best_min_dist = min_d
-                best_next = candidate
-        if best_next < 0:
-            break
-        selected.append(best_next)
-
-    # Log selection
-    for i, s in enumerate(selected):
-        idx = int(pool_indices[s])
-        logger.info(
-            f"  Diverse ref {i+1}: buffer idx={idx}, "
-            f"score={float(active_scores[idx]):.4f}, "
-            f"min_dist={min(dist[s, o] for o in selected if o != s):.4f}"
-        )
-
-    refs = []
-    for s in selected:
-        idx = int(pool_indices[s])
-        refs.append((idx, tokens[idx], float(active_scores[idx])))
-    return refs
-
-
-def build_references_with_metrics(
-    ref_data: list,
-    trajectories: list = None,
-    inject_regret: bool = True,
-    inject_dtw: bool = False,
-    downsample_points: int = 20,
-    prompt_metrics: dict = None,
-    pairwise_metrics_cfg: dict = None,
-) -> tuple:
-    """Build ReferenceMaze objects with configurable metric injection.
-
-    Args:
-        ref_data: List of (index, tokens, score) tuples
-        trajectories: List of trajectory dicts from AgentEvaluator (or None)
-        inject_regret: Include regret score as a metric (fallback to buffer score)
-        inject_dtw: Unused (kept for CLI compat)
-        downsample_points: Max points when downsampling vectors
-        prompt_metrics: Dict of metric_key -> bool controlling which per-maze
-            metrics to include. None = all enabled. Keys:
-            per_step_entropy, per_step_regret, scalar_regret, action_sequence, path_overlay
-        pairwise_metrics_cfg: Dict of metric_key -> bool controlling which
-            pairwise metrics to include. None = all enabled. Keys: position_dtw
-
-    Returns:
-        Tuple of (references, pairwise_metrics):
-            references: List of ReferenceMaze objects with per-maze metrics
-            pairwise_metrics: List of PairwiseMetricEntry
-    """
-    # Default: all metrics enabled
-    pm = prompt_metrics or {}
-    pw = pairwise_metrics_cfg or {}
-
-    def _enabled(cfg_dict, key):
-        return cfg_dict.get(key, True)
-
-    references = []
-    pairwise_metrics = []
-
-    for i, (idx, tokens, score) in enumerate(ref_data):
-        grid = tokens_to_ascii(tokens)
-        label = f"Maze {chr(65 + i)}"  # A, B, C, ...
-
-        metrics = []
-
-        if trajectories is not None and i < len(trajectories):
-            traj = trajectories[i]
-
-            # Per-step entropy
-            if _enabled(pm, "per_step_entropy"):
-                ent_info = compute_per_step_entropy(traj["entropy"], traj["dones"])
-                ds_entropy = downsample(ent_info["entropy"], downsample_points)
-                metrics.append(MetricEntry(
-                    name="Per-Step Entropy",
-                    value=format_vector(ds_entropy),
-                    description=(
-                        f"Policy uncertainty at each step "
-                        f"(mean={ent_info['mean']:.3f}, max={ent_info['max']:.3f} "
-                        f"at step {ent_info['max_step']}, ep_len={ent_info['episode_length']})"
-                    ),
-                    higher_is="more uncertain (harder decision points)",
-                    metric_key="per_step_entropy",
-                ))
-
-            # Per-step regret
-            if _enabled(pm, "per_step_regret"):
-                reg_info = compute_per_step_regret(
-                    traj["values"], traj["rewards"], traj["dones"]
-                )
-                ds_regret = downsample(reg_info["regret_curve"], downsample_points)
-                metrics.append(MetricEntry(
-                    name="Per-Step Regret",
-                    value=format_vector(ds_regret),
-                    description=(
-                        f"Difficulty at each step (max_return - V(s_t)), "
-                        f"mean={reg_info['mean_regret']:.3f}, "
-                        f"ep_len={reg_info['episode_length']}"
-                    ),
-                    higher_is="harder (agent expects lower return)",
-                    metric_key="per_step_regret",
-                ))
-
-            # Scalar regret
-            if _enabled(pm, "scalar_regret"):
-                regret_info = compute_regret(traj)
-                metrics.append(MetricEntry(
-                    name="Scalar Regret",
-                    value=regret_info.regret,
-                    description=(
-                        f"MaxMC regret (mean gap between best return and value estimate), "
-                        f"solved={regret_info.solved}, ep_len={regret_info.episode_length}"
-                    ),
-                    higher_is="more learning potential",
-                    metric_key="scalar_regret",
-                ))
-
-            # SFL Learnability (requires solve_rate from multi-rollout eval)
-            if _enabled(pm, "learnability") and "solve_rate" in traj:
-                learn_info = compute_learnability(traj)
-                metrics.append(MetricEntry(
-                    name="SFL Learnability",
-                    value=learn_info.learnability,
-                    description=(
-                        f"p×(1-p) where p=solve_rate={learn_info.solve_rate:.0%} "
-                        f"across {learn_info.n_rollouts} rollouts "
-                        f"(max 0.25 at p=0.5)"
-                    ),
-                    higher_is="more at learning frontier (peak at p=0.5)",
-                    metric_key="learnability",
-                ))
-
-            # Action sequence
-            if _enabled(pm, "action_sequence"):
-                act_info = compute_per_step_action(traj["actions"], traj["dones"])
-                ds_actions = downsample(act_info["actions"].astype(np.float64), downsample_points)
-                metrics.append(MetricEntry(
-                    name="Action Sequence",
-                    value=format_vector(ds_actions, decimals=0),
-                    description=(
-                        f"Agent's action at each step "
-                        f"({act_info['num_unique_actions']} unique, "
-                        f"dominant=action {act_info['dominant_action']} "
-                        f"at {act_info['dominant_fraction']:.0%})"
-                    ),
-                    metric_key="action_sequence",
-                ))
-
-            # Value error profile
-            if _enabled(pm, "value_error"):
-                ve_info = compute_value_error(traj["values"], traj["rewards"], traj["dones"])
-                ds_error = downsample(ve_info["error_curve"], downsample_points)
-                metrics.append(MetricEntry(
-                    name="Value Error",
-                    value=format_vector(ds_error),
-                    description=(
-                        f"Signed V(s_t)-G_t: positive=overconfident, negative=underconfident "
-                        f"(mean={ve_info['mean_error']:.3f}, "
-                        f"overconfident {ve_info['overconfident_frac']:.0%} of steps, "
-                        f"ep_len={ve_info['episode_length']})"
-                    ),
-                    higher_is="more overconfident (agent expects more than reality)",
-                    metric_key="value_error",
-                ))
-
-            # Position vector
-            if _enabled(pm, "position_vector"):
-                from metrics.utils import truncate_at_done
-                ep_pos = truncate_at_done(traj["positions"], traj["dones"])
-                ds_pos = downsample(ep_pos, downsample_points)
-                pos_str = "[" + ", ".join(f"({int(p[0])},{int(p[1])})" for p in ds_pos) + "]"
-                metrics.append(MetricEntry(
-                    name="Position Trace",
-                    value=pos_str,
-                    description=(
-                        f"Agent (x,y) at each step "
-                        f"(ep_len={len(ep_pos)}, downsampled to {len(ds_pos)} points)"
-                    ),
-                    metric_key="position_vector",
-                ))
-
-            # Path overlay
-            path_overlay = None
-            if _enabled(pm, "path_overlay"):
-                try:
-                    from metrics.utils import truncate_at_done
-                    ep_pos = truncate_at_done(traj["positions"], traj["dones"])
-                    path_overlay = overlay_path_on_grid(grid, ep_pos)
-                except Exception:
-                    pass
-
-            references.append(ReferenceMaze(
-                grid=grid,
-                label=label,
-                metrics=metrics,
-                path_overlay=path_overlay,
-            ))
-        else:
-            # Fallback: just buffer score
-            if inject_regret:
-                metrics.append(MetricEntry(
-                    name="Regret Score",
-                    value=score,
-                    description="Agent's learning potential on this maze",
-                    higher_is="more to learn",
-                    metric_key="scalar_regret",
-                ))
-            references.append(ReferenceMaze(
-                grid=grid,
-                label=label,
-                metrics=metrics,
-            ))
-
-    # Pairwise position DTW between all reference pairs
-    if _enabled(pw, "position_dtw") and trajectories is not None and len(trajectories) >= 2:
-        for i in range(len(trajectories)):
-            for j in range(i + 1, len(trajectories)):
-                ti, tj = trajectories[i], trajectories[j]
-                dtw_result = position_trace_dtw(
-                    ti["positions"], ti["dones"],
-                    tj["positions"], tj["dones"],
-                )
-                pairwise_metrics.append(PairwiseMetricEntry(
-                    maze_a_label=references[i].label,
-                    maze_b_label=references[j].label,
-                    name="Position DTW",
-                    value=dtw_result["distance"],
-                    description="Spatial path similarity (lower = more similar routes)",
-                    metric_key="position_dtw",
-                ))
-
-    # Pairwise mode transition divergence between all reference pairs
-    if _enabled(pw, "mode_transition") and trajectories is not None and len(trajectories) >= 2:
-        baseline = compute_baseline_stats(trajectories)
-        logger.info(
-            f"Mode baseline: error_threshold={baseline['error_threshold']:.3f}, "
-            f"entropy_threshold={baseline['entropy_threshold']:.3f}"
-        )
-        for i in range(len(trajectories)):
-            for j in range(i + 1, len(trajectories)):
-                ti, tj = trajectories[i], trajectories[j]
-                div_result = mode_transition_divergence(
-                    ti, ti["dones"],
-                    tj, tj["dones"],
-                    entropy_a=ti.get("entropy"),
-                    entropy_b=tj.get("entropy"),
-                    baseline_stats=baseline,
-                )
-                pairwise_metrics.append(PairwiseMetricEntry(
-                    maze_a_label=references[i].label,
-                    maze_b_label=references[j].label,
-                    name="Experience Divergence",
-                    value=div_result["kl_divergence"],
-                    description="Mode transition KL divergence (higher = more different agent experiences)",
-                    metric_key="mode_transition",
-                ))
-
-    # Pairwise TD error distribution divergence
-    if _enabled(pw, "td_error") and trajectories is not None and len(trajectories) >= 2:
-        for i in range(len(trajectories)):
-            for j in range(i + 1, len(trajectories)):
-                ti, tj = trajectories[i], trajectories[j]
-                td_result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
-                pairwise_metrics.append(PairwiseMetricEntry(
-                    maze_a_label=references[i].label,
-                    maze_b_label=references[j].label,
-                    name="TD Error EMD",
-                    value=td_result["emd"],
-                    description="Earth Mover's Distance between TD error distributions (higher = more different learning signals)",
-                    metric_key="td_error",
-                ))
-
-    return references, pairwise_metrics
-
 
 # --- Output directory ---
 
@@ -1007,13 +521,28 @@ def save_results(
                 all_markers.append('*')
                 all_force_accepted.append(force)
 
+    if len(all_trajs) < 3:
+        logger.info(f"Skipping t-SNE diversity plot: need >= 3 trajectories, have {len(all_trajs)} "
+                     f"(use --inject-metrics to include reference trajectories)")
     if len(all_trajs) >= 3:
         try:
             from sklearn.manifold import TSNE
 
+            def _traj_to_embedding(traj):
+                """Compute mean 257D embedding from trajectory."""
+                from metrics.standalone.cenie import extract_state_action_pairs
+                pairs = extract_state_action_pairs(traj)
+                if pairs is not None and len(pairs) > 0:
+                    return pairs.mean(axis=0)
+                return np.zeros(257, dtype=np.float32)
+
             def _pairwise_distance(t1, t2, metric):
                 """Compute pairwise distance between two trajectories."""
-                if metric == "td_error_emd":
+                if metric == "embedding_l2":
+                    e1 = _traj_to_embedding(t1)
+                    e2 = _traj_to_embedding(t2)
+                    return float(np.linalg.norm(e1 - e2))
+                elif metric == "td_error_emd":
                     from metrics.pairwise.td_error_distribution import td_error_divergence
                     return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
                 elif metric == "experience_divergence":
@@ -1028,10 +557,10 @@ def save_results(
                         t1["positions"], t1["dones"], t2["positions"], t2["dones"],
                     )["distance"]
                 else:
-                    from metrics.pairwise.td_error_distribution import td_error_divergence
-                    return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
+                    return _pairwise_distance(t1, t2, "embedding_l2")
 
             _emb_label = {
+                "embedding_l2": "Embedding L2",
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
@@ -1167,13 +696,12 @@ def run_test(args):
     import time as _time
     _t_setup = _time.time()
     logger.info(f"Loading buffer from {args.buffer_path}...")
-    buf = load_buffer(args.buffer_path)
+    sampler = npz_to_sampler(args.buffer_path)
+    size = int(np.asarray(sampler["size"]))
+    scores = np.asarray(sampler["scores"])
     print(f"[TIMING] Buffer load: {_time.time() - _t_setup:.1f}s", flush=True)
-    size = int(buf["size"])
-    tokens = buf["tokens"]
-    scores = buf["scores"]
 
-    # Load agent early if needed for diverse selection or metrics
+    # Load agent early if needed for embedding-based selection or metrics
     evaluator = None
     if args.inject_metrics or args.strategy in ("diverse", "kmedoid", "hybrid-kmedoid"):
         from llm.agent_evaluator import AgentEvaluator
@@ -1182,14 +710,14 @@ def run_test(args):
         evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
         print(f"[TIMING] Agent load: {_time.time() - _t_agent:.1f}s", flush=True)
 
-    # Compute buffer embeddings if needed for kmedoid strategies
+    # Compute buffer embeddings if needed for embedding-based strategies
     buffer_embeddings = None
-    if args.strategy in ("kmedoid", "hybrid-kmedoid") and evaluator is not None:
+    if args.strategy in ("diverse", "kmedoid", "hybrid-kmedoid") and evaluator is not None:
         logger.info(f"Computing buffer embeddings for {args.strategy} selection...")
         _t_emb = _time.time()
         from metrics.standalone.cenie import extract_state_action_pairs
-        emb_levels = [tokens_to_level_obj(tokens[i]) for i in range(size)]
-        emb_trajs = evaluator.evaluate_levels(emb_levels)
+        all_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in range(size)]
+        emb_trajs = evaluator.evaluate_levels(all_levels)
         buffer_embeddings = np.zeros((size, 257), dtype=np.float32)
         for i, traj in enumerate(emb_trajs):
             pairs = extract_state_action_pairs(traj)
@@ -1197,40 +725,31 @@ def run_test(args):
                 buffer_embeddings[i] = pairs.mean(axis=0)
         print(f"[TIMING] Buffer embeddings ({size} levels): {_time.time() - _t_emb:.1f}s", flush=True)
 
-    # Select reference mazes
+    # Select reference mazes via BufferStatsExtractor
+    extractor = BufferStatsExtractor(
+        n_references=args.num_refs,
+        strategy=args.strategy,
+        hybrid_difficulty_percentile=getattr(args, 'hybrid_difficulty_percentile', 50.0),
+    )
+    if buffer_embeddings is not None:
+        extractor._buffer_embeddings = buffer_embeddings
+
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
-    if args.strategy == "diverse" and evaluator is not None:
-        ref_data = select_references_diverse(
-            tokens, scores, size, evaluator,
-            n=args.num_refs,
-            pool_size=args.diverse_pool_size,
-            metric=args.diverse_metric,
-        )
-    else:
-        ref_data = select_references(
-            tokens, scores, size, n=args.num_refs, strategy=args.strategy,
-            embeddings=buffer_embeddings,
-            hybrid_difficulty_percentile=getattr(args, 'hybrid_difficulty_percentile', 50.0),
-        )
+    references, ref_levels = extractor.extract_references_with_levels(sampler)
 
     # Roll out agent on selected reference levels to get trajectory data
     ref_trajectories = None
-    if args.inject_metrics and evaluator is not None:
-        ref_levels = []
-        for idx, tok, score in ref_data:
-            ref_levels.append(tokens_to_level_obj(tok))
-
+    if args.inject_metrics and evaluator is not None and ref_levels:
         logger.info(f"Rolling out agent on {len(ref_levels)} reference levels...")
         _t_ref = _time.time()
         ref_trajectories = evaluator.evaluate_levels(ref_levels)
         print(f"[TIMING] Reference rollouts ({len(ref_levels)} levels): {_time.time() - _t_ref:.1f}s", flush=True)
         logger.info("Reference trajectories collected")
 
-    # Build references with metrics (configurable via prompt_metrics/pairwise_metrics)
-    references, pairwise_metrics = build_references_with_metrics(
-        ref_data,
+    # Enrich references with trajectory-based metrics
+    references, pairwise_metrics = enrich_references_with_metrics(
+        references,
         trajectories=ref_trajectories,
-        inject_regret=args.inject_regret,
         downsample_points=args.downsample_points,
         prompt_metrics=args.prompt_metrics,
         pairwise_metrics_cfg=args.pairwise_metrics_cfg,
@@ -1254,7 +773,7 @@ def run_test(args):
     # Build global metrics
     global_metrics = None
     if args.inject_buffer_stats:
-        active_scores = scores[:size]
+        active_scores = np.asarray(scores)
         score_label = "Learnability (SFL)" if args.difficulty_metric == "sfl" else "Regret"
         global_metrics = [
             MetricEntry(
@@ -1333,7 +852,6 @@ def run_test(args):
         if not args.inject_metrics:
             from llm.agent_evaluator import AgentEvaluator
             evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
-            ref_levels = [tokens_to_level_obj(tok) for _, tok, _ in ref_data]
             ref_trajectories = evaluator.evaluate_levels(ref_levels)
 
         ref_labels = [ref.label for ref in references]
@@ -1359,8 +877,8 @@ def run_test(args):
                 n_cenie_levels = min(size, 50)  # fit on up to 50 buffer levels
                 if n_cenie_levels > len(ref_trajectories):
                     logger.info(f"Rolling out agent on {n_cenie_levels} buffer levels for CENIE GMM...")
-                    cenie_indices = np.argsort(-scores[:size])[:n_cenie_levels]
-                    cenie_levels = [tokens_to_level_obj(tokens[i]) for i in cenie_indices]
+                    cenie_indices = np.argsort(-np.asarray(scores))[:n_cenie_levels]
+                    cenie_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in cenie_indices]
                     cenie_trajs = evaluator.evaluate_levels(cenie_levels)
                     logger.info(f"CENIE trajectories collected ({n_cenie_levels} levels)")
                 cenie_model = fit_cenie_model(cenie_trajs)
@@ -1378,9 +896,10 @@ def run_test(args):
             if ref_embs:
                 ref_embeddings = np.stack(ref_embs)
                 logger.info(f"Computed {len(ref_embs)} reference embeddings for L2 diversity")
-            # Also compute buffer-wide embeddings from stored data if available
-            if "embeddings" in buf:
-                buffer_embeddings = np.array(buf["embeddings"][:size])
+            # Also load precomputed buffer-wide embeddings if available in the npz
+            npz_data = np.load(args.buffer_path, allow_pickle=True)
+            if "embeddings" in npz_data:
+                buffer_embeddings = np.array(npz_data["embeddings"][:size])
                 logger.info(f"Loaded {size} buffer embeddings for L2 diversity")
 
         results = generator.generate_batch_with_feedback(
@@ -1533,16 +1052,9 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse", "kmedoid", "hybrid-kmedoid"],
-                        default=cfg.get("strategy"),
+    parser.add_argument("--strategy", choices=["hardest", "top_regret", "random", "diverse", "kmedoid", "hybrid-kmedoid"],
+                        default=cfg.get("strategy", "hardest"),
                         help="Reference selection strategy")
-    parser.add_argument("--diverse-metric",
-                        choices=["td_error_emd", "experience_divergence", "position_dtw"],
-                        default=cfg.get("diverse_metric", "td_error_emd"),
-                        help="Pairwise metric for diverse strategy")
-    parser.add_argument("--diverse-pool-size", type=int,
-                        default=cfg.get("diverse_pool_size", 20),
-                        help="Candidate pool size for diverse strategy")
     parser.add_argument("--hybrid-difficulty-percentile", type=float,
                         default=cfg.get("hybrid_difficulty_percentile", 50.0),
                         help="Percentile threshold for hybrid-kmedoid difficulty filter")
@@ -1612,16 +1124,16 @@ def main():
                         help="Path to agent checkpoint directory")
     parser.add_argument("--num-steps", type=int, default=cfg.get("num_steps"),
                         help="Max rollout steps per episode")
-    parser.add_argument("--n-rollouts", type=int, default=cfg.get("n_rollouts"),
+    # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
+    gate_cfg = cfg.get("gate", {})
+    parser.add_argument("--n-rollouts", type=int, default=gate_cfg.get("n_rollouts", cfg.get("n_rollouts", 50)),
                         help="Agent rollouts per maze for robust regret")
     parser.add_argument("--downsample-points", type=int,
                         default=cfg.get("downsample_points"),
                         help="Max points when downsampling metric vectors for LLM prompt")
     parser.add_argument("--max-diversity-retries", type=int,
-                        default=cfg.get("max_diversity_retries"),
+                        default=gate_cfg.get("max_diversity_retries", cfg.get("max_diversity_retries", 3)),
                         help="Max diversity gate retries per maze")
-    # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
-    gate_cfg = cfg.get("gate", {})
     parser.add_argument("--difficulty-threshold", type=float,
                         default=gate_cfg.get("difficulty_threshold"),
                         help="Min difficulty score to accept (null = disabled)")
@@ -1637,8 +1149,8 @@ def main():
                         default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "td_error_emd")),
                         help="Diversity metric: pairwise (td_error_emd, experience_divergence, position_dtw), buffer-wide (cenie), or embedding_l2")
     parser.add_argument("--embedding-metric",
-                        choices=["td_error_emd"],
-                        default=cfg.get("embedding_metric", "td_error_emd"),
+                        choices=["embedding_l2", "td_error_emd", "experience_divergence", "position_dtw"],
+                        default=cfg.get("embedding_metric", "embedding_l2"),
                         help="Pairwise metric for t-SNE diversity embedding plot")
 
     # Mode

@@ -1,19 +1,69 @@
 """Buffer statistics extractor for live sampler state to ReferenceMaze conversion.
 
-Converts a live train_state.sampler JAX dict into ReferenceMaze objects suitable
-for LLM prompt context. This replaces the .npz-based flow in test_generator.py
-with a live-buffer flow that reads directly from the training state.
+Provides two entry points:
+  1. BufferStatsExtractor — extracts reference mazes from a live JAX sampler dict
+     or a sampler dict built from a .npz buffer dump via npz_to_sampler().
+  2. npz_to_sampler() — converts a buffer dump .npz file into a sampler dict
+     compatible with BufferStatsExtractor.
 """
 
 import logging
 from typing import List, Optional, Tuple
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from llm.prompt_builder import MetricEntry, ReferenceMaze
 
 logger = logging.getLogger(__name__)
+
+
+def npz_to_sampler(npz_path: str) -> dict:
+    """Load a buffer dump .npz and return a sampler dict for BufferStatsExtractor.
+
+    Args:
+        npz_path: Path to .npz file with keys: tokens (N, 52), scores (N,), size (int).
+
+    Returns:
+        dict with keys: levels (batched Level pytree), scores (jnp array), size (int),
+        and levels_extra if ancestor_id data is present.
+    """
+    from vae.vae_level_utils import tokens_to_level
+
+    data = np.load(npz_path, allow_pickle=True)
+    tokens = data["tokens"]
+    scores = data["scores"]
+    size = int(data["size"])
+
+    if size == 0:
+        raise ValueError(f"Buffer at {npz_path} is empty (size=0)")
+
+    levels_list = []
+    for i in range(size):
+        levels_list.append(tokens_to_level(jnp.array(tokens[i])))
+
+    levels_pytree = jax.tree_util.tree_map(
+        lambda *xs: jnp.stack(xs), *levels_list
+    )
+
+    sampler = {
+        "levels": levels_pytree,
+        "scores": jnp.array(scores[:size], dtype=jnp.float32),
+        "size": size,
+    }
+
+    # Carry over levels_extra if present
+    if "ancestor_ids" in data:
+        ancestor_ids = data["ancestor_ids"][:size]
+        sampler["levels_extra"] = {
+            "ancestor_id": jnp.array(ancestor_ids, dtype=jnp.int32),
+        }
+
+    logger.info(f"[Buffer] Loaded {size} levels from {npz_path}")
+    logger.info(f"[Buffer] Score range: [{scores[:size].min():.4f}, "
+                f"{scores[:size].max():.4f}], mean={scores[:size].mean():.4f}")
+    return sampler
 
 
 def _kmedoids_select(dist_matrix: np.ndarray, n: int, weights: Optional[np.ndarray] = None) -> list:
@@ -100,13 +150,13 @@ class BufferStatsExtractor:
     Args:
         n_references: Number of reference mazes to select (default 5)
         strategy: Reference selection strategy. Currently supports:
-            - "hardest": top-regret, highest score mazes shown first
+            - "hardest" (alias "top_regret"): highest score mazes shown first
             - "random": random selection from active levels
-            - "diverse": spread selection across score range (quartile-based)
+            - "diverse": greedy max-min distance on 257D behavior embeddings
             - "kmedoid": k-medoids clustering on 257D behavior embeddings
             - "hybrid-kmedoid": density-weighted k-medoids (biased toward dense regions)
         buffer_embeddings: Optional (capacity, 257) numpy array of behavior embeddings.
-            Required for kmedoid and hybrid-kmedoid strategies.
+            Required for diverse, kmedoid, and hybrid-kmedoid strategies.
     """
 
     def __init__(self, n_references: int = 5, strategy: str = "hardest",
@@ -146,16 +196,13 @@ class BufferStatsExtractor:
 
         # Select indices by strategy
         n = min(self.n_references, size)
-        if self.strategy == "hardest":
+        if self.strategy in ("hardest", "top_regret"):
             selected_indices = np.argsort(scores)[::-1][:n]
         elif self.strategy == "random":
             selected_indices = np.random.choice(size, n, replace=False)
         elif self.strategy == "diverse":
-            sorted_idx = np.argsort(scores)
-            step = max(1, len(sorted_idx) // n)
-            selected_indices = sorted_idx[::step][:n]
+            selected_indices = self._select_diverse_indices(scores, size, n)
         elif self.strategy in ("kmedoid", "hybrid-kmedoid"):
-            # hybrid-kmedoid: filter to top X% by difficulty, then kmedoid
             difficulty_mask = None
             if self.strategy == "hybrid-kmedoid":
                 pct = self.hybrid_difficulty_percentile
@@ -169,7 +216,8 @@ class BufferStatsExtractor:
         else:
             raise ValueError(
                 f"Unknown reference selection strategy: {self.strategy!r}. "
-                "Expected 'hardest', 'random', 'diverse', 'kmedoid', or 'hybrid-kmedoid'."
+                "Expected 'hardest', 'top_regret', 'random', 'diverse', "
+                "'kmedoid', or 'hybrid-kmedoid'."
             )
 
         references = []
@@ -195,6 +243,55 @@ class BufferStatsExtractor:
             level_objects.append(level)
 
         return references, level_objects
+
+    def _select_diverse_indices(self, scores: np.ndarray, size: int, n: int) -> np.ndarray:
+        """Select reference indices via greedy max-min distance on embeddings."""
+        emb = self._buffer_embeddings
+        if emb is None:
+            logger.warning("diverse strategy requires buffer embeddings; falling back to hardest")
+            return np.argsort(scores)[::-1][:n]
+
+        emb = emb[:size]
+        norms = np.sqrt(np.sum(emb ** 2, axis=1))
+        valid_mask = norms > 1e-6
+        valid_indices = np.where(valid_mask)[0]
+        n_valid = len(valid_indices)
+        logger.info(f"Diverse selection: {n_valid} candidate levels from {size} active")
+
+        if n_valid <= n:
+            return valid_indices
+
+        # L2 pairwise distance matrix
+        valid_emb = emb[valid_indices]
+        dist_matrix = np.zeros((n_valid, n_valid), dtype=np.float32)
+        chunk_size = max(1, min(500, n_valid))
+        for start in range(0, n_valid, chunk_size):
+            end = min(start + chunk_size, n_valid)
+            diff = valid_emb[start:end, np.newaxis, :] - valid_emb[np.newaxis, :, :]
+            dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+        # Greedy max-min: start with the pair having largest distance
+        flat_max = int(np.argmax(dist_matrix))
+        i0, i1 = divmod(flat_max, n_valid)
+        selected = [i0, i1]
+
+        # Track minimum distance from each point to any selected point
+        min_dists = np.minimum(dist_matrix[i0], dist_matrix[i1])
+
+        while len(selected) < n:
+            # Zero out already-selected points
+            min_dists[selected[-1]] = -1.0
+            next_idx = int(np.argmax(min_dists))
+            selected.append(next_idx)
+            min_dists = np.minimum(min_dists, dist_matrix[next_idx])
+
+        result = valid_indices[selected]
+        for i, s in enumerate(selected):
+            idx = int(result[i])
+            min_d = float(min(dist_matrix[s, o] for o in selected if o != s))
+            logger.info(f"  Diverse {i+1}: idx={idx}, score={scores[idx]:.4f}, min_dist={min_d:.4f}")
+
+        return result
 
     def _select_kmedoid_indices(self, scores: np.ndarray, size: int, n: int,
                                 difficulty_mask: Optional[np.ndarray] = None) -> np.ndarray:

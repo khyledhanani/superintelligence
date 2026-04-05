@@ -173,6 +173,18 @@ class LLMInjectionManager:
         gen_config = self._build_generation_config(config)
         self.generator = MazeGenerator(gen_config)
 
+        # Load prompt metric config from YAML (controls which metrics appear in LLM prompt)
+        self._prompt_metrics = None
+        self._pairwise_metrics_cfg = None
+        self._downsample_points = 20
+        if config.config_path:
+            import yaml
+            with open(config.config_path) as f:
+                yaml_cfg = yaml.safe_load(f) or {}
+            self._prompt_metrics = yaml_cfg.get("prompt_metrics")
+            self._pairwise_metrics_cfg = yaml_cfg.get("pairwise_metrics")
+            self._downsample_points = yaml_cfg.get("downsample_points", 20)
+
         # Wall-flip mutation function (JAX-compiled)
         self.mutate_level = make_level_mutator_minimax(100)
 
@@ -335,6 +347,16 @@ class LLMInjectionManager:
                 )
                 ref_trajectories.append(traj)
                 ref_labels.append(ref.label)
+
+            # Enrich references with trajectory-based metrics for the LLM prompt
+            from llm.reference_metrics import enrich_references_with_metrics
+            references, _ = enrich_references_with_metrics(
+                references,
+                trajectories=ref_trajectories,
+                downsample_points=self._downsample_points,
+                prompt_metrics=self._prompt_metrics,
+                pairwise_metrics_cfg=self._pairwise_metrics_cfg,
+            )
 
         # Fit CENIE model if using cenie diversity metric
         # Precompute reference embeddings for L2 embedding diversity

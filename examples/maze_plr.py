@@ -2719,45 +2719,37 @@ if __name__=="__main__":
     llm_group.add_argument("--llm_target_buffer_pct", type=float, default=0.0,
                            help="Target LLM buffer fill %% (0=disabled, 0.05=5%%). "
                                 "Repeats injection rounds until target met or max rounds hit.")
-    llm_group.add_argument("--llm_max_injection_rounds", type=int, default=10,
-                           help="Max injection rounds per event when using target_buffer_pct")
-    llm_group.add_argument("--llm_n_references", type=int, default=5,
-                           help="Number of buffer mazes shown to LLM as reference context")
-    llm_group.add_argument("--llm_ref_strategy", type=str, default="hardest",
+    llm_group.add_argument("--llm_n_references", type=int, default=None,
+                           help="Number of buffer mazes shown to LLM as reference context (default: from config.yaml)")
+    llm_group.add_argument("--llm_ref_strategy", type=str, default=None,
                            choices=["hardest", "random", "diverse", "kmedoid", "hybrid-kmedoid"],
-                           help="Strategy for selecting reference mazes from PLR buffer")
-    llm_group.add_argument("--llm_hybrid_difficulty_percentile", type=float, default=50,
+                           help="Strategy for selecting reference mazes from PLR buffer (default: from config.yaml)")
+    llm_group.add_argument("--llm_hybrid_difficulty_percentile", type=float, default=None,
                            help="Percentile threshold for hybrid-kmedoid difficulty filter "
-                                "(50=above median, 75=top 25%%)")
+                                "(default: from config.yaml)")
     llm_group.add_argument("--llm_amplification", action=argparse.BooleanOptionalAction, default=True,
                            help="Enable mutation amplification of LLM seed mazes")
     llm_group.add_argument("--llm_mutations_per_seed", type=int, default=30,
                            help="Number of wall-flip mutations per LLM seed maze")
-    llm_group.add_argument("--llm_max_inject_per_event", type=int, default=200,
-                           help="Maximum number of levels to inject into buffer per injection event")
-    llm_group.add_argument("--llm_gate", action=argparse.BooleanOptionalAction, default=True,
-                           help="Enable decision gate (difficulty+diversity filter) for LLM mazes")
-    llm_group.add_argument("--llm_difficulty_threshold", type=float, default=0.6,
-                           help="Minimum difficulty score (regret) for gate acceptance")
-    llm_group.add_argument("--llm_difficulty_gate_mode", type=str, default="fixed",
+    llm_group.add_argument("--llm_gate", action=argparse.BooleanOptionalAction, default=None,
+                           help="Enable decision gate (default: from config.yaml)")
+    llm_group.add_argument("--llm_difficulty_threshold", type=float, default=None,
+                           help="Minimum difficulty score for gate acceptance (default: from config.yaml)")
+    llm_group.add_argument("--llm_difficulty_gate_mode", type=str, default=None,
                            choices=["fixed", "buffer_min", "buffer_mean", "reference_mean", "competitive"],
-                           help="How LLM difficulty threshold is set: fixed=absolute, "
-                                "buffer_mean=mean buffer score, reference_mean=mean of N references, "
-                                "competitive=actual SFL score competes with buffer (same as ACCEL)")
-    llm_group.add_argument("--llm_min_diversity", type=float, default=0.4,
-                           help="Minimum diversity score (td_error_emd) for gate acceptance")
-    llm_group.add_argument("--llm_diversity_gate_mode", type=str, default="fixed",
+                           help="How LLM difficulty threshold is set (default: from config.yaml)")
+    llm_group.add_argument("--llm_min_diversity", type=float, default=None,
+                           help="Minimum diversity score for gate acceptance (default: from config.yaml)")
+    llm_group.add_argument("--llm_diversity_gate_mode", type=str, default=None,
                            choices=["fixed", "buffer_median", "disabled"],
-                           help="How LLM diversity threshold is set: fixed=absolute, "
-                                "buffer_median=median pairwise distance among references, "
-                                "disabled=no diversity gate")
-    llm_group.add_argument("--llm_diversity_metric", type=str, default="td_error_emd",
+                           help="How LLM diversity threshold is set (default: from config.yaml)")
+    llm_group.add_argument("--llm_diversity_metric", type=str, default=None,
                            choices=["td_error_emd", "experience_divergence", "position_dtw", "embedding_l2", "cenie"],
-                           help="Diversity metric for decision gate")
-    llm_group.add_argument("--llm_max_diversity_retries", type=int, default=2,
-                           help="Max LLM retries when gate rejects a maze")
-    llm_group.add_argument("--llm_n_rollouts", type=int, default=100,
-                           help="Number of agent rollouts per candidate for gate evaluation")
+                           help="Diversity metric for decision gate (default: from config.yaml)")
+    llm_group.add_argument("--llm_max_diversity_retries", type=int, default=None,
+                           help="Max LLM retries when gate rejects a maze (default: from config.yaml)")
+    llm_group.add_argument("--llm_n_rollouts", type=int, default=None,
+                           help="Number of agent rollouts per candidate for gate evaluation (default: from config.yaml)")
 
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:

@@ -58,7 +58,7 @@ from vae_level_utils import level_to_tokens, tokens_to_level
 
 from llm.maze_generator import MazeGenerator, GenerationConfig
 from llm.prompt_builder import ReferenceMaze, MetricEntry, build_generation_prompt
-from llm.buffer_stats import BufferStatsExtractor
+from llm.buffer_stats import BufferStatsExtractor, npz_to_sampler
 from llm.agent_evaluator import AgentEvaluator
 from llm.decision_gate import evaluate_candidate, DiversityThresholds
 
@@ -67,34 +67,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def load_buffer_as_sampler(buffer_npz_path: str) -> dict:
-    """Load a buffer .npz dump and reconstruct a sampler-like dict."""
-    data = np.load(buffer_npz_path, allow_pickle=True)
-    tokens = data["tokens"]
-    scores = data["scores"]
-    size = int(data["size"])
+def load_buffer_as_sampler(buffer_npz_path: str) -> tuple:
+    """Load a buffer .npz dump and reconstruct a sampler-like dict.
 
-    levels_list = []
-    for i in range(size):
-        level = tokens_to_level(jnp.array(tokens[i]))
-        levels_list.append(level)
-
-    if levels_list:
-        levels_pytree = jax.tree_util.tree_map(
-            lambda *xs: jnp.stack(xs), *levels_list
-        )
-    else:
-        raise ValueError(f"Buffer at {buffer_npz_path} is empty (size=0)")
-
-    sampler = {
-        "levels": levels_pytree,
-        "scores": jnp.array(scores[:size], dtype=jnp.float32),
-        "size": size,
-    }
-    print(f"[Buffer] Loaded {size} levels from {buffer_npz_path}")
-    print(f"[Buffer] Score range: [{scores[:size].min():.4f}, {scores[:size].max():.4f}], "
-          f"mean={scores[:size].mean():.4f}")
-    return sampler, scores[:size]
+    Delegates to llm.buffer_stats.npz_to_sampler for the heavy lifting.
+    Returns (sampler, scores_numpy) for backwards compatibility.
+    """
+    sampler = npz_to_sampler(buffer_npz_path)
+    scores_np = np.asarray(sampler["scores"])
+    return sampler, scores_np
 
 
 def load_llm_config(config_path: str) -> dict:

@@ -1,28 +1,33 @@
 # LLM Maze Generator Configuration
 # ----------------------------------
-# This file is read by TWO consumers:
+# This file is the single source of truth for LLM generation parameters.
+# Both test_generator.py and injector.py read from this file.
 #
-#   1. test_generator.py (standalone testing) — uses ALL values below.
-#   2. injector.py (training loop injection via maze_plr.py) — uses ONLY the
-#      values marked [INJECTOR] below. Everything else is ignored during
-#      training because CLI flags on maze_plr.py control those parameters
-#      via injection_config.py.
-#
-# When both config.yaml and a CLI flag set the same value, the CLI flag wins
-# for provider and model. Other [INJECTOR] fields have no CLI equivalent and
-# are always read from this file.
+# During training, CLI flags on maze_plr.py can override any value below.
+# If a CLI flag is not set, the value here is used as the default.
 
 # ============================================================================
-# [INJECTOR + TEST] — Used by both training injection and standalone testing
+# Provider & Model
 # ============================================================================
-
-# --- Provider & Model ---
-# During training: overridden by --llm_provider and --llm_model CLI flags.
-provider: claude-code        # "claude-code" (uses Max subscription), "anthropic" (direct SDK), "ollama", or "openrouter"
+# CLI override: --llm_provider, --llm_model
+provider: claude-code        # "claude-code", "anthropic", "ollama", or "openrouter"
 model: sonnet                # Short alias (sonnet/opus/haiku) or full model ID
 
-# --- LLM Generation Parameters ---
-# These have no CLI flag equivalent — config.yaml is the only source.
+# Provider-specific settings (auto-selected by provider field)
+anthropic:
+  api_key_env: ANTHROPIC_API_KEY
+
+ollama:
+  base_url: https://ollama.com
+  api_key_env: OLLAMA_API_KEY
+
+openrouter:
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+
+# ============================================================================
+# LLM Generation Parameters
+# ============================================================================
 temperature: 0.8
 timeout: 0                  # No timeout (0 = unlimited)
 max_retries: 5              # Max LLM retries on invalid output
@@ -30,79 +35,68 @@ min_walls: 10               # Minimum wall cells for valid maze
 min_path_distance: 4        # Minimum Manhattan distance agent-to-goal
 validate_solvable: true     # BFS solvability check on generated mazes
 
-# Provider-specific settings (auto-selected by provider field)
-anthropic:
-  api_key_env: ANTHROPIC_API_KEY    # env var name; SDK also reads this automatically
-
-ollama:
-  base_url: https://ollama.com
-  api_key_env: OLLAMA_API_KEY       # env var name for API key
-
-openrouter:
-  base_url: https://openrouter.ai/api/v1
-  api_key_env: OPENROUTER_API_KEY
+# ============================================================================
+# Reference Mazes
+# ============================================================================
+# CLI override: --llm_ref_strategy, --llm_n_references, --llm_hybrid_difficulty_percentile
+strategy: hybrid-kmedoid    # "hardest", "random", "diverse", "kmedoid", or "hybrid-kmedoid"
+num_refs: 5                 # Number of reference mazes from buffer
+hybrid_difficulty_percentile: 50  # Percentile filter for hybrid-kmedoid
 
 # ============================================================================
-# [TEST ONLY] — Used by test_generator.py only, ignored during training
+# Diversity Gate
 # ============================================================================
-# During training, these are controlled by CLI flags on maze_plr.py
-# (e.g. --llm_batch_size, --llm_n_references, --llm_ref_strategy, etc.)
+# CLI override: --llm_gate, --llm_difficulty_threshold, --llm_difficulty_gate_mode,
+#   --llm_min_diversity, --llm_diversity_gate_mode, --llm_diversity_metric,
+#   --llm_max_diversity_retries, --llm_n_rollouts
+gate:
+  enabled: true
+  difficulty_threshold: 0.1
+  difficulty_gate_mode: buffer_mean   # "fixed", "buffer_min", "buffer_mean", "reference_mean", "competitive"
+  difficulty_metric: sfl              # "regret" or "sfl"
+  min_diversity: 0.4
+  diversity_gate_mode: fixed          # "fixed", "buffer_median", "disabled"
+  diversity_metric: embedding_l2     # "td_error_emd", "experience_divergence", "position_dtw", "cenie", "embedding_l2"
+  max_diversity_retries: 3
+  n_rollouts: 50                     # Rollouts per candidate for gate evaluation
 
-# --- Generation ---
-n: 8                        # Number of mazes to generate (training uses --llm_batch_size)
-
-# --- Reference Mazes ---
-buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz   # Training uses live PLR buffer
-num_refs: 6                 # Training uses --llm_n_references
-strategy: top_regret        # Training uses --llm_ref_strategy
-
-# --- Metric Injection ---
-# Training always computes metrics via AgentEvaluator; these switches only
-# affect test_generator.py standalone runs.
+# ============================================================================
+# Metric Injection (which metrics appear in the LLM prompt)
+# ============================================================================
 inject_metrics: true        # Master switch: compute metrics from agent rollouts
-inject_regret: true         # Include regret scores in prompt (fallback when inject_metrics=false)
+inject_regret: true         # Include regret scores in prompt
 inject_buffer_stats: true   # Include buffer-wide statistics
+downsample_points: 20       # Max points when downsampling metric vectors
 
-# Per-maze metrics injected into the LLM prompt (standalone, computed per reference).
+# Per-maze metrics shown to the LLM for each reference maze.
 prompt_metrics:
   per_step_entropy: true    # Policy uncertainty at each timestep
-  per_step_regret: false     # (max_return - V(s_t)) time series
-  scalar_regret: false       # Mean per-step regret (single number, MaxMC)
-  action_sequence: false     # Agent's discrete actions per step (behavioral fingerprint)
+  per_step_regret: false    # (max_return - V(s_t)) time series
+  scalar_regret: false      # Mean per-step regret (single number, MaxMC)
+  action_sequence: false    # Agent's discrete actions per step
   path_overlay: true        # ASCII visualization of agent trajectory on the grid
-  position_vector: true    # Agent (x,y) per step — lets LLM link regret/entropy spikes to grid locations
-  value_error: false        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
-  learnability: true       # SFL learnability p*(1-p) from multi-rollout solve rate (requires n_rollouts > 1)
+  position_vector: true     # Agent (x,y) per step
+  value_error: false        # Signed V(s_t) - G_t
+  learnability: true        # SFL learnability p*(1-p) from multi-rollout solve rate
 
-# Pairwise metrics injected into the LLM prompt (between all reference pairs).
+# Pairwise metrics between all reference pairs.
 pairwise_metrics:
-  position_dtw: false        # Spatial path similarity between two trajectories
-  mode_transition: false    # Experience mode transition divergence (experiential diversity)
-  td_error: false           # TD error distribution EMD (task-agnostic learning signal diversity)
+  position_dtw: false       # Spatial path similarity
+  mode_transition: false    # Experience mode transition divergence
+  td_error: false           # TD error distribution EMD
 
-# --- Agent & Feedback Loop ---
-agent_dir: gcs_artifacts/agent/39   # Training uses live agent, not a checkpoint
-num_steps: 250              # Training uses env config
-n_rollouts: 50              # Training uses --llm_n_rollouts
-feedback: true              # Training uses --llm_max_diversity_retries
-max_diversity_retries: 3    # Training uses --llm_max_diversity_retries
-
-# --- Diversity Gate ---
-# During training, ALL gate params come from CLI flags:
-#   --llm_difficulty_threshold, --llm_difficulty_gate_mode,
-#   --llm_min_diversity, --llm_diversity_gate_mode, --llm_diversity_metric
-gate:
-  difficulty_threshold: 0.1
-  difficulty_metric: sfl
-  min_diversity: null
-  diversity_metric: embedding_l2
+# ============================================================================
+# Test-only settings (not used during training injection)
+# ============================================================================
+n: 8                        # Number of mazes to generate in test mode
+buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
+agent_dir: gcs_artifacts/agent/accel_sfl_emb_13x13_seed0
+num_steps: 250
+feedback: true
 
 # --- Visualization ---
-embedding_metric: td_error_emd    # Pairwise metric for t-SNE diversity embedding plot
-
-# --- Metric Display ---
-downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt
+embedding_metric: embedding_l2    # Pairwise metric for t-SNE diversity embedding plot
 
 # --- Output ---
-# instruction: ""           # Optional custom generation instruction
-# dry_run: false             # Build prompts only, skip LLM calls
+# instruction: ""
+# dry_run: false
