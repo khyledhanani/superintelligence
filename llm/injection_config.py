@@ -42,6 +42,9 @@ class LLMInjectionConfig:
     mutations_per_seed: int = 30         # --llm_mutations_per_seed
     mutations_solvability_check: bool = True
 
+    # Embedding recomputation
+    buffer_state: str = "stale"        # "stale" or "fresh" — recompute all buffer embeddings at injection time
+
     # --- Shared with config.yaml (CLI overrides YAML) ---
     # These are populated from config.yaml with CLI flag overrides.
 
@@ -111,6 +114,7 @@ class LLMInjectionConfig:
             target_buffer_pct=config.get("llm_target_buffer_pct", 0.0),
             amplification_enabled=config.get("llm_amplification", True),
             mutations_per_seed=config.get("llm_mutations_per_seed", 30),
+            buffer_state=_resolve("llm_buffer_state", "buffer_state", "stale"),
 
             # Shared: CLI flag → config.yaml → hardcoded default
             provider=_resolve("llm_provider", "provider", ""),

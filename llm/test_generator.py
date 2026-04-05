@@ -178,7 +178,10 @@ def save_results(
     run_dir: str,
     ref_trajectories: list = None,
     gen_trajectories: list = None,
-    embedding_metric: str = "td_error_emd",
+    embedding_metric: str = "embedding_l2",
+    buf_embeddings: np.ndarray = None,
+    buf_scores: np.ndarray = None,
+    visualisation_plot: str = "tsne",
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
 
@@ -522,42 +525,12 @@ def save_results(
                 all_force_accepted.append(force)
 
     if len(all_trajs) < 3:
-        logger.info(f"Skipping t-SNE diversity plot: need >= 3 trajectories, have {len(all_trajs)} "
+        logger.info(f"Skipping diversity plot: need >= 3 trajectories, have {len(all_trajs)} "
                      f"(use --inject-metrics to include reference trajectories)")
     if len(all_trajs) >= 3:
         try:
-            from sklearn.manifold import TSNE
-
-            def _traj_to_embedding(traj):
-                """Compute mean 257D embedding from trajectory."""
-                from metrics.standalone.cenie import extract_state_action_pairs
-                pairs = extract_state_action_pairs(traj)
-                if pairs is not None and len(pairs) > 0:
-                    return pairs.mean(axis=0)
-                return np.zeros(257, dtype=np.float32)
-
-            def _pairwise_distance(t1, t2, metric):
-                """Compute pairwise distance between two trajectories."""
-                if metric == "embedding_l2":
-                    e1 = _traj_to_embedding(t1)
-                    e2 = _traj_to_embedding(t2)
-                    return float(np.linalg.norm(e1 - e2))
-                elif metric == "td_error_emd":
-                    from metrics.pairwise.td_error_distribution import td_error_divergence
-                    return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
-                elif metric == "experience_divergence":
-                    from metrics.pairwise.mode_transition import mode_transition_divergence
-                    return mode_transition_divergence(
-                        t1, t1["dones"], t2, t2["dones"],
-                        entropy_a=t1.get("entropy"), entropy_b=t2.get("entropy"),
-                    )["kl_divergence"]
-                elif metric == "position_dtw":
-                    from metrics.pairwise.pos_dtw import position_trace_dtw
-                    return position_trace_dtw(
-                        t1["positions"], t1["dones"], t2["positions"], t2["dones"],
-                    )["distance"]
-                else:
-                    return _pairwise_distance(t1, t2, "embedding_l2")
+            from sklearn.manifold import TSNE, MDS
+            from metrics.standalone.cenie import extract_state_action_pairs
 
             _emb_label = {
                 "embedding_l2": "Embedding L2",
@@ -566,26 +539,67 @@ def save_results(
                 "position_dtw": "Position DTW",
             }.get(_emb_metric, _emb_metric)
 
-            n = len(all_trajs)
-            dist_matrix = np.zeros((n, n))
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = _pairwise_distance(all_trajs[i], all_trajs[j], _emb_metric)
-                    dist_matrix[i, j] = d
-                    dist_matrix[j, i] = d
+            # Build foreground embedding matrix (257D mean state-action vectors)
+            n_fg = len(all_trajs)
+            fg_embeddings = np.zeros((n_fg, 257), dtype=np.float32)
+            for i, t in enumerate(all_trajs):
+                pairs = extract_state_action_pairs(t)
+                if pairs is not None and len(pairs) > 0:
+                    fg_embeddings[i] = pairs.mean(axis=0)
 
-            # t-SNE on precomputed distance matrix
-            perplexity = min(5, n - 1)
-            embedding = TSNE(
-                n_components=2, metric="precomputed",
-                perplexity=perplexity, random_state=42,
-                init="random",
-            ).fit_transform(dist_matrix)
+            # Load buffer embeddings as background (all non-zero embeddings)
+            n_buf = 0
+            buf_emb_matrix = None
+            buf_difficulty_pass = None
+            if buf_embeddings is not None:
+                norms = np.sqrt(np.sum(buf_embeddings ** 2, axis=1))
+                valid_mask = norms > 1e-6
+                buf_emb_matrix = buf_embeddings[valid_mask]
+                n_buf = len(buf_emb_matrix)
+                logger.info(f"Loaded {n_buf} buffer embeddings for plot")
+
+                # Difficulty filter for coloring buffer dots
+                if buf_scores is not None:
+                    valid_scores = buf_scores[valid_mask]
+                    mean_score = float(buf_scores[valid_mask].mean())
+                    buf_difficulty_pass = valid_scores >= mean_score
+                    logger.info(f"Buffer plot: {int(buf_difficulty_pass.sum())}/{n_buf} pass difficulty filter")
+
+            # Build combined distance matrix: [fg; buf] x [fg; buf]
+            n_total = n_fg + n_buf
+            if n_buf > 0:
+                all_emb = np.vstack([fg_embeddings, buf_emb_matrix])
+            else:
+                all_emb = fg_embeddings
+
+            # Chunked L2 pairwise distance matrix
+            dist_matrix = np.zeros((n_total, n_total), dtype=np.float32)
+            chunk = max(1, min(500, n_total))
+            for start in range(0, n_total, chunk):
+                end = min(start + chunk, n_total)
+                diff = all_emb[start:end, np.newaxis, :] - all_emb[np.newaxis, :, :]
+                dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+
+            # Dimensionality reduction
+            primary = visualisation_plot.lower()
+            perplexity = min(30 if n_buf > 0 else 5, n_total - 1)
+            if primary == "mds":
+                embedding_2d = MDS(
+                    n_components=2, dissimilarity="precomputed",
+                    random_state=42, normalized_stress='auto',
+                ).fit_transform(dist_matrix)
+                method_name = "MDS"
+            else:
+                embedding_2d = TSNE(
+                    n_components=2, metric="precomputed",
+                    perplexity=perplexity, random_state=42, init="random",
+                ).fit_transform(dist_matrix)
+                method_name = "t-SNE"
 
             # Build per-point edge colors: red edge for force-accepted
             n_before_accepted = n_ref_in_emb + sum(1 for rc in all_rejected if rc.trajectory is not None and "dones" in rc.trajectory)
             edge_colors = []
-            for i in range(n):
+            for i in range(n_fg):
                 if i >= n_before_accepted and all_markers[i] == '*':
                     fa_idx = i - n_before_accepted
                     if fa_idx < len(all_force_accepted) and all_force_accepted[fa_idx]:
@@ -595,62 +609,25 @@ def save_results(
                 else:
                     edge_colors.append('black')
 
-            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(7, 6))
-            for i in range(n):
-                ax_emb.scatter(
-                    embedding[i, 0], embedding[i, 1],
-                    c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
-                    marker=all_markers[i], zorder=5,
-                    edgecolors=edge_colors[i],
-                    linewidths=2.0 if edge_colors[i] == 'red' else 0.5,
-                )
-                ax_emb.annotate(
-                    all_labels[i], (embedding[i, 0], embedding[i, 1]),
-                    textcoords="offset points", xytext=(6, 6),
-                    fontsize=7, color=all_colors[i], fontweight='bold',
-                )
-
-            # Plot reference centroid as black dot
-            if n_ref_in_emb >= 2:
-                ref_emb = embedding[:n_ref_in_emb]
-                centroid = ref_emb.mean(axis=0)
-                ax_emb.scatter(
-                    centroid[0], centroid[1],
-                    c='black', s=200, marker='D', zorder=6,
-                    edgecolors='white', linewidths=1.5,
-                )
-                ax_emb.annotate(
-                    "Centroid", (centroid[0], centroid[1]),
-                    textcoords="offset points", xytext=(6, -10),
-                    fontsize=7, color='black', fontweight='bold',
-                )
-
-            # Draw edges with distance labels for nearest pairs
-            for i in range(n):
-                for j in range(i + 1, n):
-                    ax_emb.plot(
-                        [embedding[i, 0], embedding[j, 0]],
-                        [embedding[i, 1], embedding[j, 1]],
-                        'gray', alpha=0.15, linewidth=0.5,
-                    )
-
-            ax_emb.set_title(
-                f"Diversity Embedding ({_emb_label})",
-                fontsize=11, fontweight='bold',
-            )
-            ax_emb.set_xlabel("t-SNE dim 1", fontsize=9)
-            ax_emb.set_ylabel("t-SNE dim 2", fontsize=9)
-            ax_emb.grid(alpha=0.2)
-
-            # Legend
+            # Build legend (shared by both plots)
             from matplotlib.lines import Line2D
-            emb_legend = [
+            emb_legend = []
+            if n_buf > 0:
+                if buf_difficulty_pass is not None:
+                    n_pass = int(np.sum(buf_difficulty_pass))
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='lightsteelblue',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer pass ({n_pass})'))
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='khaki',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer fail ({n_buf - n_pass})'))
+                else:
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='lightsteelblue',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer ({n_buf})'))
+            emb_legend.extend([
                 Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
                        markersize=8, markeredgecolor='black', label='Reference'),
                 Line2D([0], [0], marker='D', color='w', markerfacecolor='black',
                        markersize=8, markeredgecolor='white', label='Ref Centroid'),
-            ]
-            # Only add legend entries for failure types present
+            ])
             has_diff = any(rc.failed_difficulty and not rc.failed_diversity for rc in all_rejected)
             has_div = any(rc.failed_diversity and not rc.failed_difficulty for rc in all_rejected)
             has_both = any(rc.failed_difficulty and rc.failed_diversity for rc in all_rejected)
@@ -673,12 +650,80 @@ def save_results(
                     emb_legend.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='green',
                                              markersize=10, markeredgecolor='red',
                                              markeredgewidth=2, label='Force-Accepted'))
-            ax_emb.legend(handles=emb_legend, loc='best', fontsize=8, framealpha=0.9)
 
+            def _plot_embedding(ax, emb_2d, method_name):
+                """Plot buffer background + foreground points on a single axes."""
+                # Buffer background
+                if n_buf > 0:
+                    buf_emb_2d = emb_2d[n_fg:]
+                    if buf_difficulty_pass is not None:
+                        fail_mask = ~buf_difficulty_pass
+                        if np.any(fail_mask):
+                            ax.scatter(buf_emb_2d[fail_mask, 0], buf_emb_2d[fail_mask, 1],
+                                       c='khaki', s=10, marker='o', zorder=1, alpha=0.4, edgecolors='none')
+                        pass_mask = buf_difficulty_pass
+                        if np.any(pass_mask):
+                            ax.scatter(buf_emb_2d[pass_mask, 0], buf_emb_2d[pass_mask, 1],
+                                       c='lightsteelblue', s=12, marker='o', zorder=2, alpha=0.5, edgecolors='none')
+                    else:
+                        ax.scatter(buf_emb_2d[:, 0], buf_emb_2d[:, 1],
+                                   c='lightsteelblue', s=12, marker='o', zorder=1, alpha=0.5, edgecolors='none')
+
+                # Foreground points
+                for i in range(n_fg):
+                    ax.scatter(emb_2d[i, 0], emb_2d[i, 1],
+                               c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
+                               marker=all_markers[i], zorder=5,
+                               edgecolors=edge_colors[i],
+                               linewidths=2.0 if edge_colors[i] == 'red' else 0.5)
+                    ax.annotate(all_labels[i], (emb_2d[i, 0], emb_2d[i, 1]),
+                                textcoords="offset points", xytext=(6, 6),
+                                fontsize=7, color=all_colors[i], fontweight='bold')
+
+                # Reference centroid
+                if n_ref_in_emb >= 2:
+                    ref_emb_2d = emb_2d[:n_ref_in_emb]
+                    centroid = ref_emb_2d.mean(axis=0)
+                    ax.scatter(centroid[0], centroid[1], c='black', s=200, marker='D',
+                               zorder=6, edgecolors='white', linewidths=1.5)
+                    ax.annotate("Centroid", (centroid[0], centroid[1]),
+                                textcoords="offset points", xytext=(6, -10),
+                                fontsize=7, color='black', fontweight='bold')
+
+                # Distance edges from rejected/accepted to closest reference
+                for i in range(n_ref_in_emb, n_fg):
+                    closest_ref, closest_dist = -1, float('inf')
+                    for j in range(n_ref_in_emb):
+                        if dist_matrix[i, j] < closest_dist:
+                            closest_dist = dist_matrix[i, j]
+                            closest_ref = j
+                    if closest_ref >= 0:
+                        mid_x = (emb_2d[i, 0] + emb_2d[closest_ref, 0]) / 2
+                        mid_y = (emb_2d[i, 1] + emb_2d[closest_ref, 1]) / 2
+                        ax.plot([emb_2d[i, 0], emb_2d[closest_ref, 0]],
+                                [emb_2d[i, 1], emb_2d[closest_ref, 1]],
+                                'gray', alpha=0.4, linewidth=1.0, linestyle='--')
+                        ax.annotate(f"{closest_dist:.4f}", (mid_x, mid_y),
+                                    fontsize=5.5, color='dimgray', ha='center',
+                                    bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                                              alpha=0.8, edgecolor='none'))
+
+                ax.set_title(f"Diversity Embedding ({_emb_label})\n"
+                             f"{method_name} layout — distances on edges are actual L2 values",
+                             fontsize=10, fontweight='bold')
+                ax.set_xlabel(f"{method_name} dim 1", fontsize=9)
+                ax.set_ylabel(f"{method_name} dim 2", fontsize=9)
+                ax.grid(alpha=0.2)
+                ax.legend(handles=emb_legend, loc='best', fontsize=8, framealpha=0.9)
+
+            # Generate the selected plot
+            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(8, 7) if n_buf > 0 else (7, 6))
+            _plot_embedding(ax_emb, embedding_2d, method_name)
             emb_path = os.path.join(run_dir, "diversity_embedding.png")
             fig_emb.savefig(emb_path, dpi=150, bbox_inches='tight')
             plt.close(fig_emb)
             logger.info(f"Saved {emb_path}")
+
         except ImportError:
             logger.warning("sklearn not installed — skipping diversity embedding")
         except Exception as e:
@@ -986,11 +1031,42 @@ def run_test(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_short = args.model.replace(":", "_").replace("/", "_")
     run_dir = os.path.join(OUTPUT_DIR, f"{timestamp}_{model_short}")
+    # Load buffer embeddings for diversity plot background
+    _buf_emb = None
+    _buf_scores = None
+    buffer_state = getattr(args, 'buffer_state', 'stale')
+    if buffer_state == "fresh" and evaluator is not None:
+        # Recompute all buffer embeddings with current agent
+        import time as _time_emb
+        _t_fresh = _time_emb.time()
+        logger.info(f"Recomputing buffer embeddings (fresh) for {size} levels...")
+        from metrics.standalone.cenie import extract_state_action_pairs
+        all_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in range(size)]
+        all_trajs_buf = evaluator.evaluate_levels(all_levels)
+        _buf_emb = np.zeros((size, 257), dtype=np.float32)
+        for i, traj in enumerate(all_trajs_buf):
+            pairs = extract_state_action_pairs(traj)
+            if pairs is not None and len(pairs) > 0:
+                _buf_emb[i] = pairs.mean(axis=0)
+        _buf_scores = np.asarray(scores)
+        print(f"[TIMING] Fresh buffer embeddings ({size} levels): {_time_emb.time() - _t_fresh:.1f}s", flush=True)
+    else:
+        npz_data = np.load(args.buffer_path, allow_pickle=True)
+        if "embeddings" in npz_data:
+            _buf_emb = npz_data["embeddings"]
+            _buf_scores = npz_data["scores"][:len(_buf_emb)]
+            logger.info(f"Loaded stale buffer embeddings ({_buf_emb.shape}) for diversity plot")
+        else:
+            logger.info("No embeddings in buffer dump — diversity plot will show foreground only")
+
     save_results(
         results, references, args.model, run_dir,
         ref_trajectories=ref_trajectories,
         gen_trajectories=gen_trajectories,
         embedding_metric=args.embedding_metric,
+        buf_embeddings=_buf_emb,
+        buf_scores=_buf_scores,
+        visualisation_plot=getattr(args, 'visualisation_plot', 'tsne'),
     )
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    - maze_XXX.txt files (ASCII grids)")
@@ -1151,7 +1227,14 @@ def main():
     parser.add_argument("--embedding-metric",
                         choices=["embedding_l2", "td_error_emd", "experience_divergence", "position_dtw"],
                         default=cfg.get("embedding_metric", "embedding_l2"),
-                        help="Pairwise metric for t-SNE diversity embedding plot")
+                        help="Pairwise metric for diversity embedding plot")
+    parser.add_argument("--visualisation-plot", choices=["tsne", "mds"],
+                        default=cfg.get("visualisation_plot", "tsne"),
+                        help="Dimensionality reduction for diversity plot")
+    parser.add_argument("--buffer-state", choices=["stale", "fresh"],
+                        default=cfg.get("buffer_state", "stale"),
+                        help="'stale' uses saved embeddings from buffer dump, "
+                             "'fresh' recomputes all buffer embeddings with current agent")
 
     # Mode
     parser.add_argument("--dry-run", action="store_true",

@@ -318,6 +318,27 @@ class LLMInjectionManager:
             self.agent_evaluator.update_params(train_state.params)
 
         # ---------------------------------------------------------------
+        # Step 1b: Recompute buffer embeddings if buffer_state == "fresh"
+        # ---------------------------------------------------------------
+        if self.config.buffer_state == "fresh" and self.agent_evaluator is not None:
+            buf_size = int(np.asarray(sampler["size"]))
+            logger.info(f"[LLM] Recomputing buffer embeddings (fresh) for {buf_size} levels...")
+            _t_fresh = time.time()
+            from metrics.standalone.cenie import extract_state_action_pairs
+            _be = getattr(self, '_buffer_embeddings', None)
+            if _be is not None:
+                levels_pytree = sampler["levels"]
+                all_levels = [jax.tree_util.tree_map(lambda x: x[i], levels_pytree) for i in range(buf_size)]
+                all_trajs = self.agent_evaluator.evaluate_levels(all_levels)
+                for i, traj in enumerate(all_trajs):
+                    pairs = extract_state_action_pairs(traj)
+                    if pairs is not None and len(pairs) > 0:
+                        _be[i] = pairs.mean(axis=0)
+                    else:
+                        _be[i] = 0.0
+                logger.info(f"[LLM] Fresh embeddings computed in {time.time() - _t_fresh:.1f}s")
+
+        # ---------------------------------------------------------------
         # Step 2: Extract references and buffer summary
         # ---------------------------------------------------------------
         # Pass buffer embeddings to extractor for kmedoid strategies

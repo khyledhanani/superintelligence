@@ -575,7 +575,6 @@ def main(config=None, project="JAXUED_TEST"):
     wandb.define_metric("gen/*", step_metric="num_updates")
     if config["use_cmaes"]:
         wandb.define_metric("cmaes/*", step_metric="num_updates")
-    wandb.define_metric("diversity/*", step_metric="num_updates")
     wandb.define_metric("buffer/*", step_metric="num_updates")
     wandb.define_metric("prox_gate/*", step_metric="num_updates")
     wandb.define_metric("interp_compare/*", step_metric="num_updates")
@@ -2073,73 +2072,6 @@ def main(config=None, project="JAXUED_TEST"):
                 inject_steps.append(cs)
         print(f"[LLM] Injection schedule ({len(inject_steps)} events): {inject_steps}")
 
-    # --- Pairwise diversity computation (runs outside JIT at diversity_log_interval) ---
-    def compute_buffer_diversity(train_state, eval_step):
-        """Subsample buffer levels, roll out agent, compute pairwise TD error EMD."""
-        from metrics.pairwise.td_error_distribution import td_error_divergence
-
-        updates_so_far = (eval_step + 1) * config["eval_freq"]
-        interval = config.get("diversity_log_interval", 0)
-        if interval <= 0 or updates_so_far % interval != 0:
-            return
-
-        sampler = train_state.sampler
-        buf_size = int(np.asarray(sampler["size"]))
-        n_sample = min(config.get("diversity_sample_size", 20), buf_size)
-        if n_sample < 2:
-            return
-
-        # Subsample indices
-        rng_div = jax.random.PRNGKey(eval_step)
-        indices = jax.random.choice(rng_div, buf_size, shape=(n_sample,), replace=False)
-        indices = np.asarray(indices)
-
-        # Extract levels and roll out
-        levels_pytree = sampler["levels"]
-        sample_levels = [jax.tree_util.tree_map(lambda x: x[i], levels_pytree) for i in indices]
-        batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *sample_levels)
-
-        # Roll out agent on subsampled buffer levels (need values + rewards for TD error)
-        rng_traj = jax.random.PRNGKey(eval_step + 2000)
-        init_obs, init_env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
-            jax.random.split(rng_traj, n_sample), batched, env_params
-        )
-        (_, _, _, _, _, last_val), (_, act_t, rew_t, done_t, _, val_t, _, _, hstate_t) = sample_trajectories_rnn(
-            rng_traj, env, env_params, train_state,
-            ActorCritic.initialize_carry((n_sample,)),
-            init_obs, init_env_state, n_sample, config["num_steps"],
-        )
-
-        val_np = np.asarray(val_t)    # (T, n_sample)
-        rew_np = np.asarray(rew_t)    # (T, n_sample)
-        dones_np = np.asarray(done_t) # (T, n_sample)
-
-        # Pairwise TD error EMD
-        emd_values = []
-        for i in range(n_sample):
-            for j in range(i + 1, n_sample):
-                result = td_error_divergence(
-                    {"values": val_np[:, i], "rewards": rew_np[:, i]},
-                    dones_np[:, i],
-                    {"values": val_np[:, j], "rewards": rew_np[:, j]},
-                    dones_np[:, j],
-                )
-                emd_values.append(result["emd"])
-
-        if emd_values:
-            emd_arr = np.array(emd_values)
-            div_log = {
-                "num_updates": updates_so_far,
-                "diversity/td_emd_mean": float(emd_arr.mean()),
-                "diversity/td_emd_std": float(emd_arr.std()),
-                "diversity/td_emd_min": float(emd_arr.min()),
-                "diversity/td_emd_max": float(emd_arr.max()),
-                "diversity/buffer_size": buf_size,
-            }
-            wandb.log(div_log)
-            print(f"[Diversity @ {updates_so_far}] TD-EMD: mean={emd_arr.mean():.4f}, "
-                  f"std={emd_arr.std():.4f}, n_pairs={len(emd_values)}")
-
     # --- Shadow comparison: interpolation vs ACCEL mutations (logging only) ---
     def _slerp_batch(z1, z2, alpha):
         """Spherical linear interpolation preserving norm through direction interpolation."""
@@ -2360,9 +2292,6 @@ def main(config=None, project="JAXUED_TEST"):
             runner_state = _recompute_seed_embeddings(runner_state)
 
         log_eval(metrics, train_state_to_log_dict(runner_state[1], level_sampler))
-
-        # Pairwise diversity logging
-        compute_buffer_diversity(runner_state[1], eval_step)
 
         # Shadow comparison: interpolation vs ACCEL mutations
         compare_interp_vs_accel(runner_state[1], eval_step)
@@ -2683,6 +2612,11 @@ if __name__=="__main__":
     group.add_argument("--llm_mutation_retries", type=int, default=5,
                        help="Number of mutation candidates per LLM-lineage parent when proximity gate is active. "
                             "Best passing candidate is selected. Only used when --proximity_gate_ratio > 0.")
+    group.add_argument("--llm_buffer_state", type=str, default=None,
+                       choices=["stale", "fresh"],
+                       help="'stale' uses incrementally updated embeddings, "
+                            "'fresh' recomputes all buffer embeddings at each injection event "
+                            "(default: from config.yaml)")
     # === ENV CONFIG ===
     group.add_argument("--maze_height", type=int, default=13)
     group.add_argument("--maze_width", type=int, default=13)
@@ -2715,11 +2649,6 @@ if __name__=="__main__":
                             "(for resuming training, not eval). Loads params only, not sampler.")
     group.add_argument("--skip_post_eval", action="store_true", default=False,
                        help="Skip post-training buffer evaluation, rendering, and PCA (run evaluate_buffer.py separately)")
-    # === DIVERSITY METRICS CONFIG ===
-    group.add_argument("--diversity_log_interval", type=int, default=100,
-                       help="Compute diversity metrics every N eval steps (0 to disable)")
-    group.add_argument("--diversity_sample_size", type=int, default=20,
-                       help="Number of buffer levels to subsample for pairwise diversity metrics")
     # === INTERP vs ACCEL SHADOW COMPARISON ===
     group.add_argument("--interp_compare_interval", type=int, default=0,
                        help="Log interp vs ACCEL mutation comparison every N updates (0 to disable). "

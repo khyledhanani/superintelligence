@@ -95,7 +95,9 @@ num_steps: 250
 feedback: true
 
 # --- Visualization ---
-embedding_metric: embedding_l2    # Pairwise metric for t-SNE diversity embedding plot
+embedding_metric: embedding_l2    # Pairwise metric for diversity embedding plot
+visualisation_plot: tsne          # "tsne" or "mds" — dimensionality reduction for diversity_embedding.png
+buffer_state: fresh               # "stale" (use saved embeddings) or "fresh" (recompute with current agent)
 
 # --- Output ---
 # instruction: ""
