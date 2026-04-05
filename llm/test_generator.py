@@ -25,6 +25,7 @@ import os
 import json
 import yaml
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import matplotlib
@@ -95,6 +96,8 @@ def select_references(
     size: int,
     n: int = 3,
     strategy: str = "top_regret",
+    embeddings: Optional[np.ndarray] = None,
+    hybrid_difficulty_percentile: float = 50.0,
 ) -> list:
     """Select reference mazes from the buffer.
 
@@ -103,7 +106,9 @@ def select_references(
         scores: (capacity,) score array
         size: number of active levels
         n: number of references to select
-        strategy: "top_regret", "random", or "diverse"
+        strategy: "top_regret", "random", "diverse", "kmedoid", or "hybrid-kmedoid"
+        embeddings: (capacity, 257) behavior embeddings, required for kmedoid strategies
+        hybrid_difficulty_percentile: percentile threshold for hybrid-kmedoid difficulty filter
 
     Returns:
         List of (index, tokens, score) tuples
@@ -121,6 +126,38 @@ def select_references(
         sorted_idx = np.argsort(active_scores)
         step = max(1, len(sorted_idx) // n)
         top_indices = sorted_idx[::step][:n]
+    elif strategy in ("kmedoid", "hybrid-kmedoid"):
+        from llm.buffer_stats import _kmedoids_select
+        if embeddings is None:
+            logger.warning("kmedoid strategy requires embeddings; falling back to top_regret")
+            return select_references(tokens, scores, size, n, strategy="top_regret")
+
+        emb = embeddings[:size]
+        norms = np.sqrt(np.sum(emb ** 2, axis=1))
+        valid_mask = norms > 1e-6
+
+        if strategy == "hybrid-kmedoid":
+            threshold = float(np.percentile(active_scores, hybrid_difficulty_percentile))
+            valid_mask &= active_scores >= threshold
+            logger.info(f"Hybrid difficulty filter (p{hybrid_difficulty_percentile:.0f}): "
+                        f"{int(valid_mask.sum())}/{size} levels above {threshold:.4f}")
+
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) <= n:
+            top_indices = valid_indices
+        else:
+            valid_emb = emb[valid_indices]
+            dist_matrix = np.sqrt(((valid_emb[:, None, :] - valid_emb[None, :, :]) ** 2).sum(axis=2))
+
+            weights = None
+            if strategy == "hybrid-kmedoid":
+                median_dist = float(np.median(dist_matrix[np.triu_indices(len(valid_indices), k=1)]))
+                radius = median_dist * 0.5
+                weights = np.sum(dist_matrix < radius, axis=1).astype(np.float64)
+                weights = weights / weights.mean()
+
+            medoid_local = _kmedoids_select(dist_matrix, n, weights=weights)
+            top_indices = valid_indices[medoid_local]
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -1138,12 +1175,27 @@ def run_test(args):
 
     # Load agent early if needed for diverse selection or metrics
     evaluator = None
-    if args.inject_metrics or args.strategy == "diverse":
+    if args.inject_metrics or args.strategy in ("diverse", "kmedoid", "hybrid-kmedoid"):
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
         _t_agent = _time.time()
         evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
         print(f"[TIMING] Agent load: {_time.time() - _t_agent:.1f}s", flush=True)
+
+    # Compute buffer embeddings if needed for kmedoid strategies
+    buffer_embeddings = None
+    if args.strategy in ("kmedoid", "hybrid-kmedoid") and evaluator is not None:
+        logger.info(f"Computing buffer embeddings for {args.strategy} selection...")
+        _t_emb = _time.time()
+        from metrics.standalone.cenie import extract_state_action_pairs
+        emb_levels = [tokens_to_level_obj(tokens[i]) for i in range(size)]
+        emb_trajs = evaluator.evaluate_levels(emb_levels)
+        buffer_embeddings = np.zeros((size, 257), dtype=np.float32)
+        for i, traj in enumerate(emb_trajs):
+            pairs = extract_state_action_pairs(traj)
+            if pairs is not None and len(pairs) > 0:
+                buffer_embeddings[i] = pairs.mean(axis=0)
+        print(f"[TIMING] Buffer embeddings ({size} levels): {_time.time() - _t_emb:.1f}s", flush=True)
 
     # Select reference mazes
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
@@ -1155,7 +1207,11 @@ def run_test(args):
             metric=args.diverse_metric,
         )
     else:
-        ref_data = select_references(tokens, scores, size, n=args.num_refs, strategy=args.strategy)
+        ref_data = select_references(
+            tokens, scores, size, n=args.num_refs, strategy=args.strategy,
+            embeddings=buffer_embeddings,
+            hybrid_difficulty_percentile=getattr(args, 'hybrid_difficulty_percentile', 50.0),
+        )
 
     # Roll out agent on selected reference levels to get trajectory data
     ref_trajectories = None
@@ -1477,7 +1533,7 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse"],
+    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse", "kmedoid", "hybrid-kmedoid"],
                         default=cfg.get("strategy"),
                         help="Reference selection strategy")
     parser.add_argument("--diverse-metric",
@@ -1487,6 +1543,9 @@ def main():
     parser.add_argument("--diverse-pool-size", type=int,
                         default=cfg.get("diverse_pool_size", 20),
                         help="Candidate pool size for diverse strategy")
+    parser.add_argument("--hybrid-difficulty-percentile", type=float,
+                        default=cfg.get("hybrid_difficulty_percentile", 50.0),
+                        help="Percentile threshold for hybrid-kmedoid difficulty filter")
 
     # Metric injection flags
     parser.add_argument("--inject-metrics", action="store_true",
