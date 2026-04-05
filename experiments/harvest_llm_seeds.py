@@ -535,7 +535,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_rollouts", type=int, default=10,
                         help="Rollouts per level for SFL scoring")
     parser.add_argument("--ref_strategy", type=str, default="hardest",
-                        choices=["hardest", "random", "diverse"])
+                        choices=["hardest", "random", "greedy"])
     parser.add_argument("--llm_provider", type=str, default="claude-code",
                         choices=["claude-code", "openrouter", "ollama"])
     parser.add_argument("--llm_model", type=str, default="claude-sonnet-4-20250514")

@@ -226,6 +226,7 @@ class LLMInjectionManager:
                 "min_walls": "min_walls",
                 "min_path_distance": "min_path_distance",
                 "validate_solvable": "validate_solvable",
+                "effort": "effort",
             }
             for yaml_key, cfg_key in field_map.items():
                 if yaml_key in yaml_cfg:

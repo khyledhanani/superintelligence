@@ -152,11 +152,12 @@ class BufferStatsExtractor:
         strategy: Reference selection strategy. Currently supports:
             - "hardest" (alias "top_regret"): highest score mazes shown first
             - "random": random selection from active levels
-            - "diverse": greedy max-min distance on 257D behavior embeddings
+            - "greedy": greedy max-min distance on 257D behavior embeddings
+            - "hybrid-greedy": greedy max-min with difficulty percentile filter
             - "kmedoid": k-medoids clustering on 257D behavior embeddings
             - "hybrid-kmedoid": density-weighted k-medoids (biased toward dense regions)
         buffer_embeddings: Optional (capacity, 257) numpy array of behavior embeddings.
-            Required for diverse, kmedoid, and hybrid-kmedoid strategies.
+            Required for greedy, hybrid-greedy, kmedoid, and hybrid-kmedoid strategies.
     """
 
     def __init__(self, n_references: int = 5, strategy: str = "hardest",
@@ -200,8 +201,17 @@ class BufferStatsExtractor:
             selected_indices = np.argsort(scores)[::-1][:n]
         elif self.strategy == "random":
             selected_indices = np.random.choice(size, n, replace=False)
-        elif self.strategy == "diverse":
-            selected_indices = self._select_diverse_indices(scores, size, n)
+        elif self.strategy in ("greedy", "hybrid-greedy"):
+            difficulty_mask = None
+            if self.strategy == "hybrid-greedy":
+                pct = self.hybrid_difficulty_percentile
+                threshold = float(np.percentile(scores, pct))
+                difficulty_mask = scores >= threshold
+                n_pass = int(difficulty_mask.sum())
+                logger.info(f"Hybrid-greedy difficulty filter (p{pct:.0f}): "
+                            f"{n_pass}/{size} levels above {threshold:.4f}")
+            selected_indices = self._select_greedy_indices(scores, size, n,
+                                                           difficulty_mask=difficulty_mask)
         elif self.strategy in ("kmedoid", "hybrid-kmedoid"):
             difficulty_mask = None
             if self.strategy == "hybrid-kmedoid":
@@ -216,8 +226,8 @@ class BufferStatsExtractor:
         else:
             raise ValueError(
                 f"Unknown reference selection strategy: {self.strategy!r}. "
-                "Expected 'hardest', 'top_regret', 'random', 'diverse', "
-                "'kmedoid', or 'hybrid-kmedoid'."
+                "Expected 'hardest', 'top_regret', 'random', 'greedy', "
+                "'hybrid-greedy', 'kmedoid', or 'hybrid-kmedoid'."
             )
 
         references = []
@@ -244,19 +254,22 @@ class BufferStatsExtractor:
 
         return references, level_objects
 
-    def _select_diverse_indices(self, scores: np.ndarray, size: int, n: int) -> np.ndarray:
+    def _select_greedy_indices(self, scores: np.ndarray, size: int, n: int,
+                               difficulty_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """Select reference indices via greedy max-min distance on embeddings."""
         emb = self._buffer_embeddings
         if emb is None:
-            logger.warning("diverse strategy requires buffer embeddings; falling back to hardest")
+            logger.warning("greedy strategy requires buffer embeddings; falling back to hardest")
             return np.argsort(scores)[::-1][:n]
 
         emb = emb[:size]
         norms = np.sqrt(np.sum(emb ** 2, axis=1))
         valid_mask = norms > 1e-6
+        if difficulty_mask is not None:
+            valid_mask &= difficulty_mask
         valid_indices = np.where(valid_mask)[0]
         n_valid = len(valid_indices)
-        logger.info(f"Diverse selection: {n_valid} candidate levels from {size} active")
+        logger.info(f"Greedy selection: {n_valid} candidate levels from {size} active")
 
         if n_valid <= n:
             return valid_indices
@@ -289,7 +302,7 @@ class BufferStatsExtractor:
         for i, s in enumerate(selected):
             idx = int(result[i])
             min_d = float(min(dist_matrix[s, o] for o in selected if o != s))
-            logger.info(f"  Diverse {i+1}: idx={idx}, score={scores[idx]:.4f}, min_dist={min_d:.4f}")
+            logger.info(f"  Greedy {i+1}: idx={idx}, score={scores[idx]:.4f}, min_dist={min_d:.4f}")
 
         return result
 

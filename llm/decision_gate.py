@@ -204,7 +204,7 @@ def evaluate_candidate(
     is_cenie = thresholds.diversity_metric == "cenie"
     is_embedding_l2 = thresholds.diversity_metric == "embedding_l2"
 
-    # --- Embedding L2 diversity (min L2 distance to buffer/ref embeddings) ---
+    # --- Embedding L2 diversity (min L2 distance to reference embeddings) ---
     # Always compute if embedding_l2 is selected, even when min_diversity is null
     # (so we can log distance stats for calibration)
     if is_embedding_l2:
@@ -212,18 +212,9 @@ def evaluate_candidate(
         pairs = extract_state_action_pairs(candidate_trajectory)  # (T_ep, 257)
         if pairs is not None and len(pairs) > 0:
             cand_emb = pairs.mean(axis=0)  # mean 257D embedding
-            # Compare against buffer embeddings first, then ref embeddings
-            all_embs = []
-            if buffer_embeddings is not None:
-                # Filter out zero rows (empty slots)
-                nonzero_mask = np.any(buffer_embeddings != 0, axis=1)
-                if nonzero_mask.any():
-                    all_embs.append(buffer_embeddings[nonzero_mask])
-            if ref_embeddings is not None:
-                all_embs.append(ref_embeddings)
-            if all_embs:
-                all_embs = np.concatenate(all_embs, axis=0)
-                distances = np.linalg.norm(all_embs - cand_emb[None, :], axis=1)
+            # Compare against reference embeddings only
+            if ref_embeddings is not None and len(ref_embeddings) > 0:
+                distances = np.linalg.norm(ref_embeddings - cand_emb[None, :], axis=1)
                 min_dist = float(distances.min())
                 mean_dist = float(distances.mean())
                 max_dist = float(distances.max())
@@ -237,7 +228,7 @@ def evaluate_candidate(
             result.summary["mean_diversity"] = mean_dist
             result.summary["max_diversity"] = max_dist
             result.summary["median_diversity"] = median_dist
-            result.summary["embedding_l2_n_compared"] = len(all_embs) if isinstance(all_embs, np.ndarray) else 0
+            result.summary["embedding_l2_n_compared"] = len(ref_embeddings) if ref_embeddings is not None else 0
             result.summary["diversity_metric"] = "embedding_l2"
 
     # --- CENIE novelty (standalone, uses pre-fitted GMM) ---

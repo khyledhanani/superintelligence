@@ -24,30 +24,28 @@ class LLMInjectionConfig:
     """
 
     # Core toggles
-    enabled: bool = False              # --use_llm
+    enabled: bool = True              # --use_llm
     config_path: str = ""              # --llm_config (path to llm/config.yaml)
 
     # --- Injection-specific (no config.yaml equivalent) ---
 
     # Timing
     injection_interval: int = 5000     # --llm_inject_interval (eval steps between injections)
-    inject_start_step: int = 2000      # --llm_inject_start_step
+    inject_start_step: int = 2500      # --llm_inject_start_step
 
     # Batch sizing
-    n_raw: int = 25                    # --llm_batch_size (mazes per injection round)
-    target_buffer_pct: float = 0.0     # --llm_target_buffer_pct (0=disabled, 0.05=5%)
+    n_raw: int = 10                    # --llm_batch_size (mazes per injection round)
+    target_buffer_pct: float = 5.0     # --llm_target_buffer_pct (0=disabled, 0.05=5%)
 
     # Mutation amplification
     amplification_enabled: bool = True   # --llm_amplification
     mutations_per_seed: int = 30         # --llm_mutations_per_seed
     mutations_solvability_check: bool = True
 
-    # Embedding recomputation
-    buffer_state: str = "stale"        # "stale" or "fresh" — recompute all buffer embeddings at injection time
-
     # --- Shared with config.yaml (CLI overrides YAML) ---
     # These are populated from config.yaml with CLI flag overrides.
 
+    buffer_state: str = ""             # "stale" or "fresh" (default from config.yaml)
     provider: str = ""                 # --llm_provider
     model: str = ""                    # --llm_model
     reference_maze_strategy: str = ""  # --llm_ref_strategy (default from config.yaml)

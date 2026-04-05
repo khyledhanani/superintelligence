@@ -11,7 +11,7 @@
 # ============================================================================
 # CLI override: --llm_provider, --llm_model
 provider: claude-code        # "claude-code", "anthropic", "ollama", or "openrouter"
-model: sonnet                # Short alias (sonnet/opus/haiku) or full model ID
+model: opus                # Short alias (sonnet/opus/haiku) or full model ID
 
 # Provider-specific settings (auto-selected by provider field)
 anthropic:
@@ -30,16 +30,27 @@ openrouter:
 # ============================================================================
 temperature: 0.8
 timeout: 0                  # No timeout (0 = unlimited)
+effort: medium                 # claude-code --effort flag: "low", "medium", "high"
 max_retries: 5              # Max LLM retries on invalid output
+thinking_in_output: true    # Ask LLM for reasoning section before the grid
 min_walls: 10               # Minimum wall cells for valid maze
 min_path_distance: 4        # Minimum Manhattan distance agent-to-goal
 validate_solvable: true     # BFS solvability check on generated mazes
 
 # ============================================================================
+# Buffer Embeddings
+# ============================================================================
+# Controls whether 257D behavior embeddings are recomputed with the current
+# agent ("fresh") or use stale insertion-time values ("stale").
+# Affects: reference selection (kmedoid/diverse), diversity gate, and plots.
+# CLI override: --llm_buffer_state
+buffer_state: fresh               # "stale" or "fresh"
+
+# ============================================================================
 # Reference Mazes
 # ============================================================================
 # CLI override: --llm_ref_strategy, --llm_n_references, --llm_hybrid_difficulty_percentile
-strategy: hybrid-kmedoid    # "hardest", "random", "diverse", "kmedoid", or "hybrid-kmedoid"
+strategy: hybrid-greedy   # "hardest", "random", "greedy", "hybrid-greedy", "kmedoid", or "hybrid-kmedoid"
 num_refs: 5                 # Number of reference mazes from buffer
 hybrid_difficulty_percentile: 50  # Percentile filter for hybrid-kmedoid
 
@@ -54,10 +65,10 @@ gate:
   difficulty_threshold: 0.1
   difficulty_gate_mode: buffer_mean   # "fixed", "buffer_min", "buffer_mean", "reference_mean", "competitive"
   difficulty_metric: sfl              # "regret" or "sfl"
-  min_diversity: 0.4
+  min_diversity: 1
   diversity_gate_mode: fixed          # "fixed", "buffer_median", "disabled"
   diversity_metric: embedding_l2     # "td_error_emd", "experience_divergence", "position_dtw", "cenie", "embedding_l2"
-  max_diversity_retries: 3
+  max_diversity_retries: 5
   n_rollouts: 50                     # Rollouts per candidate for gate evaluation
 
 # ============================================================================
@@ -66,7 +77,7 @@ gate:
 inject_metrics: true        # Master switch: compute metrics from agent rollouts
 inject_regret: true         # Include regret scores in prompt
 inject_buffer_stats: true   # Include buffer-wide statistics
-downsample_points: 20       # Max points when downsampling metric vectors
+downsample_points: 250       # Max points when downsampling metric vectors
 
 # Per-maze metrics shown to the LLM for each reference maze.
 prompt_metrics:
@@ -89,15 +100,15 @@ pairwise_metrics:
 # Test-only settings (not used during training injection)
 # ============================================================================
 n: 8                        # Number of mazes to generate in test mode
-buffer_path: buffer_dumps/injection_training_data/inject_llm_5pct_seed0/buffer_dumps/buffer_dump_5000.npz
-agent_dir: buffer_dumps/injection_training_data/inject_llm_5pct_seed0/checkpoints/inject_llm_5pct_seed0/0
+buffer_path: buffer_dumps/accel_baseline/seed0/buffer_dumps/buffer_dump_2500.npz
+agent_dir: buffer_dumps/accel_baseline/seed0/checkpoints
+checkpoint_step: 10              # Agent checkpoint step (-1 for latest)
 num_steps: 250
 feedback: true
 
 # --- Visualization ---
 embedding_metric: embedding_l2    # Pairwise metric for diversity embedding plot
 visualisation_plot: tsne          # "tsne" or "mds" — dimensionality reduction for diversity_embedding.png
-buffer_state: fresh               # "stale" (use saved embeddings) or "fresh" (recompute with current agent)
 
 # --- Output ---
 # instruction: ""

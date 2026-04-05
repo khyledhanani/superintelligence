@@ -2682,7 +2682,7 @@ if __name__=="__main__":
     llm_group.add_argument("--llm_n_references", type=int, default=None,
                            help="Number of buffer mazes shown to LLM as reference context (default: from config.yaml)")
     llm_group.add_argument("--llm_ref_strategy", type=str, default=None,
-                           choices=["hardest", "random", "diverse", "kmedoid", "hybrid-kmedoid"],
+                           choices=["hardest", "random", "greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid"],
                            help="Strategy for selecting reference mazes from PLR buffer (default: from config.yaml)")
     llm_group.add_argument("--llm_hybrid_difficulty_percentile", type=float, default=None,
                            help="Percentile threshold for hybrid-kmedoid difficulty filter "

@@ -286,6 +286,8 @@ def save_results(
                 },
                 "issues": rc.issues,
             }
+            if rc.thinking:
+                entry["thinking"] = rc.thinking
             metadata["rejected_candidates"].append(entry)
 
     # Save rejected candidate grids as text files
@@ -501,15 +503,18 @@ def save_results(
     # Rejected candidates — colored by failure reason
     for i, rc in enumerate(all_rejected):
         rt = rc.trajectory
-        if rt is not None and "dones" in rt:
+        has_traj = rt is not None and "dones" in rt
+        logger.info(f"Rejected {i+1}: trajectory={'yes' if has_traj else 'NO'}, "
+                     f"diff={rc.failed_difficulty}, div={rc.failed_diversity}")
+        if has_traj:
             all_trajs.append(rt)
             all_labels.append(f"Rej {i+1}")
             if rc.failed_difficulty and rc.failed_diversity:
-                all_colors.append('orange')
+                all_colors.append('darkorange')
             elif rc.failed_difficulty:
                 all_colors.append('red')
             else:
-                all_colors.append('gold')
+                all_colors.append('magenta')
             all_markers.append('X')
     # Accepted generated (green, or green+red-edge for force-accepted)
     all_force_accepted = []  # track which embedding indices are force-accepted
@@ -572,28 +577,34 @@ def save_results(
             else:
                 all_emb = fg_embeddings
 
-            # Chunked L2 pairwise distance matrix
-            dist_matrix = np.zeros((n_total, n_total), dtype=np.float32)
-            chunk = max(1, min(500, n_total))
-            for start in range(0, n_total, chunk):
-                end = min(start + chunk, n_total)
-                diff = all_emb[start:end, np.newaxis, :] - all_emb[np.newaxis, :, :]
-                dist_matrix[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+            # Foreground pairwise L2 distances (for edge annotations)
+            fg_dist_matrix = np.zeros((n_fg, n_fg), dtype=np.float32)
+            for i in range(n_fg):
+                diff = fg_embeddings[i] - fg_embeddings
+                fg_dist_matrix[i] = np.sqrt(np.sum(diff ** 2, axis=1))
 
             # Dimensionality reduction
             primary = visualisation_plot.lower()
-            perplexity = min(30 if n_buf > 0 else 5, n_total - 1)
+            perplexity = min(40, n_total - 1)
             if primary == "mds":
+                # MDS needs full precomputed distance matrix
+                full_dist = np.zeros((n_total, n_total), dtype=np.float32)
+                chunk = max(1, min(500, n_total))
+                for start in range(0, n_total, chunk):
+                    end = min(start + chunk, n_total)
+                    diff = all_emb[start:end, np.newaxis, :] - all_emb[np.newaxis, :, :]
+                    full_dist[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
                 embedding_2d = MDS(
                     n_components=2, dissimilarity="precomputed",
                     random_state=42, normalized_stress='auto',
-                ).fit_transform(dist_matrix)
+                ).fit_transform(full_dist)
                 method_name = "MDS"
             else:
                 embedding_2d = TSNE(
-                    n_components=2, metric="precomputed",
-                    perplexity=perplexity, random_state=42, init="random",
-                ).fit_transform(dist_matrix)
+                    n_components=2, perplexity=perplexity,
+                    random_state=42, init="pca", learning_rate="auto",
+                    max_iter=1000,
+                ).fit_transform(all_emb)
                 method_name = "t-SNE"
 
             # Build per-point edge colors: red edge for force-accepted
@@ -632,13 +643,13 @@ def save_results(
             has_div = any(rc.failed_diversity and not rc.failed_difficulty for rc in all_rejected)
             has_both = any(rc.failed_difficulty and rc.failed_diversity for rc in all_rejected)
             if has_div:
-                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='gold',
+                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='magenta',
                                          markersize=8, markeredgecolor='black', label='Rej (diversity)'))
             if has_diff:
                 emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='red',
                                          markersize=8, markeredgecolor='black', label='Rej (difficulty)'))
             if has_both:
-                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='orange',
+                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='darkorange',
                                          markersize=8, markeredgecolor='black', label='Rej (both)'))
             if n_gens > 0:
                 has_force_emb = any(all_force_accepted)
@@ -694,8 +705,8 @@ def save_results(
                 for i in range(n_ref_in_emb, n_fg):
                     closest_ref, closest_dist = -1, float('inf')
                     for j in range(n_ref_in_emb):
-                        if dist_matrix[i, j] < closest_dist:
-                            closest_dist = dist_matrix[i, j]
+                        if fg_dist_matrix[i, j] < closest_dist:
+                            closest_dist = fg_dist_matrix[i, j]
                             closest_ref = j
                     if closest_ref >= 0:
                         mid_x = (emb_2d[i, 0] + emb_2d[closest_ref, 0]) / 2
@@ -746,19 +757,25 @@ def run_test(args):
     scores = np.asarray(sampler["scores"])
     print(f"[TIMING] Buffer load: {_time.time() - _t_setup:.1f}s", flush=True)
 
-    # Load agent early if needed for embedding-based selection or metrics
+    # Load agent early if needed for embedding-based selection, metrics, or fresh embeddings
+    buffer_state = getattr(args, 'buffer_state', 'stale')
+    needs_agent = (args.inject_metrics
+                   or args.strategy in ("greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid")
+                   or buffer_state == "fresh")
     evaluator = None
-    if args.inject_metrics or args.strategy in ("diverse", "kmedoid", "hybrid-kmedoid"):
+    if needs_agent:
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
         _t_agent = _time.time()
-        evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
+        evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps, checkpoint_step=args.checkpoint_step)
         print(f"[TIMING] Agent load: {_time.time() - _t_agent:.1f}s", flush=True)
 
-    # Compute buffer embeddings if needed for embedding-based strategies
+    # Compute buffer embeddings — fresh (rollout current agent) or stale (from npz)
     buffer_embeddings = None
-    if args.strategy in ("diverse", "kmedoid", "hybrid-kmedoid") and evaluator is not None:
-        logger.info(f"Computing buffer embeddings for {args.strategy} selection...")
+    needs_fresh = (buffer_state == "fresh"
+                   or args.strategy in ("greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid"))
+    if needs_fresh and evaluator is not None:
+        logger.info(f"Computing fresh buffer embeddings for {size} levels...")
         _t_emb = _time.time()
         from metrics.standalone.cenie import extract_state_action_pairs
         all_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in range(size)]
@@ -768,7 +785,13 @@ def run_test(args):
             pairs = extract_state_action_pairs(traj)
             if pairs is not None and len(pairs) > 0:
                 buffer_embeddings[i] = pairs.mean(axis=0)
-        print(f"[TIMING] Buffer embeddings ({size} levels): {_time.time() - _t_emb:.1f}s", flush=True)
+        print(f"[TIMING] Fresh buffer embeddings ({size} levels): {_time.time() - _t_emb:.1f}s", flush=True)
+    else:
+        # Load stale embeddings from npz if available (for plot background)
+        npz_data = np.load(args.buffer_path, allow_pickle=True)
+        if "embeddings" in npz_data:
+            buffer_embeddings = npz_data["embeddings"]
+            logger.info(f"Loaded stale buffer embeddings ({buffer_embeddings.shape}) from npz")
 
     # Select reference mazes via BufferStatsExtractor
     extractor = BufferStatsExtractor(
@@ -882,6 +905,7 @@ def run_test(args):
         min_walls=args.min_walls,
         min_path_distance=args.min_path_distance,
         validate_solvable=args.validate_solvable,
+        effort=args.effort,
     )
     generator = MazeGenerator(config)
 
@@ -896,7 +920,7 @@ def run_test(args):
         # Reuse evaluator/trajectories if already loaded for metrics
         if not args.inject_metrics:
             from llm.agent_evaluator import AgentEvaluator
-            evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
+            evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps, checkpoint_step=args.checkpoint_step)
             ref_trajectories = evaluator.evaluate_levels(ref_levels)
 
         ref_labels = [ref.label for ref in references]
@@ -930,7 +954,6 @@ def run_test(args):
 
         # Compute reference embeddings for embedding_l2 diversity metric
         ref_embeddings = None
-        buffer_embeddings = None
         if args.diversity_metric == "embedding_l2" and ref_trajectories:
             from metrics.standalone.cenie import extract_state_action_pairs
             ref_embs = []
@@ -941,11 +964,7 @@ def run_test(args):
             if ref_embs:
                 ref_embeddings = np.stack(ref_embs)
                 logger.info(f"Computed {len(ref_embs)} reference embeddings for L2 diversity")
-            # Also load precomputed buffer-wide embeddings if available in the npz
-            npz_data = np.load(args.buffer_path, allow_pickle=True)
-            if "embeddings" in npz_data:
-                buffer_embeddings = np.array(npz_data["embeddings"][:size])
-                logger.info(f"Loaded {size} buffer embeddings for L2 diversity")
+            # buffer_embeddings already computed above (fresh or stale)
 
         results = generator.generate_batch_with_feedback(
             n=args.n,
@@ -1031,41 +1050,13 @@ def run_test(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_short = args.model.replace(":", "_").replace("/", "_")
     run_dir = os.path.join(OUTPUT_DIR, f"{timestamp}_{model_short}")
-    # Load buffer embeddings for diversity plot background
-    _buf_emb = None
-    _buf_scores = None
-    buffer_state = getattr(args, 'buffer_state', 'stale')
-    if buffer_state == "fresh" and evaluator is not None:
-        # Recompute all buffer embeddings with current agent
-        import time as _time_emb
-        _t_fresh = _time_emb.time()
-        logger.info(f"Recomputing buffer embeddings (fresh) for {size} levels...")
-        from metrics.standalone.cenie import extract_state_action_pairs
-        all_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in range(size)]
-        all_trajs_buf = evaluator.evaluate_levels(all_levels)
-        _buf_emb = np.zeros((size, 257), dtype=np.float32)
-        for i, traj in enumerate(all_trajs_buf):
-            pairs = extract_state_action_pairs(traj)
-            if pairs is not None and len(pairs) > 0:
-                _buf_emb[i] = pairs.mean(axis=0)
-        _buf_scores = np.asarray(scores)
-        print(f"[TIMING] Fresh buffer embeddings ({size} levels): {_time_emb.time() - _t_fresh:.1f}s", flush=True)
-    else:
-        npz_data = np.load(args.buffer_path, allow_pickle=True)
-        if "embeddings" in npz_data:
-            _buf_emb = npz_data["embeddings"]
-            _buf_scores = npz_data["scores"][:len(_buf_emb)]
-            logger.info(f"Loaded stale buffer embeddings ({_buf_emb.shape}) for diversity plot")
-        else:
-            logger.info("No embeddings in buffer dump — diversity plot will show foreground only")
-
     save_results(
         results, references, args.model, run_dir,
         ref_trajectories=ref_trajectories,
         gen_trajectories=gen_trajectories,
         embedding_metric=args.embedding_metric,
-        buf_embeddings=_buf_emb,
-        buf_scores=_buf_scores,
+        buf_embeddings=buffer_embeddings,
+        buf_scores=np.asarray(scores) if buffer_embeddings is not None else None,
         visualisation_plot=getattr(args, 'visualisation_plot', 'tsne'),
     )
     print(f"\n  Results saved to: {run_dir}/")
@@ -1128,7 +1119,7 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["hardest", "top_regret", "random", "diverse", "kmedoid", "hybrid-kmedoid"],
+    parser.add_argument("--strategy", choices=["hardest", "top_regret", "random", "greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid"],
                         default=cfg.get("strategy", "hardest"),
                         help="Reference selection strategy")
     parser.add_argument("--hybrid-difficulty-percentile", type=float,
@@ -1187,6 +1178,9 @@ def main():
                         help="BFS solvability check on generated mazes")
     parser.add_argument("--no-validate-solvable", action="store_false",
                         dest="validate_solvable")
+    parser.add_argument("--effort", default=cfg.get("effort", "low"),
+                        choices=["low", "medium", "high"],
+                        help="claude-code --effort flag (default: from config.yaml)")
 
     # Custom instruction
     parser.add_argument("--instruction", default=cfg.get("instruction", ""),
@@ -1198,6 +1192,8 @@ def main():
                         help="Enable metric feedback loop (requires agent checkpoint)")
     parser.add_argument("--agent-dir", default=cfg.get("agent_dir"),
                         help="Path to agent checkpoint directory")
+    parser.add_argument("--checkpoint-step", type=int, default=cfg.get("checkpoint_step", -1),
+                        help="Agent checkpoint step (-1 for latest)")
     parser.add_argument("--num-steps", type=int, default=cfg.get("num_steps"),
                         help="Max rollout steps per episode")
     # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
