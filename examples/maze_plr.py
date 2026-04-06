@@ -2068,9 +2068,23 @@ def main(config=None, project="JAXUED_TEST"):
         inject_steps = []
         for es in range(num_updates // eval_freq):
             cs = (es + 1) * eval_freq
-            if cs >= llm_config.inject_start_step and cs % llm_config.injection_interval == 0:
+            if cs >= llm_config.inject_start_step and (cs - llm_config.inject_start_step) % llm_config.injection_interval == 0:
                 inject_steps.append(cs)
         print(f"[LLM] Injection schedule ({len(inject_steps)} events): {inject_steps}")
+
+    # --- Inject-once: generate and inject LLM levels before training starts ---
+    if config.get("inject_once") and llm_injector is not None:
+        print(f"\n{'='*60}")
+        print(f"  INJECT-ONCE: generating LLM levels before training")
+        print(f"{'='*60}")
+        llm_injector._buffer_embeddings = _buffer_embeddings
+        runner_state = llm_injector._do_injection(runner_state, current_step=0)
+        # Dump the post-injection buffer as step 0
+        dump_buffer(runner_state[1], 0)
+        # Disable further injection during training
+        llm_injector.config.enabled = False
+        llm_injector = None
+        print(f"[LLM] Inject-once complete. Further injection disabled.")
 
     # --- Shadow comparison: interpolation vs ACCEL mutations (logging only) ---
     def _slerp_batch(z1, z2, alpha):
@@ -2710,6 +2724,10 @@ if __name__=="__main__":
                            help="Max LLM retries when gate rejects a maze (default: from config.yaml)")
     llm_group.add_argument("--llm_n_rollouts", type=int, default=None,
                            help="Number of agent rollouts per candidate for gate evaluation (default: from config.yaml)")
+    llm_group.add_argument("--inject_once", action="store_true", default=False,
+                           help="Inject LLM levels once before training starts, then disable further injection. "
+                                "Requires --use_llm. Use with --resume_checkpoint_dir and --preload_buffer_npz "
+                                "to inject into a base ACCEL checkpoint.")
 
     config = vars(parser.parse_args())
     if config["num_env_steps"] is not None:
@@ -2721,8 +2739,27 @@ if __name__=="__main__":
     else:
         config["_buffer_dump_steps"] = set()
     
+    if config.get("inject_once") and not config.get("use_llm"):
+        parser.error("--inject_once requires --use_llm")
+
+    # Auto-increment seed directory under output_dir
+    # e.g. --output_dir buffer_dumps/inject_once → buffer_dumps/inject_once/seed0
+    # The directory is created immediately to reserve the slot for parallel launches.
+    if config.get("output_dir"):
+        base_output = config["output_dir"]
+        seed_idx = 0
+        while True:
+            candidate = os.path.join(base_output, f"seed{seed_idx}")
+            try:
+                os.makedirs(candidate, exist_ok=False)
+                break  # successfully created — this slot is ours
+            except FileExistsError:
+                seed_idx += 1
+        config["output_dir"] = candidate
+        print(f"[Output] Auto-assigned seed directory: {candidate}")
+
     if config['mode'] == 'eval':
         os.environ['WANDB_MODE'] = 'disabled'
-    
+
     # wandb.login()
     main(config, project=config["project"])

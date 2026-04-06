@@ -31,7 +31,7 @@ class LLMInjectionConfig:
 
     # Timing
     injection_interval: int = 5000     # --llm_inject_interval (eval steps between injections)
-    inject_start_step: int = 2500      # --llm_inject_start_step
+    inject_start_step: int = 5000      # --llm_inject_start_step
 
     # Batch sizing
     n_raw: int = 10                    # --llm_batch_size (mazes per injection round)

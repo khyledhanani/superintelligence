@@ -269,7 +269,10 @@ class LLMInjectionManager:
         if current_step < self.config.inject_start_step:
             return runner_state
 
-        if current_step % self.config.injection_interval != 0:
+        # First injection fires exactly at inject_start_step;
+        # subsequent injections are spaced by injection_interval from that point.
+        steps_since_start = current_step - self.config.inject_start_step
+        if steps_since_start != 0 and steps_since_start % self.config.injection_interval != 0:
             return runner_state
 
         print(f"[LLM] Injection event at step {current_step} (eval_step={eval_step})", flush=True)

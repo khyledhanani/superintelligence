@@ -883,19 +883,24 @@ def run_test(args):
 
     # Compute buffer embeddings — fresh (rollout current agent) or stale (from npz)
     buffer_embeddings = None
-    needs_fresh = (buffer_state == "fresh"
-                   or args.strategy in ("greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid"))
-    if needs_fresh and evaluator is not None:
+    needs_embeddings = args.strategy in ("greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid")
+    # Try stale first if available and not explicitly requesting fresh
+    if needs_embeddings and buffer_state != "fresh":
+        npz_data = np.load(args.buffer_path, allow_pickle=True)
+        if "embeddings" in npz_data:
+            buffer_embeddings = npz_data["embeddings"][:size]
+            logger.info(f"Loaded stale buffer embeddings ({buffer_embeddings.shape}) from npz")
+    if (buffer_state == "fresh" or (needs_embeddings and buffer_embeddings is None)) and evaluator is not None:
         logger.info(f"Computing fresh buffer embeddings for {size} levels (5 rollouts averaged)...")
         _t_emb = _time.time()
         all_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in range(size)]
         buffer_embeddings = evaluator.compute_embeddings(all_levels, n_rollouts=5)
         print(f"[TIMING] Fresh buffer embeddings ({size} levels, 5 rollouts): {_time.time() - _t_emb:.1f}s", flush=True)
-    else:
+    elif buffer_embeddings is None:
         # Load stale embeddings from npz if available (for plot background)
         npz_data = np.load(args.buffer_path, allow_pickle=True)
         if "embeddings" in npz_data:
-            buffer_embeddings = npz_data["embeddings"]
+            buffer_embeddings = npz_data["embeddings"][:size]
             logger.info(f"Loaded stale buffer embeddings ({buffer_embeddings.shape}) from npz")
 
     # Select reference mazes via BufferStatsExtractor
