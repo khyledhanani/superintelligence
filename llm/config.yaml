@@ -11,7 +11,7 @@
 # ============================================================================
 # CLI override: --llm_provider, --llm_model
 provider: claude-code        # "claude-code", "anthropic", "ollama", or "openrouter"
-model: opus                # Short alias (sonnet/opus/haiku) or full model ID
+model: sonnet                # Short alias (sonnet/opus/haiku) or full model ID
 
 # Provider-specific settings (auto-selected by provider field)
 anthropic:
@@ -50,7 +50,7 @@ buffer_state: fresh               # "stale" or "fresh"
 # Reference Mazes
 # ============================================================================
 # CLI override: --llm_ref_strategy, --llm_n_references, --llm_hybrid_difficulty_percentile
-strategy: hybrid-greedy   # "hardest", "random", "greedy", "hybrid-greedy", "kmedoid", or "hybrid-kmedoid"
+strategy: hybrid-kmedoid   # "hardest", "random", "greedy", "hybrid-greedy", "kmedoid", or "hybrid-kmedoid"
 num_refs: 5                 # Number of reference mazes from buffer
 hybrid_difficulty_percentile: 50  # Percentile filter for hybrid-kmedoid
 
@@ -75,8 +75,8 @@ gate:
 # Metric Injection (which metrics appear in the LLM prompt)
 # ============================================================================
 inject_metrics: true        # Master switch: compute metrics from agent rollouts
-inject_regret: true         # Include regret scores in prompt
-inject_buffer_stats: true   # Include buffer-wide statistics
+inject_regret: false         # Include regret scores in prompt
+inject_buffer_stats: false   # Include buffer-wide statistics
 downsample_points: 250       # Max points when downsampling metric vectors
 
 # Per-maze metrics shown to the LLM for each reference maze.

@@ -162,11 +162,13 @@ class BufferStatsExtractor:
 
     def __init__(self, n_references: int = 5, strategy: str = "hardest",
                  density_radius_frac: float = 0.5,
-                 hybrid_difficulty_percentile: float = 50.0) -> None:
+                 hybrid_difficulty_percentile: float = 50.0,
+                 inject_regret: bool = True) -> None:
         self.n_references = n_references
         self.strategy = strategy
         self.density_radius_frac = density_radius_frac
         self.hybrid_difficulty_percentile = hybrid_difficulty_percentile
+        self.inject_regret = inject_regret
         self._buffer_embeddings = None  # set by injector from training loop
 
     def extract_references_with_levels(self, sampler: dict) -> Tuple[List[ReferenceMaze], list]:
@@ -237,17 +239,19 @@ class BufferStatsExtractor:
             level = jax.tree_util.tree_map(lambda x: x[idx], levels_pytree)
             ascii_grid = level.to_str()
 
-            metric = MetricEntry(
-                name="Regret Score",
-                value=float(scores[idx]),
-                description="Agent's learning potential",
-                higher_is="more to learn",
-                metric_key="scalar_regret",
-            )
+            metrics = []
+            if self.inject_regret:
+                metrics.append(MetricEntry(
+                    name="Regret Score",
+                    value=float(scores[idx]),
+                    description="Agent's learning potential",
+                    higher_is="more to learn",
+                    metric_key="scalar_regret",
+                ))
             ref = ReferenceMaze(
                 grid=ascii_grid,
                 label=f"Maze {chr(65 + i)}",
-                metrics=[metric],
+                metrics=metrics,
             )
             references.append(ref)
             level_objects.append(level)

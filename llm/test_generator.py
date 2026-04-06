@@ -181,6 +181,7 @@ def save_results(
     embedding_metric: str = "embedding_l2",
     buf_embeddings: np.ndarray = None,
     buf_scores: np.ndarray = None,
+    buf_tokens: np.ndarray = None,
     visualisation_plot: str = "tsne",
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
@@ -545,12 +546,17 @@ def save_results(
             }.get(_emb_metric, _emb_metric)
 
             # Build foreground embedding matrix (257D mean state-action vectors)
+            # Prefer mean_embedding (averaged across all rollouts) when available;
+            # fall back to single-rollout extract_state_action_pairs
             n_fg = len(all_trajs)
             fg_embeddings = np.zeros((n_fg, 257), dtype=np.float32)
             for i, t in enumerate(all_trajs):
-                pairs = extract_state_action_pairs(t)
-                if pairs is not None and len(pairs) > 0:
-                    fg_embeddings[i] = pairs.mean(axis=0)
+                if "mean_embedding" in t:
+                    fg_embeddings[i] = t["mean_embedding"]
+                else:
+                    pairs = extract_state_action_pairs(t)
+                    if pairs is not None and len(pairs) > 0:
+                        fg_embeddings[i] = pairs.mean(axis=0)
 
             # Load buffer embeddings as background (all non-zero embeddings)
             n_buf = 0
@@ -740,6 +746,111 @@ def save_results(
         except Exception as e:
             logger.warning(f"Diversity embedding failed: {e}")
 
+    # --- Structural t-SNE plot (173D: wall map + agent/goal positions) ---
+    if buf_tokens is not None:
+        try:
+            from sklearn.manifold import TSNE
+            from vae.plot_tsne_training_evolution import tokens_to_structural_features
+            from vae.vae_level_utils import level_to_tokens
+
+            # Foreground: refs + rejected + accepted → convert grids to tokens to features
+            fg_grids = []
+            fg_labels_s = []
+            fg_colors_s = []
+            fg_markers_s = []
+            for ref in references:
+                fg_grids.append(ref.grid)
+                fg_labels_s.append(ref.label)
+                fg_colors_s.append('blue')
+                fg_markers_s.append('o')
+            for i, rc in enumerate(all_rejected):
+                fg_grids.append(rc.grid)
+                fg_labels_s.append(f"Rej {i+1}")
+                if rc.failed_difficulty and rc.failed_diversity:
+                    fg_colors_s.append('darkorange')
+                elif rc.failed_difficulty:
+                    fg_colors_s.append('red')
+                else:
+                    fg_colors_s.append('magenta')
+                fg_markers_s.append('X')
+            for i, (orig_idx, result) in enumerate(successful):
+                fg_grids.append(result.grid)
+                force = bool(result.diversity_issues)
+                fg_labels_s.append(f"Force-Accepted {i+1}" if force else f"Accepted {i+1}")
+                fg_colors_s.append('green')
+                fg_markers_s.append('*')
+
+            # Convert foreground grids to tokens then to structural features
+            fg_tokens = []
+            for grid in fg_grids:
+                try:
+                    level = Level.from_str(grid)
+                    tok = np.asarray(level_to_tokens(level))
+                    fg_tokens.append(tok)
+                except Exception:
+                    fg_tokens.append(np.zeros(52, dtype=np.int32))
+            fg_tokens = np.stack(fg_tokens)
+            fg_struct = tokens_to_structural_features(fg_tokens)
+
+            # Buffer background
+            buf_struct = tokens_to_structural_features(buf_tokens)
+            n_buf_s = len(buf_struct)
+
+            # Combined embedding
+            all_struct = np.vstack([fg_struct, buf_struct])
+            n_fg_s = len(fg_struct)
+            perp_s = min(40, len(all_struct) - 1)
+            struct_2d = TSNE(
+                n_components=2, perplexity=perp_s,
+                random_state=42, init="pca", learning_rate="auto",
+                max_iter=1000,
+            ).fit_transform(all_struct)
+
+            # Plot
+            fig_s, ax_s = plt.subplots(1, 1, figsize=(8, 7))
+
+            # Buffer background (colored by difficulty)
+            buf_2d = struct_2d[n_fg_s:]
+            if buf_scores is not None and len(buf_scores) >= n_buf_s:
+                mean_score = float(buf_scores[:n_buf_s].mean())
+                pass_mask = buf_scores[:n_buf_s] >= mean_score
+                fail_mask = ~pass_mask
+                if np.any(fail_mask):
+                    ax_s.scatter(buf_2d[fail_mask, 0], buf_2d[fail_mask, 1],
+                                 c='khaki', s=10, marker='o', zorder=1, alpha=0.4, edgecolors='none')
+                if np.any(pass_mask):
+                    ax_s.scatter(buf_2d[pass_mask, 0], buf_2d[pass_mask, 1],
+                                 c='lightsteelblue', s=12, marker='o', zorder=2, alpha=0.5, edgecolors='none')
+            else:
+                ax_s.scatter(buf_2d[:, 0], buf_2d[:, 1],
+                             c='lightsteelblue', s=12, marker='o', zorder=1, alpha=0.5, edgecolors='none')
+
+            # Foreground points
+            fg_2d = struct_2d[:n_fg_s]
+            for i in range(n_fg_s):
+                ax_s.scatter(fg_2d[i, 0], fg_2d[i, 1],
+                             c=fg_colors_s[i], s=150 if fg_markers_s[i] == '*' else 100,
+                             marker=fg_markers_s[i], zorder=5,
+                             edgecolors='black', linewidths=0.5)
+                ax_s.annotate(fg_labels_s[i], (fg_2d[i, 0], fg_2d[i, 1]),
+                              textcoords="offset points", xytext=(6, 6),
+                              fontsize=7, color=fg_colors_s[i], fontweight='bold')
+
+            ax_s.set_title("Structural Embedding (173D: wall map + positions)\n"
+                           "t-SNE layout — maze topology only, no agent behavior",
+                           fontsize=10, fontweight='bold')
+            ax_s.set_xlabel("t-SNE dim 1", fontsize=9)
+            ax_s.set_ylabel("t-SNE dim 2", fontsize=9)
+            ax_s.grid(alpha=0.2)
+
+            struct_path = os.path.join(run_dir, "structural_embedding.png")
+            fig_s.savefig(struct_path, dpi=150, bbox_inches='tight')
+            plt.close(fig_s)
+            logger.info(f"Saved {struct_path}")
+
+        except Exception as e:
+            logger.warning(f"Structural embedding plot failed: {e}")
+
     return run_dir
 
 
@@ -775,17 +886,11 @@ def run_test(args):
     needs_fresh = (buffer_state == "fresh"
                    or args.strategy in ("greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid"))
     if needs_fresh and evaluator is not None:
-        logger.info(f"Computing fresh buffer embeddings for {size} levels...")
+        logger.info(f"Computing fresh buffer embeddings for {size} levels (5 rollouts averaged)...")
         _t_emb = _time.time()
-        from metrics.standalone.cenie import extract_state_action_pairs
         all_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in range(size)]
-        emb_trajs = evaluator.evaluate_levels(all_levels)
-        buffer_embeddings = np.zeros((size, 257), dtype=np.float32)
-        for i, traj in enumerate(emb_trajs):
-            pairs = extract_state_action_pairs(traj)
-            if pairs is not None and len(pairs) > 0:
-                buffer_embeddings[i] = pairs.mean(axis=0)
-        print(f"[TIMING] Fresh buffer embeddings ({size} levels): {_time.time() - _t_emb:.1f}s", flush=True)
+        buffer_embeddings = evaluator.compute_embeddings(all_levels, n_rollouts=5)
+        print(f"[TIMING] Fresh buffer embeddings ({size} levels, 5 rollouts): {_time.time() - _t_emb:.1f}s", flush=True)
     else:
         # Load stale embeddings from npz if available (for plot background)
         npz_data = np.load(args.buffer_path, allow_pickle=True)
@@ -798,6 +903,7 @@ def run_test(args):
         n_references=args.num_refs,
         strategy=args.strategy,
         hybrid_difficulty_percentile=getattr(args, 'hybrid_difficulty_percentile', 50.0),
+        inject_regret=args.inject_regret,
     )
     if buffer_embeddings is not None:
         extractor._buffer_embeddings = buffer_embeddings
@@ -806,11 +912,15 @@ def run_test(args):
     references, ref_levels = extractor.extract_references_with_levels(sampler)
 
     # Roll out agent on selected reference levels to get trajectory data
+    # Uses multi-rollout (50) for proper SFL solve_rate + mean_embedding
     ref_trajectories = None
     if args.inject_metrics and evaluator is not None and ref_levels:
-        logger.info(f"Rolling out agent on {len(ref_levels)} reference levels...")
+        logger.info(f"Rolling out agent on {len(ref_levels)} reference levels (50 rollouts each)...")
         _t_ref = _time.time()
-        ref_trajectories = evaluator.evaluate_levels(ref_levels)
+        ref_trajectories = []
+        for lv in ref_levels:
+            traj = evaluator.evaluate_level_multi_rollout(lv, n_rollouts=args.n_rollouts)
+            ref_trajectories.append(traj)
         print(f"[TIMING] Reference rollouts ({len(ref_levels)} levels): {_time.time() - _t_ref:.1f}s", flush=True)
         logger.info("Reference trajectories collected")
 
@@ -1050,6 +1160,15 @@ def run_test(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_short = args.model.replace(":", "_").replace("/", "_")
     run_dir = os.path.join(OUTPUT_DIR, f"{timestamp}_{model_short}")
+    # Load buffer tokens for structural embedding plot
+    _buf_tokens = None
+    try:
+        _npz = np.load(args.buffer_path, allow_pickle=True)
+        if "tokens" in _npz:
+            _buf_tokens = _npz["tokens"][:size]
+    except Exception:
+        pass
+
     save_results(
         results, references, args.model, run_dir,
         ref_trajectories=ref_trajectories,
@@ -1057,6 +1176,7 @@ def run_test(args):
         embedding_metric=args.embedding_metric,
         buf_embeddings=buffer_embeddings,
         buf_scores=np.asarray(scores) if buffer_embeddings is not None else None,
+        buf_tokens=_buf_tokens,
         visualisation_plot=getattr(args, 'visualisation_plot', 'tsne'),
     )
     print(f"\n  Results saved to: {run_dir}/")

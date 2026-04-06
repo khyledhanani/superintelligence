@@ -35,7 +35,7 @@ class LLMInjectionConfig:
 
     # Batch sizing
     n_raw: int = 10                    # --llm_batch_size (mazes per injection round)
-    target_buffer_pct: float = 5.0     # --llm_target_buffer_pct (0=disabled, 0.05=5%)
+    target_buffer_pct: float = 0.05     # --llm_target_buffer_pct (0=disabled, 0.05=5%)
 
     # Mutation amplification
     amplification_enabled: bool = True   # --llm_amplification
