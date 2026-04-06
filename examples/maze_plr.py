@@ -1869,7 +1869,7 @@ def main(config=None, project="JAXUED_TEST"):
         else:
             dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
         os.makedirs(dump_dir, exist_ok=True)
-        tag = f"_{update_num}" if update_num > 0 else "_final"
+        tag = f"_{update_num}" if update_num >= 0 else "_final"
         tokens_path = os.path.join(dump_dir, f"buffer_tokens{tag}.npy")
         dump_path = os.path.join(dump_dir, f"buffer_dump{tag}.npz")
         np.save(tokens_path, np.asarray(tokens))
@@ -2334,7 +2334,7 @@ def main(config=None, project="JAXUED_TEST"):
     sampler = final_train_state.sampler
     size = int(sampler["size"])
     print(f"[Buffer dump] Saving {size} levels (final)...")
-    dump_buffer(final_train_state, 0)  # tag = "_final"
+    dump_buffer(final_train_state, -1)  # tag = "_final"
 
     buffer_levels = jax.tree_util.tree_map(lambda x: x[:size], sampler["levels"])
     buffer_scores = np.asarray(sampler["scores"][:size])

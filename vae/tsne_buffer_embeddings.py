@@ -37,7 +37,7 @@ from vae_level_utils import tokens_to_level
 def load_buffer(path):
     d = np.load(path)
     size = int(d["size"])
-    embeddings = d["mean_embeddings"][:size]
+    embeddings = d["embeddings"][:size] if "embeddings" in d else d["mean_embeddings"][:size]
     scores = d["scores"][:size]
     tokens = d["tokens"][:size]
     print(f"Buffer: {size} levels, embeddings: {embeddings.shape}")
@@ -244,9 +244,10 @@ def main():
     # t-SNE
     perp = min(args.perplexity, len(all_emb) - 1)
     print(f"Running t-SNE (perplexity={perp})...")
-    tsne = TSNE(n_components=2, metric="precomputed", perplexity=perp,
-                random_state=args.seed, init="random")
-    coords_tsne = tsne.fit_transform(dist_matrix)
+    tsne = TSNE(n_components=2, perplexity=perp,
+                random_state=args.seed, init="pca", learning_rate="auto",
+                max_iter=1000)
+    coords_tsne = tsne.fit_transform(all_emb)
 
     # MDS
     print("Running MDS...")

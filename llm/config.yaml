@@ -44,7 +44,7 @@ validate_solvable: true     # BFS solvability check on generated mazes
 # agent ("fresh") or use stale insertion-time values ("stale").
 # Affects: reference selection (kmedoid/diverse), diversity gate, and plots.
 # CLI override: --llm_buffer_state
-buffer_state: stale               # "stale" or "fresh"
+buffer_state: fresh               # "stale" or "fresh"
 
 # ============================================================================
 # Reference Mazes
@@ -99,7 +99,7 @@ pairwise_metrics:
 # ============================================================================
 # Test-only settings (not used during training injection)
 # ============================================================================
-n: 8                        # Number of mazes to generate in test mode
+n: 3                        # Number of mazes to generate in test mode
 buffer_path: buffer_dumps/accel_baseline/seed0/buffer_dumps/buffer_dump_2500.npz
 agent_dir: buffer_dumps/accel_baseline/seed0/checkpoints
 checkpoint_step: 10              # Agent checkpoint step (-1 for latest)
