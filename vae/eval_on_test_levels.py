@@ -183,10 +183,11 @@ def load_agent_for_eval(checkpoint_dir, checkpoint_step, maze_height, maze_width
     )
 
     pholder_level = sample_random_level(jax.random.PRNGKey(0))
-    sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
+    sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf, "ancestor_id": jnp.int32(-1)})
     pholder_level_batch = jax.tree_util.tree_map(
         lambda x: jnp.array([x]).repeat(n_envs, axis=0), pholder_level)
 
+    max_anc = config.get("max_llm_ancestors", 256)
     template_state = TrainState.create(
         apply_fn=network.apply, params=network_params, tx=tx,
         sampler=sampler, update_state=0, es_state=None,
@@ -195,6 +196,10 @@ def load_agent_for_eval(checkpoint_dir, checkpoint_step, maze_height, maze_width
         replay_last_level_batch=pholder_level_batch,
         replay_last_level_inds=jnp.full(n_envs, -1, dtype=jnp.int32),
         mutation_last_level_batch=pholder_level_batch,
+        seed_embeddings=jnp.zeros((max_anc, 257), dtype=jnp.float32),
+        proximity_thresholds=jnp.full(max_anc, jnp.inf, dtype=jnp.float32),
+        n_seeds=jnp.int32(0),
+        fixed_dist_n_llm=jnp.int32(0),
     )
 
     models_dir = os.path.join(checkpoint_dir, "models")
@@ -221,16 +226,91 @@ def load_agent_for_eval(checkpoint_dir, checkpoint_step, maze_height, maze_width
     return train_state, config, base_env, env_params
 
 
+def evaluate_rnn_extended(rng, env, env_params, train_state, init_hstate,
+                          init_obs, init_env_state, max_episode_length):
+    """Like evaluate_rnn but also returns actions and values per step."""
+    import jax
+    import jax.numpy as jnp
+    from maze_plr import ActorCritic
+
+    num_levels = jax.tree_util.tree_flatten(init_obs)[0][0].shape[0]
+
+    def step(carry, _):
+        rng, hstate, obs, state, done, mask, episode_length = carry
+        rng, rng_action, rng_step = jax.random.split(rng, 3)
+        x = jax.tree_util.tree_map(lambda x: x[None, ...], (obs, done))
+        hstate, pi, value = train_state.apply_fn(train_state.params, x, hstate)
+        action = pi.sample(seed=rng_action).squeeze(0)
+        obs, next_state, reward, done, _ = jax.vmap(
+            env.step, in_axes=(0, 0, 0, None)
+        )(jax.random.split(rng_step, num_levels), state, action, env_params)
+        next_mask = mask & ~done
+        episode_length += mask
+        return (rng, hstate, obs, next_state, done, next_mask, episode_length), \
+               (reward, action, value.squeeze(0), episode_length)
+
+    (_, _, _, _, _, _, episode_lengths), (rewards, actions, values, _) = jax.lax.scan(
+        step,
+        (rng, init_hstate, init_obs, init_env_state,
+         jnp.zeros(num_levels, dtype=bool),
+         jnp.ones(num_levels, dtype=bool),
+         jnp.zeros(num_levels, dtype=jnp.int32)),
+        None, length=max_episode_length,
+    )
+    return rewards, episode_lengths, actions, values
+
+
+def compute_shortest_paths_bfs(levels, maze_h, maze_w):
+    """BFS shortest path for each level. Returns (N,) int array."""
+    wall_maps = np.asarray(levels.wall_map)
+    agent_pos = np.asarray(levels.agent_pos)
+    goal_pos = np.asarray(levels.goal_pos)
+    n = wall_maps.shape[0]
+    from collections import deque
+    results = np.full(n, np.inf)
+    for i in range(n):
+        wm = wall_maps[i]
+        ax, ay = int(agent_pos[i, 0]), int(agent_pos[i, 1])
+        gx, gy = int(goal_pos[i, 0]), int(goal_pos[i, 1])
+        h, w = wm.shape
+        if wm[ay, ax] or wm[gy, gx]:
+            continue
+        q = deque([(ax, ay, 0)])
+        visited = {(ax, ay)}
+        while q:
+            cx, cy, d = q.popleft()
+            if cx == gx and cy == gy:
+                results[i] = d
+                break
+            for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+                nx, ny = cx+dx, cy+dy
+                if 0 <= nx < w and 0 <= ny < h and not wm[ny, nx] and (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    q.append((nx, ny, d+1))
+    return results
+
+
+def iqm(values):
+    """Interquartile mean: mean of values between 25th and 75th percentile."""
+    values = np.asarray(values)
+    if len(values) < 4:
+        return float(values.mean())
+    q25, q75 = np.percentile(values, [25, 75])
+    mask = (values >= q25) & (values <= q75)
+    return float(values[mask].mean()) if mask.any() else float(values.mean())
+
+
 def evaluate_on_prefab_levels(train_state, config, base_env, env_params,
                               level_names, num_attempts, max_steps_override=None):
-    """Evaluate agent on named prefab levels. Returns dict of {level_name: solve_rate}."""
+    """Evaluate agent on named prefab levels. Returns comprehensive metrics dict."""
     import jax
     import jax.numpy as jnp
     from jaxued.environments.maze.level import Level, prefabs
-    from maze_plr import ActorCritic, evaluate_rnn
+    from maze_plr import ActorCritic
 
     mh = config.get("maze_height", 13)
     mw = config.get("maze_width", 13)
+    gamma = config.get("gamma", 0.995)
 
     # Load and stack prefab levels (padding to max grid size)
     level_objects = []
@@ -253,7 +333,8 @@ def evaluate_on_prefab_levels(train_state, config, base_env, env_params,
 
     levels = Level.stack(level_objects)
     num_levels = len(valid_names)
-    # Build eval env matching agent's grid size (padded levels fit into it)
+
+    # Build eval env
     eval_h = max(mh, levels.wall_map.shape[-2])
     eval_w = max(mw, levels.wall_map.shape[-1])
     from jaxued.environments import Maze
@@ -267,7 +348,20 @@ def evaluate_on_prefab_levels(train_state, config, base_env, env_params,
         eval_params = eval_env.default_params
     max_steps = eval_params.max_steps_in_episode
 
-    all_attempt_solves = []
+    # BFS shortest paths (once)
+    shortest_paths = compute_shortest_paths_bfs(levels, eval_h, eval_w)
+    # Optimal return per level: reward = (1 - 0.9 * (t+1) / max_steps) at step t
+    optimal_returns = np.where(
+        np.isfinite(shortest_paths),
+        1.0 - 0.9 * (shortest_paths + 1) / max_steps,
+        0.0,
+    )
+
+    # Run rollouts
+    all_cum_rewards = []
+    all_ep_lengths = []
+    all_values_t0 = []
+
     for attempt_idx in range(num_attempts):
         rng = jax.random.PRNGKey(attempt_idx + 2000)
         rng, rng_reset, rng_eval = jax.random.split(rng, 3)
@@ -275,18 +369,65 @@ def evaluate_on_prefab_levels(train_state, config, base_env, env_params,
         init_obs, init_state = jax.vmap(eval_env.reset_to_level, (0, 0, None))(
             jax.random.split(rng_reset, num_levels), levels, eval_params)
 
-        states, rewards, episode_lengths = evaluate_rnn(
+        rewards, ep_lengths, actions, values = evaluate_rnn_extended(
             rng_eval, eval_env, eval_params, train_state,
             ActorCritic.initialize_carry((num_levels,)),
             init_obs, init_state, max_steps)
 
-        mask = np.arange(max_steps)[:, None] < np.asarray(episode_lengths)[None, :]
+        mask = np.arange(max_steps)[:, None] < np.asarray(ep_lengths)[None, :]
         cum_rewards = (np.asarray(rewards) * mask).sum(axis=0)
-        solved = (cum_rewards > 0).astype(float)
-        all_attempt_solves.append(solved)
+        all_cum_rewards.append(cum_rewards)
+        all_ep_lengths.append(np.asarray(ep_lengths))
+        all_values_t0.append(np.asarray(values[0]))  # V^pi at t=0
 
-    solve_rates = np.stack(all_attempt_solves).mean(axis=0)
-    return {name: float(sr) for name, sr in zip(valid_names, solve_rates)}
+    all_cum_rewards = np.stack(all_cum_rewards)   # (num_attempts, num_levels)
+    all_ep_lengths = np.stack(all_ep_lengths)      # (num_attempts, num_levels)
+    all_values_t0 = np.stack(all_values_t0)        # (num_attempts, num_levels)
+
+    # Per-level metrics
+    solve_matrix = (all_cum_rewards > 0).astype(float)
+    solve_rates = solve_matrix.mean(axis=0)
+    mean_returns = all_cum_rewards.mean(axis=0)
+    learnability = solve_rates * (1.0 - solve_rates)
+
+    # Optimality gap: V*(s0) - mean V^pi(s0)
+    mean_agent_values = all_values_t0.mean(axis=0)
+    optimality_gaps = optimal_returns - mean_returns
+
+    # Episode lengths (solved only)
+    solved_mask = all_cum_rewards > 0
+    with np.errstate(all='ignore'):
+        ep_solved = np.where(solved_mask, all_ep_lengths, np.nan)
+        ep_length_means = np.nanmean(ep_solved, axis=0)
+
+    # Path ratio: agent_steps / BFS_shortest (solved only, 1.0 = optimal)
+    with np.errstate(all='ignore'):
+        sp_broadcast = shortest_paths[None, :]
+        path_ratios = np.where(solved_mask, all_ep_lengths / sp_broadcast, np.nan)
+        path_ratio_means = np.nanmean(path_ratios, axis=0)
+
+    # Aggregates
+    iqm_sr = iqm(solve_rates)
+
+    # Build result dict: per-level solve rates + all extra metrics
+    result = {name: float(sr) for name, sr in zip(valid_names, solve_rates)}
+    result["__metrics__"] = {
+        "level_names": valid_names,
+        "solve_rates": solve_rates,
+        "mean_returns": mean_returns,
+        "optimal_returns": optimal_returns,
+        "optimality_gaps": optimality_gaps,
+        "learnability": learnability,
+        "shortest_paths": shortest_paths,
+        "ep_length_means": ep_length_means,
+        "path_ratio_means": path_ratio_means,
+        "mean_solve_rate": float(solve_rates.mean()),
+        "iqm_solve_rate": float(iqm_sr),
+        "mean_return_agg": float(mean_returns.mean()),
+        "mean_optimality_gap": float(np.nanmean(optimality_gaps)),
+        "mean_path_ratio": float(np.nanmean(path_ratio_means)),
+    }
+    return result
 
 
 def method_name_from_run(run_name):
@@ -377,6 +518,7 @@ def main():
                 args.eval_levels, args.num_attempts,
                 max_steps_override=args.max_steps)
 
+            metrics = results.pop("__metrics__", {})
             row = {
                 "run_name": run_name,
                 "method": method_name_from_run(run_name),
@@ -384,13 +526,23 @@ def main():
                 "seed": seed,
                 "eval_updates": args.eval_updates,
                 "num_attempts": args.num_attempts,
-                "mean_solve_rate": float(np.mean(list(results.values()))) if results else 0.0,
+                "mean_solve_rate": metrics.get("mean_solve_rate", 0.0),
+                "iqm_solve_rate": metrics.get("iqm_solve_rate", 0.0),
+                "mean_return": metrics.get("mean_return_agg", 0.0),
+                "mean_optimality_gap": metrics.get("mean_optimality_gap", 0.0),
+                "mean_path_ratio": metrics.get("mean_path_ratio", 0.0),
             }
+            # Per-level solve rates
             row.update(results)
+            # Store full metrics for plotting
+            row["_metrics"] = metrics
             all_rows.append(row)
 
             sr_str = "  ".join(f"{n}={results[n]:.0%}" for n in args.eval_levels if n in results)
-            print(f"  Mean: {row['mean_solve_rate']:.1%} | {sr_str}")
+            print(f"  SolveRate={row['mean_solve_rate']:.1%} IQM={row['iqm_solve_rate']:.1%} "
+                  f"Return={row['mean_return']:.3f} OptGap={row['mean_optimality_gap']:.3f} "
+                  f"PathRatio={row['mean_path_ratio']:.1f}")
+            print(f"  Per-level: {sr_str}")
 
         print()
 
@@ -398,11 +550,11 @@ def main():
         print("No results collected.")
         return
 
-    # --- Save CSV ---
+    # --- Save CSV (exclude nested _metrics dict) ---
     csv_path = os.path.join(args.output_dir, "eval_test_levels.csv")
-    fieldnames = list(all_rows[0].keys())
+    fieldnames = [k for k in all_rows[0].keys() if k != "_metrics"]
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_rows)
     print(f"Saved CSV: {csv_path}")
@@ -411,13 +563,12 @@ def main():
     methods = list(dict.fromkeys(r["method"] for r in all_rows))
     level_names = [l for l in args.eval_levels if l in all_rows[0]]
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*100}")
     print("SUMMARY (mean ± std across seeds)")
-    print(f"{'='*70}")
-    header = f"{'Method':>25s} {'Mean':>8s}"
+    print(f"{'='*100}")
+    header = f"{'Method':>25s} {'SolveRate':>10s} {'IQM':>8s} {'Return':>8s} {'OptGap':>8s} {'PathRatio':>10s}"
     for ln in level_names:
-        short = ln[:12]
-        header += f" {short:>12s}"
+        header += f" {ln[:10]:>10s}"
     print(header)
     print("-" * len(header))
 
@@ -425,15 +576,21 @@ def main():
     for m in methods:
         m_rows = [r for r in all_rows if r["method"] == m]
         mean_srs = [r["mean_solve_rate"] for r in m_rows]
+        iqm_srs = [r["iqm_solve_rate"] for r in m_rows]
+        mean_rets = [r["mean_return"] for r in m_rows]
+        opt_gaps = [r["mean_optimality_gap"] for r in m_rows]
+        path_rats = [r["mean_path_ratio"] for r in m_rows]
         method_means[m] = np.mean(mean_srs)
 
-        line = f"{m:>25s} {np.mean(mean_srs):>7.1%}"
+        line = (f"{m:>25s} {np.mean(mean_srs):>9.1%} {np.mean(iqm_srs):>7.1%} "
+                f"{np.mean(mean_rets):>7.3f} {np.mean(opt_gaps):>7.3f} "
+                f"{np.nanmean(path_rats):>9.1f}")
         for ln in level_names:
             vals = [r[ln] for r in m_rows if ln in r]
             if vals:
-                line += f" {np.mean(vals):>11.1%}"
+                line += f" {np.mean(vals):>9.1%}"
             else:
-                line += f" {'N/A':>11s}"
+                line += f" {'N/A':>9s}"
         print(line)
 
     # --- Bar chart ---
@@ -468,20 +625,88 @@ def main():
     plt.close()
     print(f"\nSaved plot: {plot_path}")
 
-    # --- Also save a simple method-level summary ---
+    # --- Aggregate metrics bar chart ---
+    agg_metrics = [
+        ("mean_solve_rate", "Mean Solve Rate"),
+        ("iqm_solve_rate", "IQM Solve Rate"),
+        ("mean_return", "Mean Return"),
+        ("mean_optimality_gap", "Mean Optimality Gap"),
+    ]
+    fig_agg, axes_agg = plt.subplots(1, len(agg_metrics), figsize=(4.5 * len(agg_metrics), 5))
+    for ax_a, (key, title) in zip(axes_agg, agg_metrics):
+        means_a, stds_a, names_a = [], [], []
+        for m in methods:
+            m_rows = [r for r in all_rows if r["method"] == m]
+            vals = [r[key] for r in m_rows]
+            names_a.append(m)
+            means_a.append(np.mean(vals))
+            stds_a.append(np.std(vals))
+        colors = [f"C{i}" for i in range(len(names_a))]
+        bars = ax_a.bar(names_a, means_a, yerr=stds_a, capsize=4, color=colors, alpha=0.85)
+        ax_a.set_title(title, fontsize=11)
+        ax_a.set_xticklabels(names_a, rotation=45, ha="right", fontsize=8)
+        ax_a.grid(axis="y", alpha=0.3)
+        for bar, mv, sv in zip(bars, means_a, stds_a):
+            ax_a.text(bar.get_x() + bar.get_width()/2, bar.get_height() + sv + 0.01,
+                      f"{mv:.2f}", ha="center", va="bottom", fontsize=7)
+    plt.suptitle(f"Aggregate Metrics ({grid_size}x{grid_size}, {args.eval_updates} updates)", fontsize=13)
+    plt.tight_layout()
+    agg_path = os.path.join(args.output_dir, "aggregate_metrics.png")
+    plt.savefig(agg_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot: {agg_path}")
+
+    # --- Per-level path ratio plot ---
+    fig_pr, ax_pr = plt.subplots(figsize=(max(10, len(methods) * 2), 6))
+    x_pr = np.arange(len(methods))
+    for li, ln in enumerate(level_names):
+        means_pr, stds_pr = [], []
+        for m in methods:
+            m_rows = [r for r in all_rows if r["method"] == m]
+            vals = [r["_metrics"]["path_ratio_means"][li] for r in m_rows
+                    if "_metrics" in r and len(r["_metrics"].get("path_ratio_means", [])) > li]
+            means_pr.append(np.nanmean(vals) if vals else 0)
+            stds_pr.append(np.nanstd(vals) if len(vals) > 1 else 0)
+        offset = (li - len(level_names)/2 + 0.5) * (0.8 / max(len(level_names), 1))
+        ax_pr.bar(x_pr + offset, means_pr, 0.8/max(len(level_names),1), yerr=stds_pr,
+                  label=ln[:15], alpha=0.8, capsize=2)
+    ax_pr.set_xlabel("Method")
+    ax_pr.set_ylabel("Path Ratio (agent_steps / BFS_shortest)")
+    ax_pr.set_title(f"Path Efficiency ({grid_size}x{grid_size})")
+    ax_pr.set_xticks(x_pr)
+    ax_pr.set_xticklabels(methods, rotation=30, ha="right", fontsize=9)
+    ax_pr.axhline(y=1.0, color="grey", linestyle="--", alpha=0.3, label="Optimal")
+    ax_pr.legend(fontsize=7, ncol=min(4, len(level_names)))
+    ax_pr.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    pr_path = os.path.join(args.output_dir, "path_ratio.png")
+    plt.savefig(pr_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot: {pr_path}")
+
+    # --- Summary CSV with all metrics ---
     summary_path = os.path.join(args.output_dir, "eval_summary.csv")
     with open(summary_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["method", "n_seeds", "mean_solve_rate", "std_solve_rate"] + level_names)
+        writer.writerow(["method", "n_seeds", "mean_solve_rate", "std_solve_rate",
+                         "iqm_solve_rate", "mean_return", "mean_optimality_gap",
+                         "mean_path_ratio"] + level_names)
         for m in methods:
             m_rows = [r for r in all_rows if r["method"] == m]
             mean_srs = [r["mean_solve_rate"] for r in m_rows]
+            iqm_srs = [r["iqm_solve_rate"] for r in m_rows]
+            mean_rets = [r["mean_return"] for r in m_rows]
+            opt_gaps = [r["mean_optimality_gap"] for r in m_rows]
+            path_rats = [r["mean_path_ratio"] for r in m_rows]
             per_level = []
             for ln in level_names:
                 vals = [r[ln] for r in m_rows if ln in r]
                 per_level.append(f"{np.mean(vals):.4f}" if vals else "")
-            writer.writerow([m, len(m_rows), f"{np.mean(mean_srs):.4f}",
-                             f"{np.std(mean_srs):.4f}"] + per_level)
+            writer.writerow([m, len(m_rows),
+                             f"{np.mean(mean_srs):.4f}", f"{np.std(mean_srs):.4f}",
+                             f"{np.mean(iqm_srs):.4f}", f"{np.mean(mean_rets):.4f}",
+                             f"{np.mean(opt_gaps):.4f}", f"{np.nanmean(path_rats):.4f}",
+                             ] + per_level)
     print(f"Saved summary: {summary_path}")
     print(f"\nDone. {len(all_rows)} agent evaluations, {len(methods)} methods.")
 
