@@ -3,33 +3,33 @@ grid_size: 13
 timesteps: [250, 500, 1000, 2000, 3000, 5000, 7500, 10000, 15000, 20000, 25000, 30000]
 
 runs:
-  # PLR (no mutations, exploratory_grad_updates=True)
+  # PLR with uniform DR (0-50 walls, RPLR)
   - name: "PLR s0"
-    gcs_prefix: accel/plr_sfl_13x13_v2
-    run_id: plr_sfl_13x13_v2
+    gcs_prefix: accel/plr_uniformdr_sfl_13x13_v1
+    run_id: plr_uniformdr_sfl_13x13_v1
     seed: 0
   - name: "PLR s1"
-    gcs_prefix: accel/plr_sfl_13x13_v2
-    run_id: plr_sfl_13x13_v2
+    gcs_prefix: accel/plr_uniformdr_sfl_13x13_v1
+    run_id: plr_uniformdr_sfl_13x13_v1
     seed: 1
   - name: "PLR s2"
-    gcs_prefix: accel/plr_sfl_13x13_v2
-    run_id: plr_sfl_13x13_v2
+    gcs_prefix: accel/plr_uniformdr_sfl_13x13_v1
+    run_id: plr_uniformdr_sfl_13x13_v1
     seed: 2
 
-  # ACCEL (wall-flip mutations) — v2 seeds
-  - name: "ACCEL s3"
-    gcs_prefix: accel/accel_sfl_13x13_v2
-    run_id: accel_sfl_13x13_v2_s3
-    seed: 3
-  - name: "ACCEL s4"
-    gcs_prefix: accel/accel_sfl_13x13_v2
-    run_id: accel_sfl_13x13_v2_s4
-    seed: 4
-  - name: "ACCEL s5"
-    gcs_prefix: accel/accel_sfl_13x13_v2
-    run_id: accel_sfl_13x13_v2_s5
-    seed: 5
+  # ACCEL with uniform DR (0-50 walls)
+  - name: "ACCEL s0"
+    gcs_prefix: accel/accel_uniformdr_sfl_13x13_v1
+    run_id: accel_uniformdr_sfl_13x13_v1
+    seed: 0
+  - name: "ACCEL s1"
+    gcs_prefix: accel/accel_uniformdr_sfl_13x13_v1
+    run_id: accel_uniformdr_sfl_13x13_v1
+    seed: 1
+  - name: "ACCEL s2"
+    gcs_prefix: accel/accel_uniformdr_sfl_13x13_v1
+    run_id: accel_uniformdr_sfl_13x13_v1
+    seed: 2
 
   # CMA-ES + PLR (no mutations)
   - name: "CMA-ES+PLR s0"
@@ -85,4 +85,18 @@ runs:
   - name: "CMA-ES+LatNoise s2"
     gcs_prefix: accel/cmaes_plr_latentnoise_13x13_v1
     run_id: cmaes_plr_latentnoise_13x13_v1
+    seed: 2
+
+  # CMA-ES only (no PLR replay)
+  - name: "CMA-ES only s0"
+    gcs_prefix: accel/cmaes_only_sfl_13x13_v3
+    run_id: cmaes_only_sfl_13x13_v3
+    seed: 0
+  - name: "CMA-ES only s1"
+    gcs_prefix: accel/cmaes_only_sfl_13x13_v3
+    run_id: cmaes_only_sfl_13x13_v3
+    seed: 1
+  - name: "CMA-ES only s2"
+    gcs_prefix: accel/cmaes_only_sfl_13x13_v3
+    run_id: cmaes_only_sfl_13x13_v3
     seed: 2

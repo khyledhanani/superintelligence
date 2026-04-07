@@ -1,0 +1,40 @@
+title: "13x13 All Methods — Buffer Embedding Evolution"
+color_by: all
+grid_size: 13
+timesteps: [250, 500, 750, 1000, 2500, 5000, 10000, 15000, 20000, 30000]
+
+runs:
+  - name: "PLR"
+    gcs_prefix: accel/plr_uniformdr_sfl_13x13_v1
+    run_id: plr_uniformdr_sfl_13x13_v1
+    seed: 0
+
+  - name: "ACCEL"
+    gcs_prefix: accel/accel_uniformdr_sfl_13x13_v1
+    run_id: accel_uniformdr_sfl_13x13_v1
+    seed: 0
+
+  - name: "CMA-ES+PLR"
+    gcs_prefix: accel/cmaes_plr_nomut_sfl_13x13_v3
+    run_id: cmaes_plr_nomut_sfl_13x13_v3
+    seed: 0
+
+  - name: "CMA-ES+ACCEL"
+    gcs_prefix: accel/cmaes_accel_sfl_13x13_v2
+    run_id: cmaes_accel_sfl_13x13_v2_s3
+    seed: 3
+
+  - name: "CMA-ES+LatInterp"
+    gcs_prefix: accel/cmaes_latent_mut_sfl_13x13_v2
+    run_id: cmaes_latent_mut_sfl_13x13_v2_s3
+    seed: 3
+
+  - name: "CMA-ES+LatNoise"
+    gcs_prefix: accel/cmaes_plr_latentnoise_13x13_v1
+    run_id: cmaes_plr_latentnoise_13x13_v1
+    seed: 0
+
+  - name: "CMA-ES only"
+    gcs_prefix: accel/cmaes_only_sfl_13x13_v3
+    run_id: cmaes_only_sfl_13x13_v3
+    seed: 0
