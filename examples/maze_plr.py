@@ -562,10 +562,21 @@ def main(config=None, project="JAXUED_TEST"):
     vae_decode_fn = None
     vae_encode_fn = None
     cmaes_mgr = None
-    _need_vae = config["use_cmaes"] or config.get("interp_compare_interval", 0) > 0
+    if config.get("use_latent_noise_mut"):
+        _lnm_k = config["latent_noise_top_k"]
+        _lnm_p = config["latent_noise_per_parent"]
+        _lnm_n = config["num_train_envs"]
+        assert _lnm_k * _lnm_p == _lnm_n, (
+            f"--use_latent_noise_mut requires latent_noise_top_k * latent_noise_per_parent "
+            f"== num_train_envs (got {_lnm_k} * {_lnm_p} = {_lnm_k * _lnm_p} != {_lnm_n})"
+        )
+        assert config["use_accel"], (
+            "--use_latent_noise_mut requires --use_accel (it replaces the ACCEL mutate branch)"
+        )
+    _need_vae = config["use_cmaes"] or config.get("interp_compare_interval", 0) > 0 or config.get("use_latent_noise_mut")
     if _need_vae:
-        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes or --interp_compare_interval"
-        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes or --interp_compare_interval"
+        assert config["vae_checkpoint_path"] is not None, "--vae_checkpoint_path required when --use_cmaes, --interp_compare_interval, or --use_latent_noise_mut"
+        assert config["vae_config_path"] is not None, "--vae_config_path required when --use_cmaes, --interp_compare_interval, or --use_latent_noise_mut"
 
         # Load VAE config
         with open(config["vae_config_path"]) as f:
@@ -731,7 +742,8 @@ def main(config=None, project="JAXUED_TEST"):
     # Setup the environment
     env = Maze(max_height=config["maze_height"], max_width=config["maze_width"], agent_view_size=config["agent_view_size"], normalize_obs=True)
     eval_env = env
-    sample_random_level = make_level_generator(env.max_height, env.max_width, config["n_walls"])
+    sample_random_level = make_level_generator(env.max_height, env.max_width, config["n_walls"],
+                                                  uniform_wall_count=config.get("uniform_wall_count", False))
     env_renderer = MazeRenderer(env, tile_size=8)
     env = AutoReplayWrapper(env)
     env_params = env.default_params
@@ -1048,10 +1060,39 @@ def main(config=None, project="JAXUED_TEST"):
             """
             sampler = train_state.sampler
             rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
-            
-            # mutate
-            parent_levels = train_state.replay_last_level_batch
-            child_levels = jax.vmap(mutate_level, (0, 0, None))(jax.random.split(rng_mutate, config["num_train_envs"]), parent_levels, config["num_edits"])
+
+            if config.get("use_latent_noise_mut"):
+                # Latent-noise mutation: sample top-K buffer levels, encode to VAE latent,
+                # add N(0, sigma) noise, repeat per_parent times, decode to levels.
+                top_k = config["latent_noise_top_k"]
+                per_parent = config["latent_noise_per_parent"]
+                sigma = config["latent_noise_sigma"]
+                n_envs = config["num_train_envs"]
+
+                # Select top-K by score (masked so invalid slots never chosen)
+                _mask = jnp.arange(level_sampler.capacity) < sampler["size"]
+                _scores_masked = jnp.where(_mask, sampler["scores"], -jnp.inf)
+                top_idx = jnp.argsort(-_scores_masked)[:top_k]  # (top_k,)
+                top_levels = jax.tree_util.tree_map(lambda x: x[top_idx], sampler["levels"])
+
+                # Encode top-K to latent means (top_k, latent_dim)
+                top_tokens = jax.vmap(level_to_tokens_vae)(top_levels)
+                top_means = vae_encode_fn(top_tokens)
+
+                # Repeat each parent per_parent times → (top_k * per_parent, latent_dim)
+                z_parents = jnp.repeat(top_means, per_parent, axis=0)[:n_envs]
+
+                # Add Gaussian noise
+                rng_noise, rng_decode = jax.random.split(rng_mutate, 2)
+                noise = jax.random.normal(rng_noise, z_parents.shape) * sigma
+                z_children = z_parents + noise
+
+                # Decode to levels
+                child_levels = decode_latent_to_levels_vae(vae_decode_fn, z_children, rng_decode)
+            else:
+                # ACCEL wall-flip mutations on last replay batch
+                parent_levels = train_state.replay_last_level_batch
+                child_levels = jax.vmap(mutate_level, (0, 0, None))(jax.random.split(rng_mutate, config["num_train_envs"]), parent_levels, config["num_edits"])
             init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["num_train_envs"]), child_levels, env_params)
 
             # rollout
@@ -2174,12 +2215,27 @@ if __name__=="__main__":
     # === ACCEL ===
     group.add_argument("--use_accel", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--num_edits", type=int, default=5)
+    # === Latent-noise mutations (alternative ACCEL mutator) ===
+    # Replaces wall-flip mutations with Gaussian perturbations in VAE latent space.
+    # Selects top-K buffer levels by score, encodes to latent, adds N(0, sigma) noise,
+    # decodes. Produces `latent_noise_top_k * latent_noise_per_parent` children per step
+    # (must equal num_train_envs). Requires a VAE (use_cmaes=True loads one).
+    group.add_argument("--use_latent_noise_mut", action=argparse.BooleanOptionalAction, default=False,
+                       help="Replace ACCEL wall-flip mutations with VAE latent-space Gaussian perturbations")
+    group.add_argument("--latent_noise_top_k", type=int, default=8,
+                       help="Number of top-scoring buffer levels to use as parents")
+    group.add_argument("--latent_noise_per_parent", type=int, default=4,
+                       help="Children per parent. top_k * per_parent must equal num_train_envs")
+    group.add_argument("--latent_noise_sigma", type=float, default=0.3,
+                       help="Standard deviation of Gaussian noise in latent space")
     # === ENV CONFIG ===
     group.add_argument("--maze_height", type=int, default=13)
     group.add_argument("--maze_width", type=int, default=13)
     group.add_argument("--agent_view_size", type=int, default=5)
     # === DR CONFIG ===
     group.add_argument("--n_walls", type=int, default=25)
+    group.add_argument("--uniform_wall_count", action=argparse.BooleanOptionalAction, default=False,
+                       help="Sample wall count uniformly from [0, n_walls] per level (ACCEL paper DR setup)")
     # === CMA-ES + VAE CONFIG ===
     group.add_argument("--use_cmaes", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--vae_checkpoint_path", type=str, default=None,
