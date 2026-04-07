@@ -7,25 +7,33 @@ from enum import IntEnum
 import numpy as np
 from typing import Callable
 
-def make_level_generator(height: int, width: int, n_walls: int) -> Callable[[chex.PRNGKey], Level]:
+def make_level_generator(height: int, width: int, n_walls: int, uniform_wall_count: bool = False) -> Callable[[chex.PRNGKey], Level]:
     """This takes in a height, width and number of walls and returns a function that takes in a PRNGKey and returns a level.
 
     Args:
-        height (int): 
-        width (int): 
-        n_walls (int): 
+        height (int):
+        width (int):
+        n_walls (int): Max number of walls. If uniform_wall_count=True, the actual
+            count is sampled uniformly from [0, n_walls] per level.
+        uniform_wall_count (bool): If True, sample wall count uniformly from
+            [0, n_walls] for each level (matching the ACCEL paper's DR setup).
+            If False (default), always use exactly n_walls (original JaxUED behavior).
     """
     def sample(rng: chex.PRNGKey) -> Level:
         max_w, max_h = width, height
         all_pos = jnp.arange(max_w * max_h, dtype=jnp.uint32)
         valid_mask = (all_pos % max_w < width) & (all_pos < max_w * height)
-        
-        rng_wall, rng_agent_pos, rng_agent_dir, rng_goal = jax.random.split(rng, 4)
-        # n_walls = jax.random.choice(rng_n_walls, n_walls+1)
-        
+
+        rng_n_walls, rng_wall, rng_agent_pos, rng_agent_dir, rng_goal = jax.random.split(rng, 5)
+        _n_walls = jax.lax.cond(
+            uniform_wall_count,
+            lambda: jax.random.randint(rng_n_walls, (), 0, n_walls + 1),
+            lambda: n_walls,
+        )
+
         choices = jax.random.choice(rng_wall, max_w*max_h, shape=(max_w*max_h,), p=valid_mask, replace=True)
-        choices = jnp.where(all_pos < n_walls, choices, choices[0])
-        occupied_mask = jnp.zeros(max_w * max_h, dtype=jnp.bool_).at[choices].set(n_walls > 0) | ~valid_mask
+        choices = jnp.where(all_pos < _n_walls, choices, choices[0])
+        occupied_mask = jnp.zeros(max_w * max_h, dtype=jnp.bool_).at[choices].set(_n_walls > 0) | ~valid_mask
         wall_map = occupied_mask.reshape(max_h, max_w)
 
         # Reset agent position + dir
