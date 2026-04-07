@@ -1,0 +1,102 @@
+title: "21x21 Buffer Stats — All Methods"
+grid_size: 21
+timesteps: [250, 500, 1000, 2000, 3000, 5000, 7500, 10000, 15000, 20000, 25000, 30000]
+
+runs:
+  # PLR (no mutations, exploratory_grad_updates=True)
+  - name: "PLR s0"
+    gcs_prefix: accel/plr_sfl_21x21_v2
+    run_id: plr_sfl_21x21_v2
+    seed: 0
+  - name: "PLR s1"
+    gcs_prefix: accel/plr_sfl_21x21_v2
+    run_id: plr_sfl_21x21_v2
+    seed: 1
+  - name: "PLR s2"
+    gcs_prefix: accel/plr_sfl_21x21_v2
+    run_id: plr_sfl_21x21_v2
+    seed: 2
+
+  # ACCEL (wall-flip mutations, no CMA-ES)
+  - name: "ACCEL s3"
+    gcs_prefix: accel/accel_sfl_21x21_v2
+    run_id: accel_sfl_21x21_v2
+    seed: 3
+  - name: "ACCEL s4"
+    gcs_prefix: accel/accel_sfl_21x21_v2
+    run_id: accel_sfl_21x21_v2
+    seed: 4
+  - name: "ACCEL s5"
+    gcs_prefix: accel/accel_sfl_21x21_v2
+    run_id: accel_sfl_21x21_v2
+    seed: 5
+
+  # CMA-ES + PLR (no mutations)
+  - name: "CMA-ES+PLR s0"
+    gcs_prefix: accel/cmaes_plr_nomut_sfl_21x21_v3
+    run_id: cmaes_plr_nomut_sfl_21x21_v3
+    seed: 0
+  - name: "CMA-ES+PLR s1"
+    gcs_prefix: accel/cmaes_plr_nomut_sfl_21x21_v3
+    run_id: cmaes_plr_nomut_sfl_21x21_v3
+    seed: 1
+  - name: "CMA-ES+PLR s2"
+    gcs_prefix: accel/cmaes_plr_nomut_sfl_21x21_v3
+    run_id: cmaes_plr_nomut_sfl_21x21_v3
+    seed: 2
+
+  # CMA-ES + ACCEL (wall-flip mutations)
+  - name: "CMA-ES+ACCEL s0"
+    gcs_prefix: accel/cmaes_accel_sfl_21x21_v2
+    run_id: cmaes_accel_sfl_21x21_v2
+    seed: 0
+  - name: "CMA-ES+ACCEL s1"
+    gcs_prefix: accel/cmaes_accel_sfl_21x21_v2
+    run_id: cmaes_accel_sfl_21x21_v2
+    seed: 1
+  - name: "CMA-ES+ACCEL s2"
+    gcs_prefix: accel/cmaes_accel_sfl_21x21_v2
+    run_id: cmaes_accel_sfl_21x21_v2
+    seed: 2
+
+  # CMA-ES + Latent Interpolation mutations
+  - name: "CMA-ES+LatInterp s3"
+    gcs_prefix: accel/cmaes_latent_mut_sfl_21x21_v2
+    run_id: cmaes_latent_mut_sfl_21x21_v2
+    seed: 3
+  - name: "CMA-ES+LatInterp s4"
+    gcs_prefix: accel/cmaes_latent_mut_sfl_21x21_v2
+    run_id: cmaes_latent_mut_sfl_21x21_v2
+    seed: 4
+  - name: "CMA-ES+LatInterp s5"
+    gcs_prefix: accel/cmaes_latent_mut_sfl_21x21_v2
+    run_id: cmaes_latent_mut_sfl_21x21_v2
+    seed: 5
+
+  # CMA-ES + Latent Noise mutations
+  - name: "CMA-ES+LatNoise s0"
+    gcs_prefix: accel/cmaes_plr_latentnoise_21x21_v1
+    run_id: cmaes_plr_latentnoise_21x21_v1
+    seed: 0
+  - name: "CMA-ES+LatNoise s1"
+    gcs_prefix: accel/cmaes_plr_latentnoise_21x21_v1
+    run_id: cmaes_plr_latentnoise_21x21_v1
+    seed: 1
+  - name: "CMA-ES+LatNoise s2"
+    gcs_prefix: accel/cmaes_plr_latentnoise_21x21_v1
+    run_id: cmaes_plr_latentnoise_21x21_v1
+    seed: 2
+
+  # CMA-ES only (no PLR replay)
+  - name: "CMA-ES only s0"
+    gcs_prefix: accel/cmaes_only_sfl_21x21_v3
+    run_id: cmaes_only_sfl_21x21_v3
+    seed: 0
+  - name: "CMA-ES only s1"
+    gcs_prefix: accel/cmaes_only_sfl_21x21_v3
+    run_id: cmaes_only_sfl_21x21_v3
+    seed: 1
+  - name: "CMA-ES only s2"
+    gcs_prefix: accel/cmaes_only_sfl_21x21_v3
+    run_id: cmaes_only_sfl_21x21_v3
+    seed: 2
