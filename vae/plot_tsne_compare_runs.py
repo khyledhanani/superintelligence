@@ -115,6 +115,12 @@ def load_buffer_dump(path):
 
 
 def compute_embeddings(tokens, checkpoint_dir, ckpt_step, batch_size=256, num_rollouts=5):
+    """Compute 257D behavioral embeddings and fresh SFL learnability scores.
+
+    Returns (embeddings, sfl) where:
+        embeddings: (N, 257) averaged over num_rollouts
+        sfl: (N,) = p*(1-p) where p = solve rate over num_rollouts
+    """
     from cross_evaluate import load_agent, tokens_to_levels_batch
     from maze_plr import ActorCritic, sample_trajectories_rnn, compute_insertion_embeddings
     from jaxued.environments import Maze
@@ -124,7 +130,7 @@ def compute_embeddings(tokens, checkpoint_dir, ckpt_step, batch_size=256, num_ro
 
     train_state, config, env, env_params = load_agent(checkpoint_dir, checkpoint_step=ckpt_step)
     if train_state is None:
-        return None
+        return None, None
 
     maze_h = config.get("maze_height", 13)
     maze_w = config.get("maze_width", 13)
@@ -136,9 +142,11 @@ def compute_embeddings(tokens, checkpoint_dir, ckpt_step, batch_size=256, num_ro
     levels = tokens_to_levels_batch(tokens)
     n_levels = len(tokens)
     all_embeddings = np.zeros((n_levels, 257), dtype=np.float32)
+    all_solved = []  # list of (N,) bool arrays, one per rollout
 
     for rollout_idx in range(num_rollouts):
         rollout_embs = []
+        rollout_solved = []
         for start in range(0, n_levels, batch_size):
             end = min(start + batch_size, n_levels)
             chunk_levels = jax.tree_util.tree_map(lambda x: x[start:end], levels)
@@ -158,14 +166,21 @@ def compute_embeddings(tokens, checkpoint_dir, ckpt_step, batch_size=256, num_ro
                 init_hstate, init_obs, init_state,
                 n_chunk, max_steps,
             )
-            _, actions, _, dones, _, _, _, _, hstates = traj
+            _, actions, rewards, dones, _, _, _, _, hstates = traj
             embeddings = compute_insertion_embeddings(hstates, actions, dones)
             rollout_embs.append(np.array(embeddings))
+            # Solved if cumulative reward > 0
+            rollout_solved.append(np.array((rewards.sum(axis=0) > 0).astype(np.float32)))
 
         all_embeddings += np.concatenate(rollout_embs, axis=0)
+        all_solved.append(np.concatenate(rollout_solved, axis=0))
 
     all_embeddings /= num_rollouts
-    return all_embeddings
+    # SFL = p * (1-p) where p = solve rate across rollouts
+    solve_rate = np.stack(all_solved, axis=0).mean(axis=0)  # (N,)
+    sfl = solve_rate * (1 - solve_rate)
+
+    return all_embeddings, sfl
 
 
 def resolve_run_paths(run_cfg, timestep, local_data_root):
@@ -288,6 +303,47 @@ def plot_cell_uniform(ax, coords, color, label):
                rasterized=True, label=f"{label} ({len(coords)})")
 
 
+def plot_cell_learnability(ax, coords, sfl):
+    """Color points by SFL learnability (0=easy/hard, 0.25=maximally learnable)."""
+    sc = ax.scatter(coords[:, 0], coords[:, 1],
+                    c=sfl, cmap='viridis', s=5, alpha=0.5,
+                    edgecolors='none', rasterized=True,
+                    vmin=0, vmax=0.25)
+    return sc
+
+
+# Marker styles for origin+learnability combined mode
+ORIGIN_MARKERS_LLM = {
+    0: ("o", 3, "Organic"),
+    1: ("*", 30, "LLM orig"),
+    2: ("^", 6, "LLM mut"),
+}
+ORIGIN_MARKERS_CMAES = {
+    0: ("o", 3, "DR gen"),
+    1: ("D", 6, "CMA-ES gen"),
+    2: ("o", 3, "DR mut"),
+    3: ("D", 6, "CMA-ES mut"),
+}
+
+
+def plot_cell_origin_learnability(ax, coords, origins, sfl):
+    """Marker by origin, color by SFL learnability."""
+    unique = set(np.unique(origins).tolist())
+    markers = ORIGIN_MARKERS_CMAES if (3 in unique or (1 in unique and 0 not in unique)) else ORIGIN_MARKERS_LLM
+    last_sc = None
+    for origin_val in sorted(markers.keys()):
+        mask = origins == origin_val
+        if mask.sum() == 0:
+            continue
+        marker, size, label = markers[origin_val]
+        sc = ax.scatter(coords[mask, 0], coords[mask, 1],
+                        c=sfl[mask], cmap='viridis', s=size, alpha=0.5,
+                        marker=marker, edgecolors='none', rasterized=True,
+                        vmin=0, vmax=0.25, label=f"{label} ({mask.sum()})")
+        last_sc = sc
+    return last_sc
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -302,6 +358,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_rollouts", type=int, default=5)
     parser.add_argument("--cache_only", action="store_true")
+    parser.add_argument("--gcs_cache_prefix", type=str, default=None,
+                        help="GCS prefix for cache. Upload immediately and delete local file.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -310,7 +368,11 @@ def main():
     runs = cfg["runs"]
     timesteps = cfg.get("timesteps", [250, 1000, 3000, 5000, 7000, 10000])
     title = cfg.get("title", "Buffer Embedding Comparison")
-    color_by_origin = cfg.get("color_by_origin", False)
+    # color_by: "origin", "learnability", or "both" (produces 2 plots)
+    color_by = cfg.get("color_by", "origin")
+    # backward compat
+    if "color_by_origin" in cfg and "color_by" not in cfg:
+        color_by = "origin" if cfg["color_by_origin"] else "uniform"
 
     if args.cache_dir:
         os.makedirs(args.cache_dir, exist_ok=True)
@@ -332,9 +394,11 @@ def main():
             key = (ri, ts)
             print(f"\n  [{run_name}] update {ts}:")
 
-            # Check cache
+            # Check cache (local first, then GCS)
             if args.cache_dir:
                 cache_path = os.path.join(args.cache_dir, f"emb_{cache_id}_t{ts}.npz")
+                if not os.path.exists(cache_path) and args.gcs_cache_prefix:
+                    gcs_download(f"{args.gcs_cache_prefix}/emb_{cache_id}_t{ts}.npz", cache_path)
                 if os.path.exists(cache_path):
                     print(f"    Loading from cache")
                     cached = np.load(cache_path, allow_pickle=True)
@@ -346,6 +410,8 @@ def main():
                     }
                     if "origins" in cached:
                         d["origins"] = cached["origins"]
+                    if "sfl" in cached:
+                        d["sfl"] = cached["sfl"]
                     data[key] = d
                     continue
                 elif args.cache_only:
@@ -368,8 +434,8 @@ def main():
                 print(f"    SKIP: checkpoint not found")
                 continue
 
-            print(f"    {buf['size']} levels, computing embeddings (step {ckpt_step}, {args.num_rollouts} rollouts)...")
-            embeddings = compute_embeddings(
+            print(f"    {buf['size']} levels, computing embeddings + SFL (step {ckpt_step}, {args.num_rollouts} rollouts)...")
+            embeddings, sfl = compute_embeddings(
                 buf["tokens"], ckpt_dir, ckpt_step,
                 batch_size=args.batch_size,
                 num_rollouts=args.num_rollouts,
@@ -381,6 +447,7 @@ def main():
             d = {
                 "embeddings": embeddings,
                 "scores": buf["scores"],
+                "sfl": sfl,
                 "color": run_color,
                 "label": run_name,
             }
@@ -388,80 +455,123 @@ def main():
                 d["origins"] = buf["origins"]
             data[key] = d
 
-            # Cache
+            # Cache locally, upload to GCS, then delete local copy
             if args.cache_dir:
                 save_dict = {
                     "embeddings": embeddings,
                     "scores": buf["scores"],
+                    "sfl": sfl,
                 }
                 if "origins" in buf:
                     save_dict["origins"] = buf["origins"]
                 np.savez_compressed(cache_path, **save_dict)
-                print(f"    Cached")
+                # Upload immediately to GCS and remove local file
+                if args.gcs_cache_prefix:
+                    try:
+                        blob = _get_bucket().blob(f"{args.gcs_cache_prefix}/{os.path.basename(cache_path)}")
+                        blob.upload_from_filename(cache_path)
+                        os.remove(cache_path)
+                        print(f"    Uploaded to GCS, local removed")
+                    except Exception as e:
+                        print(f"    Cached locally (GCS upload failed: {e})")
+                else:
+                    print(f"    Cached locally")
 
     if not data:
         print("No data loaded.")
         return
 
-    # --- Plot ---
-    print(f"\n=== Plotting {n_rows}x{n_cols} grid ===")
-    fig, axes = plt.subplots(n_rows, n_cols,
-                              figsize=(3.5 * n_cols, 3.5 * n_rows),
-                              squeeze=False)
-
+    # --- Pre-compute per-cell t-SNE coordinates (shared across color modes) ---
+    print(f"\n=== Computing per-cell t-SNE ===")
+    tsne_coords = {}
     n_done = 0
     n_total = sum(1 for k in data)
-
     for ri, run in enumerate(runs):
         for j, ts in enumerate(timesteps):
-            ax = axes[ri][j]
             key = (ri, ts)
-
             if key not in data:
-                ax.text(0.5, 0.5, "N/A", ha='center', va='center',
-                        transform=ax.transAxes, fontsize=12, color='red')
-                ax.set_title(f"{run['name']}\n{ts} upd", fontsize=8)
-                ax.set_xticks([])
-                ax.set_yticks([])
                 continue
-
-            d = data[key]
             n_done += 1
-            print(f"  t-SNE: {run['name']}, {ts} upd ({len(d['embeddings'])} pts) [{n_done}/{n_total}]")
-
-            perp = min(args.tsne_perplexity, len(d["embeddings"]) - 1)
+            emb = data[key]["embeddings"]
+            print(f"  t-SNE: {run['name']}, {ts} upd ({len(emb)} pts) [{n_done}/{n_total}]")
+            perp = min(args.tsne_perplexity, len(emb) - 1)
             tsne = TSNE(n_components=2, perplexity=perp,
                         random_state=42, max_iter=1000, learning_rate='auto', init='pca')
-            coords = tsne.fit_transform(d["embeddings"])
+            tsne_coords[key] = tsne.fit_transform(emb)
 
-            if color_by_origin and "origins" in d:
-                plot_cell_with_origins(ax, coords, d["origins"])
-            else:
-                plot_cell_uniform(ax, coords, d["color"], d["label"])
+    # --- Determine which plots to produce ---
+    mode_map = {
+        "origin": ["origin"],
+        "learnability": ["learnability"],
+        "combined": ["combined"],
+        "both": ["origin", "learnability"],
+        "all": ["origin", "learnability", "combined"],
+    }
+    color_modes = mode_map.get(color_by, ["origin"])
 
-            ax.set_title(f"{run['name']}\n{ts} upd ({len(d['embeddings'])} lvls)", fontsize=8)
-            ax.set_xticks([])
-            ax.set_yticks([])
+    base_output = args.output or os.path.join(os.path.dirname(args.config), "tsne_comparison.png")
 
-            if ri == 0 and j == 0:
-                ax.legend(fontsize=5, loc='lower left', framealpha=0.7)
+    for mode in color_modes:
+        print(f"\n=== Plotting {n_rows}x{n_cols} grid (color_by={mode}) ===")
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                  figsize=(3.5 * n_cols, 3.5 * n_rows),
+                                  squeeze=False)
+        last_sc = None
 
-        # Row label
-        axes[ri][0].set_ylabel(run["name"], fontsize=10, rotation=90, labelpad=10)
+        for ri, run in enumerate(runs):
+            for j, ts in enumerate(timesteps):
+                ax = axes[ri][j]
+                key = (ri, ts)
 
-    plt.suptitle(f"{title}\n({args.num_rollouts}-rollout embeddings, per-cell t-SNE)",
-                 fontsize=13, y=1.01)
-    plt.tight_layout()
+                if key not in data:
+                    ax.text(0.5, 0.5, "N/A", ha='center', va='center',
+                            transform=ax.transAxes, fontsize=12, color='red')
+                    ax.set_title(f"{run['name']}\n{ts} upd", fontsize=8)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    continue
 
-    if args.output:
-        out_path = args.output
-    else:
-        out_path = os.path.join(os.path.dirname(args.config), "tsne_comparison.png")
+                d = data[key]
+                coords = tsne_coords[key]
 
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"\nSaved: {out_path}")
+                if mode == "combined" and "origins" in d and "sfl" in d:
+                    last_sc = plot_cell_origin_learnability(ax, coords, d["origins"], d["sfl"])
+                elif mode == "learnability" and "sfl" in d:
+                    last_sc = plot_cell_learnability(ax, coords, d["sfl"])
+                elif mode == "origin" and "origins" in d:
+                    plot_cell_with_origins(ax, coords, d["origins"])
+                else:
+                    plot_cell_uniform(ax, coords, d.get("color", "grey"), d.get("label", ""))
+
+                ax.set_title(f"{run['name']}\n{ts} upd ({len(d['embeddings'])} lvls)", fontsize=8)
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+                if ri == 0 and j == 0 and mode in ("origin", "combined"):
+                    ax.legend(fontsize=5, loc='lower left', framealpha=0.7)
+
+            axes[ri][0].set_ylabel(run["name"], fontsize=10, rotation=90, labelpad=10)
+
+        subtitles = {
+            "origin": "colored by origin",
+            "learnability": "colored by SFL learnability",
+            "combined": "marker=origin, color=SFL learnability",
+        }
+        plt.suptitle(f"{title}\n({args.num_rollouts}-rollout, {subtitles[mode]})",
+                     fontsize=13, y=1.01)
+
+        if mode in ("learnability", "combined") and last_sc is not None:
+            fig.colorbar(last_sc, ax=axes, label="SFL = p(1-p)", shrink=0.6, pad=0.02)
+
+        plt.tight_layout()
+
+        stem, ext = os.path.splitext(base_output)
+        out_path = f"{stem}_{mode}{ext}" if len(color_modes) > 1 else base_output
+
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  Saved: {out_path}")
 
 
 if __name__ == "__main__":
