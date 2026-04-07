@@ -290,6 +290,22 @@ class AgentEvaluator:
             "solve_rate": float(np.mean(solved)),
             "all_returns": returns,
         }
+
+        # Mean 257D embedding averaged across ALL rollouts (not just best)
+        # Matches compute_insertion_embeddings() in maze_plr.py
+        all_hstates = results["hstates"]    # (T, N, 256)
+        all_actions = results["actions"]     # (T, N)
+        all_dones = results["dones"]         # (T, N)
+        # Episode mask: 1 up to and including first done, 0 after
+        pre_done = np.concatenate([np.zeros((1, n_rollouts)), all_dones[:-1]], axis=0)
+        episode_mask = (np.cumsum(pre_done, axis=0) == 0).astype(np.float32)  # (T, N)
+        ep_lengths = np.maximum(episode_mask.sum(axis=0), 1.0)  # (N,)
+        # Per-rollout mean embeddings
+        mean_h = (all_hstates * episode_mask[..., None]).sum(axis=0) / ep_lengths[..., None]  # (N, 256)
+        mean_a = (all_actions.astype(np.float32) * episode_mask).sum(axis=0) / ep_lengths  # (N,)
+        per_rollout_emb = np.concatenate([mean_h, mean_a[:, None]], axis=-1)  # (N, 257)
+        traj["mean_embedding"] = per_rollout_emb.mean(axis=0)  # (257,)
+
         return traj
 
     def evaluate_levels(self, levels: list) -> List[dict]:
@@ -320,6 +336,40 @@ class AgentEvaluator:
             }
             trajectories.append(traj)
         return trajectories
+
+    def compute_embeddings(self, levels: list, n_rollouts: int = 5) -> np.ndarray:
+        """Compute mean 257D embeddings for multiple levels, averaged over rollouts.
+
+        Matches the methodology in plot_tsne_training_evolution.py:
+        compute_insertion_embeddings() averaged over n_rollouts independent
+        rollouts per level.
+
+        Args:
+            levels: List of Level objects
+            n_rollouts: Number of rollouts to average (default: 5)
+
+        Returns:
+            (N, 257) array of mean [hstate(256), action(1)] embeddings
+        """
+        batched_levels = Level.stack(levels)
+        n = len(levels)
+        embeddings = np.zeros((n, 257), dtype=np.float32)
+
+        for _ in range(n_rollouts):
+            results = self._evaluate_batch(batched_levels, n)
+            hstates = results["hstates"]   # (T, N, 256)
+            actions = results["actions"]    # (T, N)
+            dones = results["dones"]        # (T, N)
+            # Episode mask: 1 up to and including first done, 0 after
+            pre_done = np.concatenate([np.zeros((1, n)), dones[:-1]], axis=0)
+            episode_mask = (np.cumsum(pre_done, axis=0) == 0).astype(np.float32)
+            ep_lengths = np.maximum(episode_mask.sum(axis=0), 1.0)
+            mean_h = (hstates * episode_mask[..., None]).sum(axis=0) / ep_lengths[..., None]
+            mean_a = (actions.astype(np.float32) * episode_mask).sum(axis=0) / ep_lengths
+            embeddings += np.concatenate([mean_h, mean_a[:, None]], axis=-1)
+
+        embeddings /= n_rollouts
+        return embeddings
 
     def _evaluate_batch(self, batched_levels, num_levels: int) -> dict:
         """Run the agent on a batch of levels.

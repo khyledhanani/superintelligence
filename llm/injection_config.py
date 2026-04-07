@@ -1,10 +1,16 @@
 """LLM injection configuration dataclass for maze_plr.py training loop integration.
 
-Holds all parameters controlling when, how, and at what rate LLM-generated mazes
-are injected into the PLR buffer during training. CLI flags on maze_plr.py populate
-this config via from_config_dict().
+Holds parameters controlling when, how, and at what rate LLM-generated mazes
+are injected into the PLR buffer during training.
+
+Shared LLM generation parameters (provider, model, reference strategy, gate
+thresholds, prompt metrics) live in config.yaml — this dataclass only holds
+injection-specific parameters that have no equivalent in config.yaml.
+
+CLI flags on maze_plr.py can override any config.yaml value.
 """
 
+import os
 from dataclasses import dataclass
 
 
@@ -12,70 +18,56 @@ from dataclasses import dataclass
 class LLMInjectionConfig:
     """Configuration for LLM-based maze injection into PLR training loop.
 
-    All fields have sensible defaults. When using from_config_dict(), values are
-    extracted from the CLI config dict produced by vars(parser.parse_args()).
-
-    Phase 1 note: score_seeds_with_rollout defaults to False. Full policy rollout
-    scoring (Tier 1 from CONTEXT.md) is deferred to Phase 2 when AgentEvaluator
-    is wired in. Phase 1 uses max-priority insertion only.
+    Shared parameters (reference strategy, gate thresholds, etc.) are loaded
+    from config.yaml via from_config_dict(). Injection-specific parameters
+    (timing, batch size, mutation, buffer targets) are set here.
     """
 
     # Core toggles
-    enabled: bool = False              # --use_llm sets this True
-    provider: str = ""                 # --llm_provider (required when enabled)
-    model: str = ""                    # --llm_model
+    enabled: bool = True              # --use_llm
     config_path: str = ""              # --llm_config (path to llm/config.yaml)
 
+    # --- Injection-specific (no config.yaml equivalent) ---
+
     # Timing
-    injection_interval: int = 3000     # --llm_inject_interval (eval steps between injections)
-    inject_start_step: int = 5000      # --llm_inject_start_step (no injection before this training step)
+    injection_interval: int = 5000     # --llm_inject_interval (eval steps between injections)
+    inject_start_step: int = 5000      # --llm_inject_start_step
 
-    # LLM generation
-    n_raw: int = 25                    # --llm_batch_size (mazes requested per injection)
-    reference_maze_strategy: str = "hardest"  # --llm_ref_strategy
-    n_reference_mazes: int = 5         # --llm_n_references
-
-    # Diversity gate (Phase 2: enabled by default; locked decisions from CONTEXT.md)
-    gate_enabled: bool = True               # --llm_gate
-    difficulty_threshold: float = 0.6       # --llm_difficulty_threshold
-    difficulty_gate_mode: str = "fixed"     # --llm_difficulty_gate_mode
-    #   "fixed": use difficulty_threshold as absolute floor
-    #   "buffer_mean": threshold = mean score across entire buffer
-    #   "reference_mean": threshold = mean score of N reference mazes
-    #   "competitive": no difficulty gate, insert with actual SFL score (same as ACCEL)
-    min_diversity: float = 0.02             # --llm_min_diversity
-    diversity_gate_mode: str = "fixed"      # --llm_diversity_gate_mode
-    #   "fixed": use min_diversity as absolute floor
-    #   "buffer_median": threshold = median pairwise distance among N reference mazes
-    #   "disabled": no diversity gate
-    diversity_metric: str = "td_error_emd"  # --llm_diversity_metric
-    max_diversity_retries: int = 3          # --llm_max_diversity_retries
-    n_rollouts_gate: int = 50               # --llm_n_rollouts (rollouts per candidate)
+    # Batch sizing
+    n_raw: int = 10                    # --llm_batch_size (mazes per injection round)
+    target_buffer_pct: float = 0.05     # --llm_target_buffer_pct (0=disabled, 0.05=5%)
 
     # Mutation amplification
     amplification_enabled: bool = True   # --llm_amplification
     mutations_per_seed: int = 30         # --llm_mutations_per_seed
-    use_native_regret_filter: bool = True
-
-    # Scoring strategy
-    # NOTE: seed rollout scoring (Tier 1 from CONTEXT.md) is deferred to Phase 2
-    # when AgentEvaluator is wired in. Phase 1 uses max-priority insertion only.
-    score_seeds_with_rollout: bool = False    # Phase 2 sets True when AgentEvaluator exists
-    score_mutations_with_rollout: bool = False
     mutations_solvability_check: bool = True
 
-    # Buffer injection
-    max_inject_per_event: int = 200    # --llm_max_inject_per_event
+    # --- Shared with config.yaml (CLI overrides YAML) ---
+    # These are populated from config.yaml with CLI flag overrides.
 
-    # Tracking
-    track_lineage: bool = True
+    buffer_state: str = ""             # "stale" or "fresh" (default from config.yaml)
+    provider: str = ""                 # --llm_provider
+    model: str = ""                    # --llm_model
+    reference_maze_strategy: str = ""  # --llm_ref_strategy (default from config.yaml)
+    n_reference_mazes: int = 0         # --llm_n_references (default from config.yaml)
+    hybrid_difficulty_percentile: float = 0.0  # --llm_hybrid_difficulty_percentile
+
+    # Gate
+    gate_enabled: bool = True               # --llm_gate
+    difficulty_threshold: float = 0.0       # --llm_difficulty_threshold
+    difficulty_gate_mode: str = ""          # --llm_difficulty_gate_mode
+    min_diversity: float = 0.0              # --llm_min_diversity
+    diversity_gate_mode: str = ""           # --llm_diversity_gate_mode
+    diversity_metric: str = ""              # --llm_diversity_metric
+    max_diversity_retries: int = 0          # --llm_max_diversity_retries
+    n_rollouts_gate: int = 0               # --llm_n_rollouts
 
     @classmethod
     def from_config_dict(cls, config: dict) -> "LLMInjectionConfig":
-        """Construct LLMInjectionConfig from a CLI config dict.
+        """Construct LLMInjectionConfig from CLI config dict + config.yaml.
 
-        Maps CLI flag names (snake_case from argparse dest) to dataclass fields.
-        Validates that --llm_provider is set when --use_llm is True.
+        Loads config.yaml (via --llm_config path) for shared defaults,
+        then applies CLI flag overrides.
 
         Args:
             config: dict from vars(parser.parse_args()) in maze_plr.py
@@ -86,27 +78,58 @@ class LLMInjectionConfig:
         Raises:
             ValueError: if use_llm=True and llm_provider is empty
         """
+        # Load config.yaml defaults
+        yaml_cfg = {}
+        config_path = config.get("llm_config", "")
+        if config_path and os.path.exists(config_path):
+            import yaml
+            with open(config_path) as f:
+                yaml_cfg = yaml.safe_load(f) or {}
+
+        gate_cfg = yaml_cfg.get("gate", {})
+
+        # Helper: CLI value wins if present, else YAML value, else hardcoded default.
+        # Uses None as sentinel — argparse defaults should be None for shared fields
+        # so we can distinguish "not set" from "set to 0".
+        def _resolve(cli_key, yaml_key, default, yaml_dict=yaml_cfg):
+            cli_val = config.get(cli_key)
+            if cli_val is not None:
+                return cli_val
+            yaml_val = yaml_dict.get(yaml_key)
+            if yaml_val is not None:
+                return yaml_val
+            return default
+
         instance = cls(
+            # Core
             enabled=config.get("use_llm", False),
-            provider=config.get("llm_provider", ""),
-            model=config.get("llm_model", ""),
-            config_path=config.get("llm_config", ""),
-            injection_interval=config.get("llm_inject_interval", 3000),
+            config_path=config_path,
+
+            # Injection-specific (CLI only)
+            injection_interval=config.get("llm_inject_interval", 5000),
             inject_start_step=config.get("llm_inject_start_step", config.get("llm_warmup_steps", 5000)),
             n_raw=config.get("llm_batch_size", 25),
-            reference_maze_strategy=config.get("llm_ref_strategy", "hardest"),
-            n_reference_mazes=config.get("llm_n_references", 5),
-            gate_enabled=config.get("llm_gate", True),
-            difficulty_threshold=config.get("llm_difficulty_threshold", 0.6),
-            difficulty_gate_mode=config.get("llm_difficulty_gate_mode", "fixed"),
-            min_diversity=config.get("llm_min_diversity", 0.02),
-            diversity_gate_mode=config.get("llm_diversity_gate_mode", "fixed"),
-            diversity_metric=config.get("llm_diversity_metric", "td_error_emd"),
-            max_diversity_retries=config.get("llm_max_diversity_retries", 2),
-            n_rollouts_gate=config.get("llm_n_rollouts", 50),
+            target_buffer_pct=config.get("llm_target_buffer_pct", 0.0),
             amplification_enabled=config.get("llm_amplification", True),
             mutations_per_seed=config.get("llm_mutations_per_seed", 30),
-            max_inject_per_event=config.get("llm_max_inject_per_event", 200),
+            buffer_state=_resolve("llm_buffer_state", "buffer_state", "stale"),
+
+            # Shared: CLI flag → config.yaml → hardcoded default
+            provider=_resolve("llm_provider", "provider", ""),
+            model=_resolve("llm_model", "model", ""),
+            reference_maze_strategy=_resolve("llm_ref_strategy", "strategy", "hardest"),
+            n_reference_mazes=_resolve("llm_n_references", "num_refs", 5),
+            hybrid_difficulty_percentile=_resolve("llm_hybrid_difficulty_percentile", "hybrid_difficulty_percentile", 50.0),
+
+            # Gate: CLI flag → config.yaml gate: sub-dict → hardcoded default
+            gate_enabled=_resolve("llm_gate", "enabled", True, gate_cfg),
+            difficulty_threshold=_resolve("llm_difficulty_threshold", "difficulty_threshold", 0.1, gate_cfg),
+            difficulty_gate_mode=_resolve("llm_difficulty_gate_mode", "difficulty_gate_mode", "buffer_mean", gate_cfg),
+            min_diversity=_resolve("llm_min_diversity", "min_diversity", 0.4, gate_cfg),
+            diversity_gate_mode=_resolve("llm_diversity_gate_mode", "diversity_gate_mode", "fixed", gate_cfg),
+            diversity_metric=_resolve("llm_diversity_metric", "diversity_metric", "embedding_l2", gate_cfg),
+            max_diversity_retries=_resolve("llm_max_diversity_retries", "max_diversity_retries", 3, gate_cfg),
+            n_rollouts_gate=_resolve("llm_n_rollouts", "n_rollouts", 50, gate_cfg),
         )
 
         if instance.enabled and not instance.provider:

@@ -46,462 +46,13 @@ from llm.prompt_builder import (
     PairwiseMetricEntry,
     overlay_path_on_grid,
 )
-from metrics.standalone.per_step_entropy import compute_per_step_entropy
-from metrics.standalone.per_step_regret import compute_per_step_regret
-from metrics.standalone.per_step_action import compute_per_step_action
+from llm.buffer_stats import npz_to_sampler, BufferStatsExtractor
+from llm.reference_metrics import enrich_references_with_metrics
 from metrics.standalone.regret import compute_regret
-from metrics.standalone.learnability import compute_learnability
-from metrics.standalone.value_error import compute_value_error
-from metrics.pairwise.pos_dtw import position_trace_dtw
-from metrics.pairwise.mode_transition import mode_transition_divergence, compute_baseline_stats
-from metrics.pairwise.td_error_distribution import td_error_divergence
 from metrics.utils import downsample, format_vector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
-
-# --- Buffer loading ---
-
-def load_buffer(path: str) -> dict:
-    """Load a buffer dump .npz file.
-
-    Returns dict with keys: tokens (N, 52), scores (N,), size (int), etc.
-    """
-    data = np.load(path)
-    info = {k: data[k] for k in data.files}
-    size = int(info.get("size", len(info["tokens"])))
-    logger.info(f"Loaded buffer: {size} levels, tokens shape {info['tokens'].shape}")
-    return info
-
-
-def tokens_to_ascii(tokens: np.ndarray) -> str:
-    """Convert a 52-token sequence to ASCII maze grid via Level.to_str()."""
-    tokens_jax = jnp.array(tokens, dtype=jnp.int32)
-    level = tokens_to_level(tokens_jax)
-    return level.to_str()
-
-
-def tokens_to_level_obj(tokens: np.ndarray):
-    """Convert a 52-token sequence to a Level object."""
-    tokens_jax = jnp.array(tokens, dtype=jnp.int32)
-    return tokens_to_level(tokens_jax)
-
-
-# --- Reference maze selection ---
-
-def select_references(
-    tokens: np.ndarray,
-    scores: np.ndarray,
-    size: int,
-    n: int = 3,
-    strategy: str = "top_regret",
-) -> list:
-    """Select reference mazes from the buffer.
-
-    Args:
-        tokens: (capacity, 52) token array
-        scores: (capacity,) score array
-        size: number of active levels
-        n: number of references to select
-        strategy: "top_regret", "random", or "diverse"
-
-    Returns:
-        List of (index, tokens, score) tuples
-    """
-    active_tokens = tokens[:size]
-    active_scores = scores[:size]
-
-    if strategy == "top_regret":
-        # Top n by score (regret)
-        top_indices = np.argsort(active_scores)[::-1][:n]
-    elif strategy == "random":
-        top_indices = np.random.choice(size, min(n, size), replace=False)
-    elif strategy == "diverse":
-        # Spread across score range: pick from quartiles
-        sorted_idx = np.argsort(active_scores)
-        step = max(1, len(sorted_idx) // n)
-        top_indices = sorted_idx[::step][:n]
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
-    refs = []
-    for idx in top_indices:
-        refs.append((int(idx), active_tokens[idx], float(active_scores[idx])))
-    return refs
-
-
-def select_references_diverse(
-    tokens: np.ndarray,
-    scores: np.ndarray,
-    size: int,
-    evaluator,
-    n: int = 3,
-    pool_size: int = 20,
-    metric: str = "td_error_emd",
-) -> list:
-    """Select maximally diverse references using pairwise trajectory metrics.
-
-    Picks a candidate pool (top by regret), runs agent rollouts, computes
-    pairwise diversity, and greedily selects N references that maximize
-    the minimum pairwise distance.
-
-    Args:
-        tokens: (capacity, 52) token array
-        scores: (capacity,) score array
-        size: number of active levels
-        evaluator: AgentEvaluator instance (already loaded)
-        n: number of references to select
-        pool_size: candidate pool size (top by regret)
-        metric: pairwise metric to maximize. One of:
-            "td_error_emd" — Earth Mover's Distance between TD error distributions
-            "experience_divergence" — KL divergence between mode transition matrices
-            "position_dtw" — spatial path DTW distance
-
-    Returns:
-        List of (index, tokens, score) tuples
-    """
-    from metrics.pairwise.td_error_distribution import td_error_divergence
-    from metrics.pairwise.mode_transition import (
-        mode_transition_divergence,
-        compute_baseline_stats,
-    )
-    from metrics.pairwise.pos_dtw import position_trace_dtw
-
-    active_scores = scores[:size]
-    pool_k = min(pool_size, size)
-
-    # Candidate pool: top by regret
-    pool_indices = np.argsort(active_scores)[::-1][:pool_k]
-    logger.info(f"Diverse selection: pool of {pool_k} candidates, metric={metric}")
-
-    # Roll out agent on candidate pool
-    pool_levels = [tokens_to_level_obj(tokens[i]) for i in pool_indices]
-    logger.info(f"Rolling out agent on {pool_k} candidate levels...")
-    pool_trajectories = evaluator.evaluate_levels(pool_levels)
-
-    # Compute baseline stats for mode transition if needed
-    baseline_stats = None
-    if metric == "experience_divergence":
-        baseline_stats = compute_baseline_stats(pool_trajectories)
-        logger.info(
-            f"Mode baseline: error_threshold={baseline_stats['error_threshold']:.3f}, "
-            f"entropy_threshold={baseline_stats['entropy_threshold']:.3f}"
-        )
-
-    # Compute pairwise distance matrix
-    dist = np.zeros((pool_k, pool_k))
-    for i in range(pool_k):
-        for j in range(i + 1, pool_k):
-            ti, tj = pool_trajectories[i], pool_trajectories[j]
-            if metric == "td_error_emd":
-                result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
-                d = result["emd"]
-            elif metric == "experience_divergence":
-                result = mode_transition_divergence(
-                    ti, ti["dones"], tj, tj["dones"],
-                    entropy_a=ti.get("entropy"), entropy_b=tj.get("entropy"),
-                    baseline_stats=baseline_stats,
-                )
-                d = result["kl_divergence"]
-            elif metric == "position_dtw":
-                result = position_trace_dtw(
-                    ti["positions"], ti["dones"],
-                    tj["positions"], tj["dones"],
-                )
-                d = result["distance"]
-            else:
-                raise ValueError(f"Unknown diverse metric: {metric}")
-            dist[i, j] = d
-            dist[j, i] = d
-
-    # Greedy selection: maximize minimum pairwise distance
-    # Start with the pair that has the highest distance
-    best_pair = np.unravel_index(np.argmax(dist), dist.shape)
-    selected = [best_pair[0], best_pair[1]]
-
-    while len(selected) < n and len(selected) < pool_k:
-        best_next = -1
-        best_min_dist = -1
-        for candidate in range(pool_k):
-            if candidate in selected:
-                continue
-            # Min distance from candidate to any already-selected
-            min_d = min(dist[candidate, s] for s in selected)
-            if min_d > best_min_dist:
-                best_min_dist = min_d
-                best_next = candidate
-        if best_next < 0:
-            break
-        selected.append(best_next)
-
-    # Log selection
-    for i, s in enumerate(selected):
-        idx = int(pool_indices[s])
-        logger.info(
-            f"  Diverse ref {i+1}: buffer idx={idx}, "
-            f"score={float(active_scores[idx]):.4f}, "
-            f"min_dist={min(dist[s, o] for o in selected if o != s):.4f}"
-        )
-
-    refs = []
-    for s in selected:
-        idx = int(pool_indices[s])
-        refs.append((idx, tokens[idx], float(active_scores[idx])))
-    return refs
-
-
-def build_references_with_metrics(
-    ref_data: list,
-    trajectories: list = None,
-    inject_regret: bool = True,
-    inject_dtw: bool = False,
-    downsample_points: int = 20,
-    prompt_metrics: dict = None,
-    pairwise_metrics_cfg: dict = None,
-) -> tuple:
-    """Build ReferenceMaze objects with configurable metric injection.
-
-    Args:
-        ref_data: List of (index, tokens, score) tuples
-        trajectories: List of trajectory dicts from AgentEvaluator (or None)
-        inject_regret: Include regret score as a metric (fallback to buffer score)
-        inject_dtw: Unused (kept for CLI compat)
-        downsample_points: Max points when downsampling vectors
-        prompt_metrics: Dict of metric_key -> bool controlling which per-maze
-            metrics to include. None = all enabled. Keys:
-            per_step_entropy, per_step_regret, scalar_regret, action_sequence, path_overlay
-        pairwise_metrics_cfg: Dict of metric_key -> bool controlling which
-            pairwise metrics to include. None = all enabled. Keys: position_dtw
-
-    Returns:
-        Tuple of (references, pairwise_metrics):
-            references: List of ReferenceMaze objects with per-maze metrics
-            pairwise_metrics: List of PairwiseMetricEntry
-    """
-    # Default: all metrics enabled
-    pm = prompt_metrics or {}
-    pw = pairwise_metrics_cfg or {}
-
-    def _enabled(cfg_dict, key):
-        return cfg_dict.get(key, True)
-
-    references = []
-    pairwise_metrics = []
-
-    for i, (idx, tokens, score) in enumerate(ref_data):
-        grid = tokens_to_ascii(tokens)
-        label = f"Maze {chr(65 + i)}"  # A, B, C, ...
-
-        metrics = []
-
-        if trajectories is not None and i < len(trajectories):
-            traj = trajectories[i]
-
-            # Per-step entropy
-            if _enabled(pm, "per_step_entropy"):
-                ent_info = compute_per_step_entropy(traj["entropy"], traj["dones"])
-                ds_entropy = downsample(ent_info["entropy"], downsample_points)
-                metrics.append(MetricEntry(
-                    name="Per-Step Entropy",
-                    value=format_vector(ds_entropy),
-                    description=(
-                        f"Policy uncertainty at each step "
-                        f"(mean={ent_info['mean']:.3f}, max={ent_info['max']:.3f} "
-                        f"at step {ent_info['max_step']}, ep_len={ent_info['episode_length']})"
-                    ),
-                    higher_is="more uncertain (harder decision points)",
-                    metric_key="per_step_entropy",
-                ))
-
-            # Per-step regret
-            if _enabled(pm, "per_step_regret"):
-                reg_info = compute_per_step_regret(
-                    traj["values"], traj["rewards"], traj["dones"]
-                )
-                ds_regret = downsample(reg_info["regret_curve"], downsample_points)
-                metrics.append(MetricEntry(
-                    name="Per-Step Regret",
-                    value=format_vector(ds_regret),
-                    description=(
-                        f"Difficulty at each step (max_return - V(s_t)), "
-                        f"mean={reg_info['mean_regret']:.3f}, "
-                        f"ep_len={reg_info['episode_length']}"
-                    ),
-                    higher_is="harder (agent expects lower return)",
-                    metric_key="per_step_regret",
-                ))
-
-            # Scalar regret
-            if _enabled(pm, "scalar_regret"):
-                regret_info = compute_regret(traj)
-                metrics.append(MetricEntry(
-                    name="Scalar Regret",
-                    value=regret_info.regret,
-                    description=(
-                        f"MaxMC regret (mean gap between best return and value estimate), "
-                        f"solved={regret_info.solved}, ep_len={regret_info.episode_length}"
-                    ),
-                    higher_is="more learning potential",
-                    metric_key="scalar_regret",
-                ))
-
-            # SFL Learnability (requires solve_rate from multi-rollout eval)
-            if _enabled(pm, "learnability") and "solve_rate" in traj:
-                learn_info = compute_learnability(traj)
-                metrics.append(MetricEntry(
-                    name="SFL Learnability",
-                    value=learn_info.learnability,
-                    description=(
-                        f"p×(1-p) where p=solve_rate={learn_info.solve_rate:.0%} "
-                        f"across {learn_info.n_rollouts} rollouts "
-                        f"(max 0.25 at p=0.5)"
-                    ),
-                    higher_is="more at learning frontier (peak at p=0.5)",
-                    metric_key="learnability",
-                ))
-
-            # Action sequence
-            if _enabled(pm, "action_sequence"):
-                act_info = compute_per_step_action(traj["actions"], traj["dones"])
-                ds_actions = downsample(act_info["actions"].astype(np.float64), downsample_points)
-                metrics.append(MetricEntry(
-                    name="Action Sequence",
-                    value=format_vector(ds_actions, decimals=0),
-                    description=(
-                        f"Agent's action at each step "
-                        f"({act_info['num_unique_actions']} unique, "
-                        f"dominant=action {act_info['dominant_action']} "
-                        f"at {act_info['dominant_fraction']:.0%})"
-                    ),
-                    metric_key="action_sequence",
-                ))
-
-            # Value error profile
-            if _enabled(pm, "value_error"):
-                ve_info = compute_value_error(traj["values"], traj["rewards"], traj["dones"])
-                ds_error = downsample(ve_info["error_curve"], downsample_points)
-                metrics.append(MetricEntry(
-                    name="Value Error",
-                    value=format_vector(ds_error),
-                    description=(
-                        f"Signed V(s_t)-G_t: positive=overconfident, negative=underconfident "
-                        f"(mean={ve_info['mean_error']:.3f}, "
-                        f"overconfident {ve_info['overconfident_frac']:.0%} of steps, "
-                        f"ep_len={ve_info['episode_length']})"
-                    ),
-                    higher_is="more overconfident (agent expects more than reality)",
-                    metric_key="value_error",
-                ))
-
-            # Position vector
-            if _enabled(pm, "position_vector"):
-                from metrics.utils import truncate_at_done
-                ep_pos = truncate_at_done(traj["positions"], traj["dones"])
-                ds_pos = downsample(ep_pos, downsample_points)
-                pos_str = "[" + ", ".join(f"({int(p[0])},{int(p[1])})" for p in ds_pos) + "]"
-                metrics.append(MetricEntry(
-                    name="Position Trace",
-                    value=pos_str,
-                    description=(
-                        f"Agent (x,y) at each step "
-                        f"(ep_len={len(ep_pos)}, downsampled to {len(ds_pos)} points)"
-                    ),
-                    metric_key="position_vector",
-                ))
-
-            # Path overlay
-            path_overlay = None
-            if _enabled(pm, "path_overlay"):
-                try:
-                    from metrics.utils import truncate_at_done
-                    ep_pos = truncate_at_done(traj["positions"], traj["dones"])
-                    path_overlay = overlay_path_on_grid(grid, ep_pos)
-                except Exception:
-                    pass
-
-            references.append(ReferenceMaze(
-                grid=grid,
-                label=label,
-                metrics=metrics,
-                path_overlay=path_overlay,
-            ))
-        else:
-            # Fallback: just buffer score
-            if inject_regret:
-                metrics.append(MetricEntry(
-                    name="Regret Score",
-                    value=score,
-                    description="Agent's learning potential on this maze",
-                    higher_is="more to learn",
-                    metric_key="scalar_regret",
-                ))
-            references.append(ReferenceMaze(
-                grid=grid,
-                label=label,
-                metrics=metrics,
-            ))
-
-    # Pairwise position DTW between all reference pairs
-    if _enabled(pw, "position_dtw") and trajectories is not None and len(trajectories) >= 2:
-        for i in range(len(trajectories)):
-            for j in range(i + 1, len(trajectories)):
-                ti, tj = trajectories[i], trajectories[j]
-                dtw_result = position_trace_dtw(
-                    ti["positions"], ti["dones"],
-                    tj["positions"], tj["dones"],
-                )
-                pairwise_metrics.append(PairwiseMetricEntry(
-                    maze_a_label=references[i].label,
-                    maze_b_label=references[j].label,
-                    name="Position DTW",
-                    value=dtw_result["distance"],
-                    description="Spatial path similarity (lower = more similar routes)",
-                    metric_key="position_dtw",
-                ))
-
-    # Pairwise mode transition divergence between all reference pairs
-    if _enabled(pw, "mode_transition") and trajectories is not None and len(trajectories) >= 2:
-        baseline = compute_baseline_stats(trajectories)
-        logger.info(
-            f"Mode baseline: error_threshold={baseline['error_threshold']:.3f}, "
-            f"entropy_threshold={baseline['entropy_threshold']:.3f}"
-        )
-        for i in range(len(trajectories)):
-            for j in range(i + 1, len(trajectories)):
-                ti, tj = trajectories[i], trajectories[j]
-                div_result = mode_transition_divergence(
-                    ti, ti["dones"],
-                    tj, tj["dones"],
-                    entropy_a=ti.get("entropy"),
-                    entropy_b=tj.get("entropy"),
-                    baseline_stats=baseline,
-                )
-                pairwise_metrics.append(PairwiseMetricEntry(
-                    maze_a_label=references[i].label,
-                    maze_b_label=references[j].label,
-                    name="Experience Divergence",
-                    value=div_result["kl_divergence"],
-                    description="Mode transition KL divergence (higher = more different agent experiences)",
-                    metric_key="mode_transition",
-                ))
-
-    # Pairwise TD error distribution divergence
-    if _enabled(pw, "td_error") and trajectories is not None and len(trajectories) >= 2:
-        for i in range(len(trajectories)):
-            for j in range(i + 1, len(trajectories)):
-                ti, tj = trajectories[i], trajectories[j]
-                td_result = td_error_divergence(ti, ti["dones"], tj, tj["dones"])
-                pairwise_metrics.append(PairwiseMetricEntry(
-                    maze_a_label=references[i].label,
-                    maze_b_label=references[j].label,
-                    name="TD Error EMD",
-                    value=td_result["emd"],
-                    description="Earth Mover's Distance between TD error distributions (higher = more different learning signals)",
-                    metric_key="td_error",
-                ))
-
-    return references, pairwise_metrics
-
 
 # --- Output directory ---
 
@@ -627,7 +178,11 @@ def save_results(
     run_dir: str,
     ref_trajectories: list = None,
     gen_trajectories: list = None,
-    embedding_metric: str = "td_error_emd",
+    embedding_metric: str = "embedding_l2",
+    buf_embeddings: np.ndarray = None,
+    buf_scores: np.ndarray = None,
+    buf_tokens: np.ndarray = None,
+    visualisation_plot: str = "tsne",
 ):
     """Save generated mazes as text files, JSON metadata, and a PNG visualization.
 
@@ -732,6 +287,8 @@ def save_results(
                 },
                 "issues": rc.issues,
             }
+            if rc.thinking:
+                entry["thinking"] = rc.thinking
             metadata["rejected_candidates"].append(entry)
 
     # Save rejected candidate grids as text files
@@ -947,15 +504,18 @@ def save_results(
     # Rejected candidates — colored by failure reason
     for i, rc in enumerate(all_rejected):
         rt = rc.trajectory
-        if rt is not None and "dones" in rt:
+        has_traj = rt is not None and "dones" in rt
+        logger.info(f"Rejected {i+1}: trajectory={'yes' if has_traj else 'NO'}, "
+                     f"diff={rc.failed_difficulty}, div={rc.failed_diversity}")
+        if has_traj:
             all_trajs.append(rt)
             all_labels.append(f"Rej {i+1}")
             if rc.failed_difficulty and rc.failed_diversity:
-                all_colors.append('orange')
+                all_colors.append('darkorange')
             elif rc.failed_difficulty:
                 all_colors.append('red')
             else:
-                all_colors.append('gold')
+                all_colors.append('magenta')
             all_markers.append('X')
     # Accepted generated (green, or green+red-edge for force-accepted)
     all_force_accepted = []  # track which embedding indices are force-accepted
@@ -970,56 +530,93 @@ def save_results(
                 all_markers.append('*')
                 all_force_accepted.append(force)
 
+    if len(all_trajs) < 3:
+        logger.info(f"Skipping diversity plot: need >= 3 trajectories, have {len(all_trajs)} "
+                     f"(use --inject-metrics to include reference trajectories)")
     if len(all_trajs) >= 3:
         try:
-            from sklearn.manifold import TSNE
-
-            def _pairwise_distance(t1, t2, metric):
-                """Compute pairwise distance between two trajectories."""
-                if metric == "td_error_emd":
-                    from metrics.pairwise.td_error_distribution import td_error_divergence
-                    return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
-                elif metric == "experience_divergence":
-                    from metrics.pairwise.mode_transition import mode_transition_divergence
-                    return mode_transition_divergence(
-                        t1, t1["dones"], t2, t2["dones"],
-                        entropy_a=t1.get("entropy"), entropy_b=t2.get("entropy"),
-                    )["kl_divergence"]
-                elif metric == "position_dtw":
-                    from metrics.pairwise.pos_dtw import position_trace_dtw
-                    return position_trace_dtw(
-                        t1["positions"], t1["dones"], t2["positions"], t2["dones"],
-                    )["distance"]
-                else:
-                    from metrics.pairwise.td_error_distribution import td_error_divergence
-                    return td_error_divergence(t1, t1["dones"], t2, t2["dones"])["emd"]
+            from sklearn.manifold import TSNE, MDS
+            from metrics.standalone.cenie import extract_state_action_pairs
 
             _emb_label = {
+                "embedding_l2": "Embedding L2",
                 "td_error_emd": "TD Error EMD",
                 "experience_divergence": "Experience Divergence",
                 "position_dtw": "Position DTW",
             }.get(_emb_metric, _emb_metric)
 
-            n = len(all_trajs)
-            dist_matrix = np.zeros((n, n))
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = _pairwise_distance(all_trajs[i], all_trajs[j], _emb_metric)
-                    dist_matrix[i, j] = d
-                    dist_matrix[j, i] = d
+            # Build foreground embedding matrix (257D mean state-action vectors)
+            # Prefer mean_embedding (averaged across all rollouts) when available;
+            # fall back to single-rollout extract_state_action_pairs
+            n_fg = len(all_trajs)
+            fg_embeddings = np.zeros((n_fg, 257), dtype=np.float32)
+            for i, t in enumerate(all_trajs):
+                if "mean_embedding" in t:
+                    fg_embeddings[i] = t["mean_embedding"]
+                else:
+                    pairs = extract_state_action_pairs(t)
+                    if pairs is not None and len(pairs) > 0:
+                        fg_embeddings[i] = pairs.mean(axis=0)
 
-            # t-SNE on precomputed distance matrix
-            perplexity = min(5, n - 1)
-            embedding = TSNE(
-                n_components=2, metric="precomputed",
-                perplexity=perplexity, random_state=42,
-                init="random",
-            ).fit_transform(dist_matrix)
+            # Load buffer embeddings as background (all non-zero embeddings)
+            n_buf = 0
+            buf_emb_matrix = None
+            buf_difficulty_pass = None
+            if buf_embeddings is not None:
+                norms = np.sqrt(np.sum(buf_embeddings ** 2, axis=1))
+                valid_mask = norms > 1e-6
+                buf_emb_matrix = buf_embeddings[valid_mask]
+                n_buf = len(buf_emb_matrix)
+                logger.info(f"Loaded {n_buf} buffer embeddings for plot")
+
+                # Difficulty filter for coloring buffer dots
+                if buf_scores is not None:
+                    valid_scores = buf_scores[valid_mask]
+                    mean_score = float(buf_scores[valid_mask].mean())
+                    buf_difficulty_pass = valid_scores >= mean_score
+                    logger.info(f"Buffer plot: {int(buf_difficulty_pass.sum())}/{n_buf} pass difficulty filter")
+
+            # Build combined distance matrix: [fg; buf] x [fg; buf]
+            n_total = n_fg + n_buf
+            if n_buf > 0:
+                all_emb = np.vstack([fg_embeddings, buf_emb_matrix])
+            else:
+                all_emb = fg_embeddings
+
+            # Foreground pairwise L2 distances (for edge annotations)
+            fg_dist_matrix = np.zeros((n_fg, n_fg), dtype=np.float32)
+            for i in range(n_fg):
+                diff = fg_embeddings[i] - fg_embeddings
+                fg_dist_matrix[i] = np.sqrt(np.sum(diff ** 2, axis=1))
+
+            # Dimensionality reduction
+            primary = visualisation_plot.lower()
+            perplexity = min(40, n_total - 1)
+            if primary == "mds":
+                # MDS needs full precomputed distance matrix
+                full_dist = np.zeros((n_total, n_total), dtype=np.float32)
+                chunk = max(1, min(500, n_total))
+                for start in range(0, n_total, chunk):
+                    end = min(start + chunk, n_total)
+                    diff = all_emb[start:end, np.newaxis, :] - all_emb[np.newaxis, :, :]
+                    full_dist[start:end] = np.sqrt(np.sum(diff ** 2, axis=2))
+                embedding_2d = MDS(
+                    n_components=2, dissimilarity="precomputed",
+                    random_state=42, normalized_stress='auto',
+                ).fit_transform(full_dist)
+                method_name = "MDS"
+            else:
+                embedding_2d = TSNE(
+                    n_components=2, perplexity=perplexity,
+                    random_state=42, init="pca", learning_rate="auto",
+                    max_iter=1000,
+                ).fit_transform(all_emb)
+                method_name = "t-SNE"
 
             # Build per-point edge colors: red edge for force-accepted
             n_before_accepted = n_ref_in_emb + sum(1 for rc in all_rejected if rc.trajectory is not None and "dones" in rc.trajectory)
             edge_colors = []
-            for i in range(n):
+            for i in range(n_fg):
                 if i >= n_before_accepted and all_markers[i] == '*':
                     fa_idx = i - n_before_accepted
                     if fa_idx < len(all_force_accepted) and all_force_accepted[fa_idx]:
@@ -1029,73 +626,36 @@ def save_results(
                 else:
                     edge_colors.append('black')
 
-            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(7, 6))
-            for i in range(n):
-                ax_emb.scatter(
-                    embedding[i, 0], embedding[i, 1],
-                    c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
-                    marker=all_markers[i], zorder=5,
-                    edgecolors=edge_colors[i],
-                    linewidths=2.0 if edge_colors[i] == 'red' else 0.5,
-                )
-                ax_emb.annotate(
-                    all_labels[i], (embedding[i, 0], embedding[i, 1]),
-                    textcoords="offset points", xytext=(6, 6),
-                    fontsize=7, color=all_colors[i], fontweight='bold',
-                )
-
-            # Plot reference centroid as black dot
-            if n_ref_in_emb >= 2:
-                ref_emb = embedding[:n_ref_in_emb]
-                centroid = ref_emb.mean(axis=0)
-                ax_emb.scatter(
-                    centroid[0], centroid[1],
-                    c='black', s=200, marker='D', zorder=6,
-                    edgecolors='white', linewidths=1.5,
-                )
-                ax_emb.annotate(
-                    "Centroid", (centroid[0], centroid[1]),
-                    textcoords="offset points", xytext=(6, -10),
-                    fontsize=7, color='black', fontweight='bold',
-                )
-
-            # Draw edges with distance labels for nearest pairs
-            for i in range(n):
-                for j in range(i + 1, n):
-                    ax_emb.plot(
-                        [embedding[i, 0], embedding[j, 0]],
-                        [embedding[i, 1], embedding[j, 1]],
-                        'gray', alpha=0.15, linewidth=0.5,
-                    )
-
-            ax_emb.set_title(
-                f"Diversity Embedding ({_emb_label})",
-                fontsize=11, fontweight='bold',
-            )
-            ax_emb.set_xlabel("t-SNE dim 1", fontsize=9)
-            ax_emb.set_ylabel("t-SNE dim 2", fontsize=9)
-            ax_emb.grid(alpha=0.2)
-
-            # Legend
+            # Build legend (shared by both plots)
             from matplotlib.lines import Line2D
-            emb_legend = [
+            emb_legend = []
+            if n_buf > 0:
+                if buf_difficulty_pass is not None:
+                    n_pass = int(np.sum(buf_difficulty_pass))
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='lightsteelblue',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer pass ({n_pass})'))
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='khaki',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer fail ({n_buf - n_pass})'))
+                else:
+                    emb_legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='lightsteelblue',
+                                             markersize=6, markeredgecolor='none', label=f'Buffer ({n_buf})'))
+            emb_legend.extend([
                 Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
                        markersize=8, markeredgecolor='black', label='Reference'),
                 Line2D([0], [0], marker='D', color='w', markerfacecolor='black',
                        markersize=8, markeredgecolor='white', label='Ref Centroid'),
-            ]
-            # Only add legend entries for failure types present
+            ])
             has_diff = any(rc.failed_difficulty and not rc.failed_diversity for rc in all_rejected)
             has_div = any(rc.failed_diversity and not rc.failed_difficulty for rc in all_rejected)
             has_both = any(rc.failed_difficulty and rc.failed_diversity for rc in all_rejected)
             if has_div:
-                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='gold',
+                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='magenta',
                                          markersize=8, markeredgecolor='black', label='Rej (diversity)'))
             if has_diff:
                 emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='red',
                                          markersize=8, markeredgecolor='black', label='Rej (difficulty)'))
             if has_both:
-                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='orange',
+                emb_legend.append(Line2D([0], [0], marker='X', color='w', markerfacecolor='darkorange',
                                          markersize=8, markeredgecolor='black', label='Rej (both)'))
             if n_gens > 0:
                 has_force_emb = any(all_force_accepted)
@@ -1107,16 +667,189 @@ def save_results(
                     emb_legend.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='green',
                                              markersize=10, markeredgecolor='red',
                                              markeredgewidth=2, label='Force-Accepted'))
-            ax_emb.legend(handles=emb_legend, loc='best', fontsize=8, framealpha=0.9)
 
+            def _plot_embedding(ax, emb_2d, method_name):
+                """Plot buffer background + foreground points on a single axes."""
+                # Buffer background
+                if n_buf > 0:
+                    buf_emb_2d = emb_2d[n_fg:]
+                    if buf_difficulty_pass is not None:
+                        fail_mask = ~buf_difficulty_pass
+                        if np.any(fail_mask):
+                            ax.scatter(buf_emb_2d[fail_mask, 0], buf_emb_2d[fail_mask, 1],
+                                       c='khaki', s=10, marker='o', zorder=1, alpha=0.4, edgecolors='none')
+                        pass_mask = buf_difficulty_pass
+                        if np.any(pass_mask):
+                            ax.scatter(buf_emb_2d[pass_mask, 0], buf_emb_2d[pass_mask, 1],
+                                       c='lightsteelblue', s=12, marker='o', zorder=2, alpha=0.5, edgecolors='none')
+                    else:
+                        ax.scatter(buf_emb_2d[:, 0], buf_emb_2d[:, 1],
+                                   c='lightsteelblue', s=12, marker='o', zorder=1, alpha=0.5, edgecolors='none')
+
+                # Foreground points
+                for i in range(n_fg):
+                    ax.scatter(emb_2d[i, 0], emb_2d[i, 1],
+                               c=all_colors[i], s=150 if all_markers[i] == '*' else 100,
+                               marker=all_markers[i], zorder=5,
+                               edgecolors=edge_colors[i],
+                               linewidths=2.0 if edge_colors[i] == 'red' else 0.5)
+                    ax.annotate(all_labels[i], (emb_2d[i, 0], emb_2d[i, 1]),
+                                textcoords="offset points", xytext=(6, 6),
+                                fontsize=7, color=all_colors[i], fontweight='bold')
+
+                # Reference centroid
+                if n_ref_in_emb >= 2:
+                    ref_emb_2d = emb_2d[:n_ref_in_emb]
+                    centroid = ref_emb_2d.mean(axis=0)
+                    ax.scatter(centroid[0], centroid[1], c='black', s=200, marker='D',
+                               zorder=6, edgecolors='white', linewidths=1.5)
+                    ax.annotate("Centroid", (centroid[0], centroid[1]),
+                                textcoords="offset points", xytext=(6, -10),
+                                fontsize=7, color='black', fontweight='bold')
+
+                # Distance edges from rejected/accepted to closest reference
+                for i in range(n_ref_in_emb, n_fg):
+                    closest_ref, closest_dist = -1, float('inf')
+                    for j in range(n_ref_in_emb):
+                        if fg_dist_matrix[i, j] < closest_dist:
+                            closest_dist = fg_dist_matrix[i, j]
+                            closest_ref = j
+                    if closest_ref >= 0:
+                        mid_x = (emb_2d[i, 0] + emb_2d[closest_ref, 0]) / 2
+                        mid_y = (emb_2d[i, 1] + emb_2d[closest_ref, 1]) / 2
+                        ax.plot([emb_2d[i, 0], emb_2d[closest_ref, 0]],
+                                [emb_2d[i, 1], emb_2d[closest_ref, 1]],
+                                'gray', alpha=0.4, linewidth=1.0, linestyle='--')
+                        ax.annotate(f"{closest_dist:.4f}", (mid_x, mid_y),
+                                    fontsize=5.5, color='dimgray', ha='center',
+                                    bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                                              alpha=0.8, edgecolor='none'))
+
+                ax.set_title(f"Diversity Embedding ({_emb_label})\n"
+                             f"{method_name} layout — distances on edges are actual L2 values",
+                             fontsize=10, fontweight='bold')
+                ax.set_xlabel(f"{method_name} dim 1", fontsize=9)
+                ax.set_ylabel(f"{method_name} dim 2", fontsize=9)
+                ax.grid(alpha=0.2)
+                ax.legend(handles=emb_legend, loc='best', fontsize=8, framealpha=0.9)
+
+            # Generate the selected plot
+            fig_emb, ax_emb = plt.subplots(1, 1, figsize=(8, 7) if n_buf > 0 else (7, 6))
+            _plot_embedding(ax_emb, embedding_2d, method_name)
             emb_path = os.path.join(run_dir, "diversity_embedding.png")
             fig_emb.savefig(emb_path, dpi=150, bbox_inches='tight')
             plt.close(fig_emb)
             logger.info(f"Saved {emb_path}")
+
         except ImportError:
             logger.warning("sklearn not installed — skipping diversity embedding")
         except Exception as e:
             logger.warning(f"Diversity embedding failed: {e}")
+
+    # --- Structural t-SNE plot (173D: wall map + agent/goal positions) ---
+    if buf_tokens is not None:
+        try:
+            from sklearn.manifold import TSNE
+            from vae.plot_tsne_training_evolution import tokens_to_structural_features
+            from vae.vae_level_utils import level_to_tokens
+
+            # Foreground: refs + rejected + accepted → convert grids to tokens to features
+            fg_grids = []
+            fg_labels_s = []
+            fg_colors_s = []
+            fg_markers_s = []
+            for ref in references:
+                fg_grids.append(ref.grid)
+                fg_labels_s.append(ref.label)
+                fg_colors_s.append('blue')
+                fg_markers_s.append('o')
+            for i, rc in enumerate(all_rejected):
+                fg_grids.append(rc.grid)
+                fg_labels_s.append(f"Rej {i+1}")
+                if rc.failed_difficulty and rc.failed_diversity:
+                    fg_colors_s.append('darkorange')
+                elif rc.failed_difficulty:
+                    fg_colors_s.append('red')
+                else:
+                    fg_colors_s.append('magenta')
+                fg_markers_s.append('X')
+            for i, (orig_idx, result) in enumerate(successful):
+                fg_grids.append(result.grid)
+                force = bool(result.diversity_issues)
+                fg_labels_s.append(f"Force-Accepted {i+1}" if force else f"Accepted {i+1}")
+                fg_colors_s.append('green')
+                fg_markers_s.append('*')
+
+            # Convert foreground grids to tokens then to structural features
+            fg_tokens = []
+            for grid in fg_grids:
+                try:
+                    level = Level.from_str(grid)
+                    tok = np.asarray(level_to_tokens(level))
+                    fg_tokens.append(tok)
+                except Exception:
+                    fg_tokens.append(np.zeros(52, dtype=np.int32))
+            fg_tokens = np.stack(fg_tokens)
+            fg_struct = tokens_to_structural_features(fg_tokens)
+
+            # Buffer background
+            buf_struct = tokens_to_structural_features(buf_tokens)
+            n_buf_s = len(buf_struct)
+
+            # Combined embedding
+            all_struct = np.vstack([fg_struct, buf_struct])
+            n_fg_s = len(fg_struct)
+            perp_s = min(40, len(all_struct) - 1)
+            struct_2d = TSNE(
+                n_components=2, perplexity=perp_s,
+                random_state=42, init="pca", learning_rate="auto",
+                max_iter=1000,
+            ).fit_transform(all_struct)
+
+            # Plot
+            fig_s, ax_s = plt.subplots(1, 1, figsize=(8, 7))
+
+            # Buffer background (colored by difficulty)
+            buf_2d = struct_2d[n_fg_s:]
+            if buf_scores is not None and len(buf_scores) >= n_buf_s:
+                mean_score = float(buf_scores[:n_buf_s].mean())
+                pass_mask = buf_scores[:n_buf_s] >= mean_score
+                fail_mask = ~pass_mask
+                if np.any(fail_mask):
+                    ax_s.scatter(buf_2d[fail_mask, 0], buf_2d[fail_mask, 1],
+                                 c='khaki', s=10, marker='o', zorder=1, alpha=0.4, edgecolors='none')
+                if np.any(pass_mask):
+                    ax_s.scatter(buf_2d[pass_mask, 0], buf_2d[pass_mask, 1],
+                                 c='lightsteelblue', s=12, marker='o', zorder=2, alpha=0.5, edgecolors='none')
+            else:
+                ax_s.scatter(buf_2d[:, 0], buf_2d[:, 1],
+                             c='lightsteelblue', s=12, marker='o', zorder=1, alpha=0.5, edgecolors='none')
+
+            # Foreground points
+            fg_2d = struct_2d[:n_fg_s]
+            for i in range(n_fg_s):
+                ax_s.scatter(fg_2d[i, 0], fg_2d[i, 1],
+                             c=fg_colors_s[i], s=150 if fg_markers_s[i] == '*' else 100,
+                             marker=fg_markers_s[i], zorder=5,
+                             edgecolors='black', linewidths=0.5)
+                ax_s.annotate(fg_labels_s[i], (fg_2d[i, 0], fg_2d[i, 1]),
+                              textcoords="offset points", xytext=(6, 6),
+                              fontsize=7, color=fg_colors_s[i], fontweight='bold')
+
+            ax_s.set_title("Structural Embedding (173D: wall map + positions)\n"
+                           "t-SNE layout — maze topology only, no agent behavior",
+                           fontsize=10, fontweight='bold')
+            ax_s.set_xlabel("t-SNE dim 1", fontsize=9)
+            ax_s.set_ylabel("t-SNE dim 2", fontsize=9)
+            ax_s.grid(alpha=0.2)
+
+            struct_path = os.path.join(run_dir, "structural_embedding.png")
+            fig_s.savefig(struct_path, dpi=150, bbox_inches='tight')
+            plt.close(fig_s)
+            logger.info(f"Saved {struct_path}")
+
+        except Exception as e:
+            logger.warning(f"Structural embedding plot failed: {e}")
 
     return run_dir
 
@@ -1130,51 +863,76 @@ def run_test(args):
     import time as _time
     _t_setup = _time.time()
     logger.info(f"Loading buffer from {args.buffer_path}...")
-    buf = load_buffer(args.buffer_path)
+    sampler = npz_to_sampler(args.buffer_path)
+    size = int(np.asarray(sampler["size"]))
+    scores = np.asarray(sampler["scores"])
     print(f"[TIMING] Buffer load: {_time.time() - _t_setup:.1f}s", flush=True)
-    size = int(buf["size"])
-    tokens = buf["tokens"]
-    scores = buf["scores"]
 
-    # Load agent early if needed for diverse selection or metrics
+    # Load agent early if needed for embedding-based selection, metrics, or fresh embeddings
+    buffer_state = getattr(args, 'buffer_state', 'stale')
+    needs_agent = (args.inject_metrics
+                   or args.strategy in ("greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid")
+                   or buffer_state == "fresh")
     evaluator = None
-    if args.inject_metrics or args.strategy == "diverse":
+    if needs_agent:
         from llm.agent_evaluator import AgentEvaluator
         logger.info(f"Loading agent from {args.agent_dir} for metric computation...")
         _t_agent = _time.time()
-        evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
+        evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps, checkpoint_step=args.checkpoint_step)
         print(f"[TIMING] Agent load: {_time.time() - _t_agent:.1f}s", flush=True)
 
-    # Select reference mazes
+    # Compute buffer embeddings — fresh (rollout current agent) or stale (from npz)
+    buffer_embeddings = None
+    needs_embeddings = args.strategy in ("greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid")
+    # Try stale first if available and not explicitly requesting fresh
+    if needs_embeddings and buffer_state != "fresh":
+        npz_data = np.load(args.buffer_path, allow_pickle=True)
+        if "embeddings" in npz_data:
+            buffer_embeddings = npz_data["embeddings"][:size]
+            logger.info(f"Loaded stale buffer embeddings ({buffer_embeddings.shape}) from npz")
+    if (buffer_state == "fresh" or (needs_embeddings and buffer_embeddings is None)) and evaluator is not None:
+        logger.info(f"Computing fresh buffer embeddings for {size} levels (5 rollouts averaged)...")
+        _t_emb = _time.time()
+        all_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in range(size)]
+        buffer_embeddings = evaluator.compute_embeddings(all_levels, n_rollouts=5)
+        print(f"[TIMING] Fresh buffer embeddings ({size} levels, 5 rollouts): {_time.time() - _t_emb:.1f}s", flush=True)
+    elif buffer_embeddings is None:
+        # Load stale embeddings from npz if available (for plot background)
+        npz_data = np.load(args.buffer_path, allow_pickle=True)
+        if "embeddings" in npz_data:
+            buffer_embeddings = npz_data["embeddings"][:size]
+            logger.info(f"Loaded stale buffer embeddings ({buffer_embeddings.shape}) from npz")
+
+    # Select reference mazes via BufferStatsExtractor
+    extractor = BufferStatsExtractor(
+        n_references=args.num_refs,
+        strategy=args.strategy,
+        hybrid_difficulty_percentile=getattr(args, 'hybrid_difficulty_percentile', 50.0),
+        inject_regret=args.inject_regret,
+    )
+    if buffer_embeddings is not None:
+        extractor._buffer_embeddings = buffer_embeddings
+
     logger.info(f"Selecting {args.num_refs} reference mazes (strategy={args.strategy})...")
-    if args.strategy == "diverse" and evaluator is not None:
-        ref_data = select_references_diverse(
-            tokens, scores, size, evaluator,
-            n=args.num_refs,
-            pool_size=args.diverse_pool_size,
-            metric=args.diverse_metric,
-        )
-    else:
-        ref_data = select_references(tokens, scores, size, n=args.num_refs, strategy=args.strategy)
+    references, ref_levels = extractor.extract_references_with_levels(sampler)
 
     # Roll out agent on selected reference levels to get trajectory data
+    # Uses multi-rollout (50) for proper SFL solve_rate + mean_embedding
     ref_trajectories = None
-    if args.inject_metrics and evaluator is not None:
-        ref_levels = []
-        for idx, tok, score in ref_data:
-            ref_levels.append(tokens_to_level_obj(tok))
-
-        logger.info(f"Rolling out agent on {len(ref_levels)} reference levels...")
+    if args.inject_metrics and evaluator is not None and ref_levels:
+        logger.info(f"Rolling out agent on {len(ref_levels)} reference levels (50 rollouts each)...")
         _t_ref = _time.time()
-        ref_trajectories = evaluator.evaluate_levels(ref_levels)
+        ref_trajectories = []
+        for lv in ref_levels:
+            traj = evaluator.evaluate_level_multi_rollout(lv, n_rollouts=args.n_rollouts)
+            ref_trajectories.append(traj)
         print(f"[TIMING] Reference rollouts ({len(ref_levels)} levels): {_time.time() - _t_ref:.1f}s", flush=True)
         logger.info("Reference trajectories collected")
 
-    # Build references with metrics (configurable via prompt_metrics/pairwise_metrics)
-    references, pairwise_metrics = build_references_with_metrics(
-        ref_data,
+    # Enrich references with trajectory-based metrics
+    references, pairwise_metrics = enrich_references_with_metrics(
+        references,
         trajectories=ref_trajectories,
-        inject_regret=args.inject_regret,
         downsample_points=args.downsample_points,
         prompt_metrics=args.prompt_metrics,
         pairwise_metrics_cfg=args.pairwise_metrics_cfg,
@@ -1198,7 +956,7 @@ def run_test(args):
     # Build global metrics
     global_metrics = None
     if args.inject_buffer_stats:
-        active_scores = scores[:size]
+        active_scores = np.asarray(scores)
         score_label = "Learnability (SFL)" if args.difficulty_metric == "sfl" else "Regret"
         global_metrics = [
             MetricEntry(
@@ -1262,6 +1020,7 @@ def run_test(args):
         min_walls=args.min_walls,
         min_path_distance=args.min_path_distance,
         validate_solvable=args.validate_solvable,
+        effort=args.effort,
     )
     generator = MazeGenerator(config)
 
@@ -1276,8 +1035,7 @@ def run_test(args):
         # Reuse evaluator/trajectories if already loaded for metrics
         if not args.inject_metrics:
             from llm.agent_evaluator import AgentEvaluator
-            evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps)
-            ref_levels = [tokens_to_level_obj(tok) for _, tok, _ in ref_data]
+            evaluator = AgentEvaluator.from_checkpoint(args.agent_dir, num_steps=args.num_steps, checkpoint_step=args.checkpoint_step)
             ref_trajectories = evaluator.evaluate_levels(ref_levels)
 
         ref_labels = [ref.label for ref in references]
@@ -1303,15 +1061,14 @@ def run_test(args):
                 n_cenie_levels = min(size, 50)  # fit on up to 50 buffer levels
                 if n_cenie_levels > len(ref_trajectories):
                     logger.info(f"Rolling out agent on {n_cenie_levels} buffer levels for CENIE GMM...")
-                    cenie_indices = np.argsort(-scores[:size])[:n_cenie_levels]
-                    cenie_levels = [tokens_to_level_obj(tokens[i]) for i in cenie_indices]
+                    cenie_indices = np.argsort(-np.asarray(scores))[:n_cenie_levels]
+                    cenie_levels = [jax.tree_util.tree_map(lambda x: x[i], sampler["levels"]) for i in cenie_indices]
                     cenie_trajs = evaluator.evaluate_levels(cenie_levels)
                     logger.info(f"CENIE trajectories collected ({n_cenie_levels} levels)")
                 cenie_model = fit_cenie_model(cenie_trajs)
 
         # Compute reference embeddings for embedding_l2 diversity metric
         ref_embeddings = None
-        buffer_embeddings = None
         if args.diversity_metric == "embedding_l2" and ref_trajectories:
             from metrics.standalone.cenie import extract_state_action_pairs
             ref_embs = []
@@ -1322,10 +1079,7 @@ def run_test(args):
             if ref_embs:
                 ref_embeddings = np.stack(ref_embs)
                 logger.info(f"Computed {len(ref_embs)} reference embeddings for L2 diversity")
-            # Also compute buffer-wide embeddings from stored data if available
-            if "embeddings" in buf:
-                buffer_embeddings = np.array(buf["embeddings"][:size])
-                logger.info(f"Loaded {size} buffer embeddings for L2 diversity")
+            # buffer_embeddings already computed above (fresh or stale)
 
         results = generator.generate_batch_with_feedback(
             n=args.n,
@@ -1411,11 +1165,24 @@ def run_test(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_short = args.model.replace(":", "_").replace("/", "_")
     run_dir = os.path.join(OUTPUT_DIR, f"{timestamp}_{model_short}")
+    # Load buffer tokens for structural embedding plot
+    _buf_tokens = None
+    try:
+        _npz = np.load(args.buffer_path, allow_pickle=True)
+        if "tokens" in _npz:
+            _buf_tokens = _npz["tokens"][:size]
+    except Exception:
+        pass
+
     save_results(
         results, references, args.model, run_dir,
         ref_trajectories=ref_trajectories,
         gen_trajectories=gen_trajectories,
         embedding_metric=args.embedding_metric,
+        buf_embeddings=buffer_embeddings,
+        buf_scores=np.asarray(scores) if buffer_embeddings is not None else None,
+        buf_tokens=_buf_tokens,
+        visualisation_plot=getattr(args, 'visualisation_plot', 'tsne'),
     )
     print(f"\n  Results saved to: {run_dir}/")
     print(f"    - maze_XXX.txt files (ASCII grids)")
@@ -1477,16 +1244,12 @@ def main():
                         help="Number of mazes to generate")
     parser.add_argument("--num-refs", type=int, default=cfg.get("num_refs"),
                         help="Number of reference mazes")
-    parser.add_argument("--strategy", choices=["top_regret", "random", "diverse"],
-                        default=cfg.get("strategy"),
+    parser.add_argument("--strategy", choices=["hardest", "top_regret", "random", "greedy", "hybrid-greedy", "kmedoid", "hybrid-kmedoid"],
+                        default=cfg.get("strategy", "hardest"),
                         help="Reference selection strategy")
-    parser.add_argument("--diverse-metric",
-                        choices=["td_error_emd", "experience_divergence", "position_dtw"],
-                        default=cfg.get("diverse_metric", "td_error_emd"),
-                        help="Pairwise metric for diverse strategy")
-    parser.add_argument("--diverse-pool-size", type=int,
-                        default=cfg.get("diverse_pool_size", 20),
-                        help="Candidate pool size for diverse strategy")
+    parser.add_argument("--hybrid-difficulty-percentile", type=float,
+                        default=cfg.get("hybrid_difficulty_percentile", 50.0),
+                        help="Percentile threshold for hybrid-kmedoid difficulty filter")
 
     # Metric injection flags
     parser.add_argument("--inject-metrics", action="store_true",
@@ -1540,6 +1303,9 @@ def main():
                         help="BFS solvability check on generated mazes")
     parser.add_argument("--no-validate-solvable", action="store_false",
                         dest="validate_solvable")
+    parser.add_argument("--effort", default=cfg.get("effort", "low"),
+                        choices=["low", "medium", "high"],
+                        help="claude-code --effort flag (default: from config.yaml)")
 
     # Custom instruction
     parser.add_argument("--instruction", default=cfg.get("instruction", ""),
@@ -1551,18 +1317,20 @@ def main():
                         help="Enable metric feedback loop (requires agent checkpoint)")
     parser.add_argument("--agent-dir", default=cfg.get("agent_dir"),
                         help="Path to agent checkpoint directory")
+    parser.add_argument("--checkpoint-step", type=int, default=cfg.get("checkpoint_step", -1),
+                        help="Agent checkpoint step (-1 for latest)")
     parser.add_argument("--num-steps", type=int, default=cfg.get("num_steps"),
                         help="Max rollout steps per episode")
-    parser.add_argument("--n-rollouts", type=int, default=cfg.get("n_rollouts"),
+    # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
+    gate_cfg = cfg.get("gate", {})
+    parser.add_argument("--n-rollouts", type=int, default=gate_cfg.get("n_rollouts", cfg.get("n_rollouts", 50)),
                         help="Agent rollouts per maze for robust regret")
     parser.add_argument("--downsample-points", type=int,
                         default=cfg.get("downsample_points"),
                         help="Max points when downsampling metric vectors for LLM prompt")
     parser.add_argument("--max-diversity-retries", type=int,
-                        default=cfg.get("max_diversity_retries"),
+                        default=gate_cfg.get("max_diversity_retries", cfg.get("max_diversity_retries", 3)),
                         help="Max diversity gate retries per maze")
-    # Gate thresholds (read from gate: sub-dict in config, or flat keys for backwards compat)
-    gate_cfg = cfg.get("gate", {})
     parser.add_argument("--difficulty-threshold", type=float,
                         default=gate_cfg.get("difficulty_threshold"),
                         help="Min difficulty score to accept (null = disabled)")
@@ -1578,9 +1346,16 @@ def main():
                         default=gate_cfg.get("diversity_metric", cfg.get("diversity_metric", "td_error_emd")),
                         help="Diversity metric: pairwise (td_error_emd, experience_divergence, position_dtw), buffer-wide (cenie), or embedding_l2")
     parser.add_argument("--embedding-metric",
-                        choices=["td_error_emd"],
-                        default=cfg.get("embedding_metric", "td_error_emd"),
-                        help="Pairwise metric for t-SNE diversity embedding plot")
+                        choices=["embedding_l2", "td_error_emd", "experience_divergence", "position_dtw"],
+                        default=cfg.get("embedding_metric", "embedding_l2"),
+                        help="Pairwise metric for diversity embedding plot")
+    parser.add_argument("--visualisation-plot", choices=["tsne", "mds"],
+                        default=cfg.get("visualisation_plot", "tsne"),
+                        help="Dimensionality reduction for diversity plot")
+    parser.add_argument("--buffer-state", choices=["stale", "fresh"],
+                        default=cfg.get("buffer_state", "stale"),
+                        help="'stale' uses saved embeddings from buffer dump, "
+                             "'fresh' recomputes all buffer embeddings with current agent")
 
     # Mode
     parser.add_argument("--dry-run", action="store_true",

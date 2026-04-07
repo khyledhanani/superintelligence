@@ -128,19 +128,69 @@ def score_levels_sfl(evaluator, levels, n_rollouts=10):
     return scores
 
 
-def compute_embedding(evaluator, level, n_rollouts=10):
-    """Compute 257D behavior embedding for a level: mean LSTM hstate (256) + mean action (1)."""
-    traj = evaluator.evaluate_level_multi_rollout(level, n_rollouts=n_rollouts)
-    hstates = traj["hstates"]   # (T,) -> actually (T, 256) from best rollout
-    actions = traj["actions"]   # (T,)
-    dones = traj["dones"]       # (T,)
-
-    # Mask to first episode only
+def _embedding_from_rollout(hstates, actions, dones):
+    """Compute 257D embedding from a single rollout's data."""
     done_idx = np.where(dones)[0]
     end = done_idx[0] + 1 if len(done_idx) > 0 else len(dones)
     h_mean = hstates[:end].mean(axis=0)  # (256,)
     a_mean = np.array([actions[:end].astype(np.float32).mean()])  # (1,)
-    return np.concatenate([h_mean, a_mean]), traj
+    return np.concatenate([h_mean, a_mean])
+
+
+def compute_embedding(evaluator, level, n_rollouts=10):
+    """Compute 257D behavior embedding for a level, averaged over all rollouts.
+
+    Runs n_rollouts independent rollouts and averages the per-rollout embeddings
+    (mean LSTM hidden state + mean action) for a more stable representation.
+    """
+    batched_levels = Level.stack([level] * n_rollouts)
+    results = evaluator._evaluate_batch(batched_levels, n_rollouts)
+
+    # Compute per-rollout embeddings and average
+    hstates = results["hstates"]   # (T, N, 256)
+    actions = results["actions"]   # (T, N)
+    dones = results["dones"]       # (T, N)
+    rewards = results["rewards"]   # (T, N)
+
+    per_rollout_emb = []
+    returns = np.zeros(n_rollouts)
+    solved = np.zeros(n_rollouts, dtype=bool)
+    for i in range(n_rollouts):
+        emb_i = _embedding_from_rollout(hstates[:, i], actions[:, i], dones[:, i])
+        per_rollout_emb.append(emb_i)
+        done_idx = np.where(dones[:, i])[0]
+        if len(done_idx) > 0:
+            end = done_idx[0] + 1
+            solved[i] = True
+        else:
+            end = len(rewards)
+        returns[i] = float(np.sum(rewards[:end, i]))
+
+    # --- Mean over all rollouts ---
+    mean_emb = np.mean(per_rollout_emb, axis=0)          # (257,) mean embedding
+    solve_rate = float(np.mean(solved))                   # fraction solved
+    all_returns = returns                                  # (N,) per-rollout returns
+
+    # --- Best single rollout (highest return) ---
+    best_idx = int(np.argmax(returns))
+    best_return = float(returns[best_idx])
+
+    traj = {
+        # all-rollout aggregates
+        "solve_rate": solve_rate,
+        "all_returns": all_returns,
+        "best_return": best_return,
+        # single best rollout trajectory
+        "observations": results["observations"][:, best_idx],
+        "positions": results["positions"][:, best_idx],
+        "values": results["values"][:, best_idx],
+        "dones": results["dones"][:, best_idx],
+        "actions": results["actions"][:, best_idx],
+        "rewards": results["rewards"][:, best_idx],
+        "entropy": results["entropy"][:, best_idx],
+        "hstates": results["hstates"][:, best_idx],
+    }
+    return mean_emb, traj
 
 
 def score_and_embed_levels(evaluator, levels, n_rollouts=10):
@@ -227,6 +277,45 @@ def run_experiment(args):
 
     rng = jax.random.PRNGKey(args.seed)
 
+    # --- Proximity gate: compute seed embeddings and per-seed thresholds ---
+    proximity_ratio = args.proximity_gate_ratio  # 0 = disabled
+    seed_embeddings = None
+    proximity_thresholds = None  # per-seed L2 threshold
+
+    if proximity_ratio > 0:
+        print(f"\n  Computing seed & buffer embeddings for proximity gate "
+              f"(ratio={proximity_ratio:.2f})...")
+
+        # Embed all LLM seeds (mean over n_rollouts)
+        seed_embeddings = np.zeros((n_seeds, 257), dtype=np.float32)
+        for i, seed_level in enumerate(seeds):
+            seed_embeddings[i], _ = compute_embedding(
+                evaluator, seed_level, n_rollouts=args.n_scoring_rollouts)
+
+        # Embed organic buffer levels (mean over n_rollouts)
+        print(f"  Embedding {buffer_size} buffer levels...")
+        buffer_embeddings = np.zeros((buffer_size, 257), dtype=np.float32)
+        for i in range(buffer_size):
+            buffer_embeddings[i], _ = compute_embedding(
+                evaluator, buffer_levels[i], n_rollouts=args.n_scoring_rollouts)
+            if (i + 1) % 200 == 0:
+                print(f"    {i + 1}/{buffer_size}...")
+
+        # Per-seed: distance to nearest buffer level -> threshold
+        from scipy.spatial.distance import cdist
+        seed_to_buf = cdist(seed_embeddings, buffer_embeddings, metric="euclidean")
+        seed_nn_dist = seed_to_buf.min(axis=1)
+        proximity_thresholds = proximity_ratio * seed_nn_dist
+
+        for i in range(n_seeds):
+            print(f"    Seed {i}: dist_to_buffer={seed_nn_dist[i]:.4f}, "
+                  f"threshold={proximity_thresholds[i]:.4f}")
+
+        print(f"  Proximity gate ENABLED: mutation must have "
+              f"dist(mut, parent_seed) < {proximity_ratio:.2f} × dist(seed, nearest_buffer)")
+    else:
+        print(f"  Proximity gate DISABLED")
+
     # Accumulate eligible levels across rounds
     eligible_levels = []
     eligible_scores = []
@@ -235,6 +324,7 @@ def run_experiment(args):
     total_generated = 0
     total_scored = 0
     total_diversity_rejected = 0
+    total_proximity_rejected = 0
     round_num = 0
     batch_per_seed = args.batch_per_seed  # mutants per seed per round
     min_emb_div = args.min_embedding_diversity  # L2 threshold (0 = disabled)
@@ -264,7 +354,8 @@ def run_experiment(args):
         batch_seed_idx = np.array([pair[1] for pair in mutant_pairs])
 
         # Score + compute embeddings in a single pass (no double rollouts)
-        if min_emb_div > 0:
+        need_embeddings = min_emb_div > 0 or proximity_ratio > 0
+        if need_embeddings:
             print(f"  Scoring + embedding {n_gen} mutants ({args.n_scoring_rollouts} rollouts each)...")
             batch_scores, batch_embeddings = score_and_embed_levels(
                 evaluator, batch_levels, n_rollouts=args.n_scoring_rollouts)
@@ -278,13 +369,26 @@ def run_experiment(args):
         sfl_mask = batch_scores > buffer_min_score
         n_sfl_pass = int(sfl_mask.sum())
 
+        # Filter by proximity gate: mutation must stay near its parent seed
+        # dist(mutation, parent_seed) < proximity_ratio * dist(parent_seed, nearest_buffer)
+        n_prox_rejected = 0
+        mask = sfl_mask.copy()
+        if proximity_ratio > 0 and n_sfl_pass > 0:
+            for i in np.where(sfl_mask)[0]:
+                parent_idx = batch_seed_idx[i]
+                dist_to_parent = np.linalg.norm(batch_embeddings[i] - seed_embeddings[parent_idx])
+                if dist_to_parent > proximity_thresholds[parent_idx]:
+                    mask[i] = False
+                    n_prox_rejected += 1
+            total_proximity_rejected += n_prox_rejected
+
+        n_after_prox = int(mask.sum())
+
         # Filter by embedding diversity (greedy: each accepted must be > threshold from all prior)
         n_div_rejected = 0
-        mask = sfl_mask.copy()
-        if min_emb_div > 0 and n_sfl_pass > 0:
-            # Pre-stack accepted embeddings once (updated within batch as we accept)
+        if min_emb_div > 0 and n_after_prox > 0:
             accepted_arr = np.stack(eligible_embeddings) if eligible_embeddings else None
-            for i in np.where(sfl_mask)[0]:
+            for i in np.where(mask)[0]:
                 emb_i = batch_embeddings[i]
                 if accepted_arr is not None:
                     dists = np.linalg.norm(accepted_arr - emb_i, axis=1)
@@ -301,15 +405,20 @@ def run_experiment(args):
             total_diversity_rejected += n_div_rejected
 
         n_new = int(mask.sum())
-        div_str = f", {n_div_rejected} diversity-rejected" if min_emb_div > 0 else ""
+        gate_parts = []
+        if proximity_ratio > 0:
+            gate_parts.append(f"{n_prox_rejected} proximity-rejected")
+        if min_emb_div > 0:
+            gate_parts.append(f"{n_div_rejected} diversity-rejected")
+        gate_str = f", {', '.join(gate_parts)}" if gate_parts else ""
         print(f"  Eligible this round: {n_new}/{n_gen} "
-              f"(SFL pass: {n_sfl_pass}{div_str}, yield {n_new/max(n_gen,1):.0%})")
+              f"(SFL pass: {n_sfl_pass}{gate_str}, yield {n_new/max(n_gen,1):.0%})")
 
         for i in np.where(mask)[0]:
             eligible_levels.append(batch_levels[i])
             eligible_scores.append(batch_scores[i])
             eligible_seed_indices.append(batch_seed_idx[i])
-            if min_emb_div > 0:
+            if need_embeddings:
                 eligible_embeddings.append(batch_embeddings[i])
 
         # Per-seed breakdown this round
@@ -328,6 +437,9 @@ def run_experiment(args):
     print(f"  Rounds: {round_num}, total generated: {total_generated}, "
           f"total scored: {total_scored}")
     print(f"  Eligible: {n_eligible} (overall yield {n_eligible/max(total_scored,1):.0%})")
+    if proximity_ratio > 0:
+        print(f"  Proximity-rejected: {total_proximity_rejected} "
+              f"(ratio: {proximity_ratio:.2f})")
     if min_emb_div > 0:
         print(f"  Diversity-rejected: {total_diversity_rejected} "
               f"(threshold: {min_emb_div:.3f} L2)")
@@ -340,6 +452,7 @@ def run_experiment(args):
             "generation/n_eligible": n_eligible,
             "generation/yield_pct": n_eligible / max(total_scored, 1),
             "generation/total_diversity_rejected": total_diversity_rejected,
+            "generation/total_proximity_rejected": total_proximity_rejected,
         })
 
     if n_eligible == 0:
@@ -523,6 +636,9 @@ def run_experiment(args):
         "injections": injection_summary,
         "min_embedding_diversity": min_emb_div,
         "total_diversity_rejected": total_diversity_rejected,
+        "proximity_gate_ratio": proximity_ratio,
+        "total_proximity_rejected": total_proximity_rejected,
+        "proximity_thresholds": proximity_thresholds.tolist() if proximity_thresholds is not None else None,
         "n_scoring_rollouts": args.n_scoring_rollouts,
         "agent_checkpoint": args.agent_checkpoint_dir,
         "buffer_npz": args.buffer_npz,
@@ -593,6 +709,11 @@ if __name__ == "__main__":
                         help="Min L2 distance in 257D embedding space between accepted "
                              "mutations. Set to 0 to disable. Default 0.35 matches organic "
                              "buffer 1-NN p25.")
+    parser.add_argument("--proximity_gate_ratio", type=float, default=0.0,
+                        help="Proximity gate: mutation must have dist(mut, parent_seed) < "
+                             "ratio * dist(parent_seed, nearest_buffer_level). "
+                             "Set to 0 to disable. E.g. 0.5 means mutations must stay "
+                             "within half the seed-to-buffer distance.")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="experiments/results/default")

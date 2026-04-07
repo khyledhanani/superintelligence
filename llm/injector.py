@@ -153,25 +153,46 @@ class LLMInjectionManager:
         eval_freq: int,
         agent_evaluator=None,
         level_cache: Optional[LevelCache] = None,
+        training_config: Optional[dict] = None,
     ) -> None:
         self.config = config
         self.level_sampler = level_sampler
         self.eval_freq = eval_freq
         self.agent_evaluator = agent_evaluator  # AgentEvaluator instance (None if gate disabled)
         self.level_cache = level_cache  # LevelCache instance (None if caching disabled)
+        self.training_config = training_config  # mutable training config dict from maze_plr.py
 
         # Buffer stats extractor for reference maze selection
         self.buffer_stats = BufferStatsExtractor(
             n_references=config.n_reference_mazes,
             strategy=config.reference_maze_strategy,
+            hybrid_difficulty_percentile=config.hybrid_difficulty_percentile,
         )
 
         # Initialize MazeGenerator from config
         gen_config = self._build_generation_config(config)
         self.generator = MazeGenerator(gen_config)
 
+        # Load prompt metric config from YAML (controls which metrics appear in LLM prompt)
+        self._prompt_metrics = None
+        self._pairwise_metrics_cfg = None
+        self._downsample_points = 20
+        if config.config_path:
+            import yaml
+            with open(config.config_path) as f:
+                yaml_cfg = yaml.safe_load(f) or {}
+            self._prompt_metrics = yaml_cfg.get("prompt_metrics")
+            self._pairwise_metrics_cfg = yaml_cfg.get("pairwise_metrics")
+            self._downsample_points = yaml_cfg.get("downsample_points", 20)
+
         # Wall-flip mutation function (JAX-compiled)
         self.mutate_level = make_level_mutator_minimax(100)
+
+        # Track next ancestor_id for online injection (incremented per LLM seed)
+        self.next_ancestor_id = 0
+
+        # Mutable fixed-distribution slot count (avoids wandb config immutability)
+        self.fixed_dist_n_llm = 0
 
         # Cumulative counters for WandB logging
         self.total_injected = 0
@@ -205,6 +226,7 @@ class LLMInjectionManager:
                 "min_walls": "min_walls",
                 "min_path_distance": "min_path_distance",
                 "validate_solvable": "validate_solvable",
+                "effort": "effort",
             }
             for yaml_key, cfg_key in field_map.items():
                 if yaml_key in yaml_cfg:
@@ -247,7 +269,10 @@ class LLMInjectionManager:
         if current_step < self.config.inject_start_step:
             return runner_state
 
-        if current_step % self.config.injection_interval != 0:
+        # First injection fires exactly at inject_start_step;
+        # subsequent injections are spaced by injection_interval from that point.
+        steps_since_start = current_step - self.config.inject_start_step
+        if steps_since_start != 0 and steps_since_start % self.config.injection_interval != 0:
             return runner_state
 
         print(f"[LLM] Injection event at step {current_step} (eval_step={eval_step})", flush=True)
@@ -297,8 +322,33 @@ class LLMInjectionManager:
             self.agent_evaluator.update_params(train_state.params)
 
         # ---------------------------------------------------------------
+        # Step 1b: Recompute buffer embeddings if buffer_state == "fresh"
+        # ---------------------------------------------------------------
+        if self.config.buffer_state == "fresh" and self.agent_evaluator is not None:
+            buf_size = int(np.asarray(sampler["size"]))
+            logger.info(f"[LLM] Recomputing buffer embeddings (fresh) for {buf_size} levels...")
+            _t_fresh = time.time()
+            from metrics.standalone.cenie import extract_state_action_pairs
+            _be = getattr(self, '_buffer_embeddings', None)
+            if _be is not None:
+                levels_pytree = sampler["levels"]
+                all_levels = [jax.tree_util.tree_map(lambda x: x[i], levels_pytree) for i in range(buf_size)]
+                all_trajs = self.agent_evaluator.evaluate_levels(all_levels)
+                for i, traj in enumerate(all_trajs):
+                    pairs = extract_state_action_pairs(traj)
+                    if pairs is not None and len(pairs) > 0:
+                        _be[i] = pairs.mean(axis=0)
+                    else:
+                        _be[i] = 0.0
+                logger.info(f"[LLM] Fresh embeddings computed in {time.time() - _t_fresh:.1f}s")
+
+        # ---------------------------------------------------------------
         # Step 2: Extract references and buffer summary
         # ---------------------------------------------------------------
+        # Pass buffer embeddings to extractor for kmedoid strategies
+        buffer_embeddings_for_refs = getattr(self, '_buffer_embeddings', None)
+        self.buffer_stats._buffer_embeddings = buffer_embeddings_for_refs
+
         if gate_active:
             references, ref_levels = self.buffer_stats.extract_references_with_levels(sampler)
         else:
@@ -322,6 +372,16 @@ class LLMInjectionManager:
                 )
                 ref_trajectories.append(traj)
                 ref_labels.append(ref.label)
+
+            # Enrich references with trajectory-based metrics for the LLM prompt
+            from llm.reference_metrics import enrich_references_with_metrics
+            references, _ = enrich_references_with_metrics(
+                references,
+                trajectories=ref_trajectories,
+                downsample_points=self._downsample_points,
+                prompt_metrics=self._prompt_metrics,
+                pairwise_metrics_cfg=self._pairwise_metrics_cfg,
+            )
 
         # Fit CENIE model if using cenie diversity metric
         # Precompute reference embeddings for L2 embedding diversity
@@ -350,6 +410,8 @@ class LLMInjectionManager:
         mode = self.config.difficulty_gate_mode
         if mode == "fixed":
             effective_threshold = self.config.difficulty_threshold
+        elif mode == "buffer_min":
+            effective_threshold = float(buffer_scores.min())
         elif mode == "buffer_mean":
             effective_threshold = float(buffer_scores.mean())
         elif mode == "reference_mean":
@@ -389,6 +451,7 @@ class LLMInjectionManager:
 
         thresholds = DiversityThresholds(
             difficulty_threshold=effective_threshold,
+            difficulty_metric="sfl",
             min_diversity=effective_diversity,
             diversity_metric=self.config.diversity_metric,
         )
@@ -505,57 +568,127 @@ class LLMInjectionManager:
         # ---------------------------------------------------------------
         mutations_generated = 0
         mutations_solvable = 0
+        mutations_prox_rejected = 0
         mutation_levels = []
+        mutation_ancestor_ids = []
+
+        # Compute seed embeddings for proximity gating of mutations
+        prox_ratio = self.training_config.get("proximity_gate_ratio", 0) if self.training_config else 0
+        seed_emb_cache = {}  # seed_idx -> (embedding, threshold)
+        if prox_ratio > 0 and self.agent_evaluator is not None and valid_levels:
+            # Compute organic centroid for threshold calculation
+            buf_size = int(np.asarray(sampler["size"]))
+            _be = getattr(self, '_buffer_embeddings', None)
+            if _be is not None:
+                nonzero = np.any(_be[:buf_size] != 0, axis=1)
+                anc_ids = np.asarray(sampler["levels_extra"]["ancestor_id"][:buf_size])
+                org_mask = (anc_ids < 0) & nonzero
+                organic_centroid = _be[:buf_size][org_mask].mean(axis=0) if org_mask.any() else np.zeros(257)
+            else:
+                organic_centroid = np.zeros(257, dtype=np.float32)
+
+            for si, level in enumerate(valid_levels):
+                traj = self.agent_evaluator.evaluate_level_multi_rollout(
+                    level, n_rollouts=self.config.n_rollouts_gate)
+                from metrics.standalone.cenie import extract_state_action_pairs
+                pairs = extract_state_action_pairs(traj)
+                if pairs is not None and len(pairs) > 0:
+                    emb = pairs.mean(axis=0)
+                else:
+                    emb = np.zeros(257, dtype=np.float32)
+                dist = float(np.linalg.norm(emb - organic_centroid))
+                seed_emb_cache[si] = (emb, prox_ratio * dist)
+
+        # Assign ancestor IDs before mutation step (needed for mutation_ancestor_ids)
+        seed_ancestor_ids = []
+        for _ in valid_levels:
+            seed_ancestor_ids.append(self.next_ancestor_id)
+            self.next_ancestor_id += 1
 
         if self.config.amplification_enabled and valid_levels:
-            total_so_far = len(valid_levels)
-            max_mutation_rounds = 10  # safety cap to avoid infinite loop
-            for seed_level in valid_levels:
-                if total_so_far + len(mutation_levels) >= self.config.max_inject_per_event:
-                    break
+            # Determine mutation target: either fixed per-seed or fill-to-target
+            target_pct = self.config.target_buffer_pct
+            buf_capacity = int(sampler["scores"].shape[0])
+            if target_pct > 0:
+                # Target fill mode: generate mutations until buffer has target_pct LLM levels
+                buf_size = int(np.asarray(sampler["size"]))
+                target_total = max(1, int(target_pct * buf_capacity))
+                # Count seeds already accepted (they'll be inserted)
+                mutation_target = max(0, target_total - len(valid_levels))
+                max_attempts = mutation_target * 10  # safety cap
+                print(f"[LLM] Mutation target: {mutation_target} levels "
+                      f"(target {target_total} = {target_pct:.0%} of {buf_capacity}, "
+                      f"{len(valid_levels)} seeds, max {max_attempts} attempts)",
+                      flush=True)
+            else:
+                # Fixed per-seed mode (original behavior)
+                mutation_target = self.config.mutations_per_seed * len(valid_levels)
+                max_attempts = mutation_target * 10
 
-                target = self.config.mutations_per_seed
-                seed_mutations = []
+            n_seeds = len(valid_levels)
+            seed_cycle = 0  # round-robin across seeds
+            attempts = 0
 
-                for round_idx in range(max_mutation_rounds):
-                    if len(seed_mutations) >= target:
+            while len(mutation_levels) < mutation_target and attempts < max_attempts:
+                seed_idx = seed_cycle % n_seeds
+                seed_level = valid_levels[seed_idx]
+                seed_cycle += 1
+
+                # Generate a batch of mutations from this seed
+                n_batch = min(50, max_attempts - attempts)
+                attempts += n_batch
+                mutations_generated += n_batch
+                rng, mut_rng = jax.random.split(rng)
+                mut_rngs = jax.random.split(mut_rng, n_batch)
+                mutated_levels = jax.vmap(
+                    lambda r: self.mutate_level(r, seed_level, 3)
+                )(mut_rngs)
+
+                # Filter by solvability (BFS, Python-side)
+                wall_map_batch = np.asarray(mutated_levels.wall_map)
+                agent_pos_batch = np.asarray(mutated_levels.agent_pos)
+                goal_pos_batch = np.asarray(mutated_levels.goal_pos)
+
+                for j in range(n_batch):
+                    if len(mutation_levels) >= mutation_target:
                         break
-                    if total_so_far + len(mutation_levels) + len(seed_mutations) >= self.config.max_inject_per_event:
-                        break
 
-                    # Generate a batch of mutations
-                    n_batch = min(target * 2, 100)  # generate 2x target per round
-                    mutations_generated += n_batch
-                    rng, mut_rng = jax.random.split(rng)
-                    mut_rngs = jax.random.split(mut_rng, n_batch)
-                    mutated_levels = jax.vmap(
-                        lambda r: self.mutate_level(r, seed_level, 3)
-                    )(mut_rngs)
+                    if self.config.mutations_solvability_check:
+                        wm = wall_map_batch[j]
+                        ap = (int(agent_pos_batch[j, 0]), int(agent_pos_batch[j, 1]))
+                        gp = (int(goal_pos_batch[j, 0]), int(goal_pos_batch[j, 1]))
+                        path_len = _bfs_path_length(wm, ap, gp)
+                        if path_len < 0:
+                            continue
 
-                    # Filter by solvability (BFS, Python-side)
-                    wall_map_batch = np.asarray(mutated_levels.wall_map)
-                    agent_pos_batch = np.asarray(mutated_levels.agent_pos)
-                    goal_pos_batch = np.asarray(mutated_levels.goal_pos)
-
-                    for j in range(n_batch):
-                        if len(seed_mutations) >= target:
-                            break
-
-                        if self.config.mutations_solvability_check:
-                            wm = wall_map_batch[j]
-                            ap = (int(agent_pos_batch[j, 0]), int(agent_pos_batch[j, 1]))
-                            gp = (int(goal_pos_batch[j, 0]), int(goal_pos_batch[j, 1]))
-                            path_len = _bfs_path_length(wm, ap, gp)
-                            if path_len < 0:
-                                continue
-
+                    # Proximity gate: check L2 distance from parent seed
+                    if seed_idx in seed_emb_cache and self.agent_evaluator is not None:
                         mutation = jax.tree_util.tree_map(lambda x: x[j], mutated_levels)
-                        seed_mutations.append(mutation)
+                        mut_traj = self.agent_evaluator.evaluate_level_multi_rollout(
+                            mutation, n_rollouts=1)
+                        from metrics.standalone.cenie import extract_state_action_pairs
+                        mut_pairs = extract_state_action_pairs(mut_traj)
+                        if mut_pairs is not None and len(mut_pairs) > 0:
+                            mut_emb = mut_pairs.mean(axis=0)
+                            seed_emb, threshold = seed_emb_cache[seed_idx]
+                            dist = float(np.linalg.norm(mut_emb - seed_emb))
+                            if dist > threshold:
+                                mutations_prox_rejected += 1
+                                continue
+                    else:
+                        mutation = jax.tree_util.tree_map(lambda x: x[j], mutated_levels)
 
-                mutations_solvable += len(seed_mutations)
-                mutation_levels.extend(seed_mutations)
-                if len(seed_mutations) < target:
-                    print(f"[LLM] Warning: only found {len(seed_mutations)}/{target} solvable mutations after {max_mutation_rounds} rounds", flush=True)
+                    mutation_levels.append(mutation)
+                    # Track which seed this mutation came from
+                    mutation_ancestor_ids.append(seed_ancestor_ids[seed_idx])
+
+            mutations_solvable = len(mutation_levels)
+            print(f"[LLM] Mutations: {mutations_solvable} accepted from "
+                  f"{mutations_generated} generated ({attempts} attempts, "
+                  f"{mutations_prox_rejected} proximity-rejected)", flush=True)
+
+        if mutations_prox_rejected > 0:
+            print(f"[LLM] Proximity gate rejected {mutations_prox_rejected} mutations", flush=True)
 
         total_levels_to_inject = len(valid_levels) + len(mutation_levels)
         logger.info(f"[LLM] Injecting {total_levels_to_inject} levels "
@@ -569,7 +702,7 @@ class LLMInjectionManager:
         retained_seeds = 0
         retained_mutations = 0
 
-        # --- Insert seeds ---
+        # --- Insert seeds (ancestor IDs assigned before step 5) ---
         if valid_levels:
             if mode == "competitive":
                 # Competitive: use actual SFL scores from gate evaluation
@@ -587,34 +720,104 @@ class LLMInjectionManager:
             seed_batch = jax.tree_util.tree_map(
                 lambda *xs: jnp.stack(xs), *valid_levels
             )
+            seed_extras = {
+                "ancestor_id": jnp.array(seed_ancestor_ids, dtype=jnp.int32),
+                "max_return": jnp.full(len(valid_levels), -jnp.inf),
+            }
             new_sampler, seed_indices = self.level_sampler.insert_batch(
-                sampler, seed_batch, seed_scores_arr
+                sampler, seed_batch, seed_scores_arr, level_extras=seed_extras
             )
             retained_seeds = int(jnp.sum(seed_indices >= 0))
             train_state = train_state.replace(sampler=new_sampler)
             sampler = new_sampler
 
-        # --- Insert mutations with actual SFL scores (standard buffer competition) ---
+            # Update numpy provenance arrays for seeds (origin=1)
+            if hasattr(self, '_buffer_origins') and self._buffer_origins is not None:
+                for i, slot in enumerate(np.asarray(seed_indices)):
+                    if slot >= 0:
+                        self._buffer_origins[slot] = 1  # LLM original
+                        self._buffer_ancestor_ids[slot] = seed_ancestor_ids[i]
+
+        # --- Filter mutations by buffer_min SFL, then force-insert passing ones ---
         if mutation_levels and self.agent_evaluator is not None:
             logger.info(f"[LLM] Scoring {len(mutation_levels)} mutations via 10-rollout SFL eval...")
+            buf_size = int(np.asarray(sampler["size"]))
+            buf_min_score = float(np.asarray(sampler["scores"][:buf_size]).min()) if buf_size > 0 else 0.0
+            buf_max_score = float(np.asarray(sampler["scores"][:buf_size]).max()) if buf_size > 0 else 1.0
+            inject_score = buf_max_score + 1e-4  # max-priority to guarantee insertion
+
+            passing_levels = []
+            passing_ancestor_ids = []
             mut_sfl_scores = []
-            for mut_level in mutation_levels:
+            mut_rejected_sfl = 0
+            for idx_m, mut_level in enumerate(mutation_levels):
                 traj = self.agent_evaluator.evaluate_level_multi_rollout(mut_level, n_rollouts=10)
                 p = traj.get("solve_rate", 0.0)
-                mut_sfl_scores.append(p * (1.0 - p))
+                sfl = p * (1.0 - p)
+                mut_sfl_scores.append(sfl)
+                if sfl >= buf_min_score:
+                    passing_levels.append(mut_level)
+                    passing_ancestor_ids.append(mutation_ancestor_ids[idx_m])
+                else:
+                    mut_rejected_sfl += 1
 
-            mut_batch = jax.tree_util.tree_map(
-                lambda *xs: jnp.stack(xs), *mutation_levels
-            )
-            mut_scores_arr = jnp.array(mut_sfl_scores, dtype=jnp.float32)
-            new_sampler, mut_indices = self.level_sampler.insert_batch(
-                sampler, mut_batch, mut_scores_arr
-            )
-            retained_mutations = int(jnp.sum(mut_indices >= 0))
-            train_state = train_state.replace(sampler=new_sampler)
-            sampler = new_sampler
-            logger.info(f"[LLM] Mutations: {retained_mutations}/{len(mutation_levels)} inserted "
-                        f"(mean SFL={np.mean(mut_sfl_scores):.4f})")
+            logger.info(f"[LLM] Mutation SFL filter: {len(passing_levels)}/{len(mutation_levels)} passed "
+                        f"(>= buffer_min {buf_min_score:.4f}), "
+                        f"{mut_rejected_sfl} rejected, mean SFL={np.mean(mut_sfl_scores):.4f}")
+
+            if passing_levels:
+                # Direct buffer write: find slots with lowest raw scores and overwrite them.
+                # Bypasses PLR weight-based insertion which fights freshness/staleness.
+                buf_size = int(np.asarray(sampler["size"]))
+                raw_scores = np.asarray(sampler["scores"][:buf_size])
+                # Sort by score ascending — weakest first
+                weakest_slots = np.argsort(raw_scores)
+                n_to_insert = min(len(passing_levels), len(weakest_slots))
+
+                mut_batch = jax.tree_util.tree_map(
+                    lambda *xs: jnp.stack(xs), *passing_levels[:n_to_insert]
+                )
+                target_slots = jnp.array(weakest_slots[:n_to_insert], dtype=jnp.int32)
+
+                # Write levels, scores, extras directly into target slots
+                new_levels = sampler["levels"]
+                for i in range(n_to_insert):
+                    slot = int(target_slots[i])
+                    level_i = jax.tree_util.tree_map(lambda x: x[i], mut_batch)
+                    new_levels = jax.tree_util.tree_map(
+                        lambda buf, val: buf.at[slot].set(val), new_levels, level_i)
+
+                new_scores = sampler["scores"].at[target_slots].set(
+                    jnp.full(n_to_insert, inject_score, dtype=jnp.float32))
+                new_timestamps = sampler["timestamps"].at[target_slots].set(
+                    jnp.full(n_to_insert, sampler["episode_count"] + 1, dtype=jnp.int32))
+
+                new_extras = sampler["levels_extra"]
+                new_anc = new_extras["ancestor_id"].at[target_slots].set(
+                    jnp.array(passing_ancestor_ids[:n_to_insert], dtype=jnp.int32))
+                new_maxret = new_extras["max_return"].at[target_slots].set(
+                    jnp.full(n_to_insert, -jnp.inf))
+                new_extras = {**new_extras, "ancestor_id": new_anc, "max_return": new_maxret}
+
+                new_sampler = {**sampler,
+                               "levels": new_levels,
+                               "scores": new_scores,
+                               "timestamps": new_timestamps,
+                               "levels_extra": new_extras,
+                               "episode_count": sampler["episode_count"] + n_to_insert}
+                retained_mutations = n_to_insert
+                train_state = train_state.replace(sampler=new_sampler)
+                sampler = new_sampler
+                logger.info(f"[LLM] Mutations: {retained_mutations}/{len(passing_levels)} inserted "
+                            f"(direct write to {n_to_insert} weakest slots, "
+                            f"mean SFL={np.mean(mut_sfl_scores):.4f})")
+
+                # Update numpy provenance arrays
+                if hasattr(self, '_buffer_origins') and self._buffer_origins is not None:
+                    for i in range(n_to_insert):
+                        slot = int(target_slots[i])
+                        self._buffer_origins[slot] = 2  # LLM mutation descendant
+                        self._buffer_ancestor_ids[slot] = passing_ancestor_ids[i]
         elif mutation_levels:
             # No agent evaluator (gate disabled) — insert with max priority (legacy fallback)
             buf_size = int(np.asarray(sampler["size"]))
@@ -624,18 +827,72 @@ class LLMInjectionManager:
                 lambda *xs: jnp.stack(xs), *mutation_levels
             )
             mut_scores_arr = jnp.full(len(mutation_levels), inject_score, dtype=jnp.float32)
+            mut_extras = {
+                "ancestor_id": jnp.array(mutation_ancestor_ids[:len(mutation_levels)], dtype=jnp.int32),
+                "max_return": jnp.full(len(mutation_levels), -jnp.inf),
+            }
             new_sampler, mut_indices = self.level_sampler.insert_batch(
-                sampler, mut_batch, mut_scores_arr
+                sampler, mut_batch, mut_scores_arr, level_extras=mut_extras
             )
             retained_mutations = int(jnp.sum(mut_indices >= 0))
             train_state = train_state.replace(sampler=new_sampler)
             sampler = new_sampler
+
+            # Update numpy provenance arrays for mutations (origin=2)
+            if hasattr(self, '_buffer_origins') and self._buffer_origins is not None:
+                for i, slot in enumerate(np.asarray(mut_indices)):
+                    if slot >= 0:
+                        self._buffer_origins[slot] = 2
+                        self._buffer_ancestor_ids[slot] = mutation_ancestor_ids[i]
 
         retained_count = retained_seeds + retained_mutations
         retained_rate = retained_count / total_levels_to_inject if total_levels_to_inject > 0 else 0.0
 
         if total_levels_to_inject == 0:
             logger.warning("[LLM] No levels accepted for injection this event")
+
+        # ---------------------------------------------------------------
+        # Step 5b: Update fixed_distribution and proximity gate for online injection
+        # ---------------------------------------------------------------
+        if retained_count > 0 and self.training_config is not None:
+            # Update fixed distribution slot count on train_state (JIT-visible)
+            if self.training_config.get("fixed_distribution"):
+                buf_size = int(np.asarray(sampler["size"]))
+                ancestor_ids = np.asarray(sampler["levels_extra"]["ancestor_id"][:buf_size])
+                n_llm_in_buffer = int((ancestor_ids >= 0).sum())
+                if n_llm_in_buffer > 0 and buf_size > 0:
+                    injection_pct = n_llm_in_buffer / buf_size
+                    n_train_envs = self.training_config.get("num_train_envs", 32)
+                    n_llm_slots = max(1, round(injection_pct * n_train_envs))
+                    train_state = train_state.replace(
+                        fixed_dist_n_llm=jnp.int32(n_llm_slots))
+                    print(f"[LLM] Fixed distribution updated: {injection_pct:.1%} LLM in buffer -> "
+                          f"{n_llm_slots}/{n_train_envs} replay slots",
+                          flush=True)
+
+            # Register seed embeddings for proximity gate (reuse cache from step 5)
+            if prox_ratio > 0 and valid_levels and seed_emb_cache:
+                max_anc = self.training_config.get("max_llm_ancestors", 256)
+                seed_embs = np.array(train_state.seed_embeddings, copy=True)
+                prox_thresholds = np.array(train_state.proximity_thresholds, copy=True)
+
+                for i in range(len(valid_levels)):
+                    anc_id = seed_ancestor_ids[i]
+                    if anc_id >= max_anc or i not in seed_emb_cache:
+                        continue
+                    emb, threshold = seed_emb_cache[i]
+                    seed_embs[anc_id] = emb
+                    prox_thresholds[anc_id] = threshold
+                    print(f"[LLM] Seed ancestor {anc_id}: threshold={threshold:.4f}", flush=True)
+
+                n_seeds = int((prox_thresholds < np.inf).sum())
+                train_state = train_state.replace(
+                    seed_embeddings=jnp.array(seed_embs),
+                    proximity_thresholds=jnp.array(prox_thresholds),
+                    n_seeds=jnp.int32(n_seeds),
+                )
+                print(f"[LLM] Registered {len(valid_levels)} new seed embeddings "
+                      f"({n_seeds} total ancestors)", flush=True)
 
         # ---------------------------------------------------------------
         # Step 6: Update counters and WandB logging
@@ -663,6 +920,7 @@ class LLMInjectionManager:
             "llm/injection_time_seconds": injection_time,
             "llm/total_injected": self.total_injected,
             "llm/mutation_survival_rate": mutation_survival_rate,
+            "llm/mutations_prox_rejected": mutations_prox_rejected,
             # Gate-specific metrics (GATE-03)
             "llm/diversity_score_mean": float(np.mean(diversity_scores)) if diversity_scores else 0.0,
             "llm/difficulty_score_mean": float(np.mean(difficulty_scores)) if difficulty_scores else 0.0,

@@ -29,6 +29,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from sklearn.manifold import TSNE
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'examples'))
@@ -132,12 +133,40 @@ def load_buffer_dump(local_dir, updates):
     d = np.load(path, allow_pickle=True)
     size = int(d["size"]) if "size" in d else len(d["tokens"])
     origins = d["origins"][:size] if "origins" in d else np.zeros(size, dtype=np.int32)
+    ancestor_ids = d["ancestor_ids"][:size] if "ancestor_ids" in d else np.full(size, -1, dtype=np.int32)
     return {
         "tokens": d["tokens"][:size],
         "origins": origins,
         "scores": d["scores"][:size],
+        "ancestor_ids": ancestor_ids,
         "size": size,
     }
+
+
+EVAL_LEVEL_NAMES = [
+    "SixteenRooms", "SixteenRooms2", "Labyrinth", "LabyrinthFlipped",
+    "Labyrinth2", "StandardMaze", "StandardMaze2", "StandardMaze3",
+]
+
+EVAL_LEVEL_SHORT = {
+    "SixteenRooms": "16R", "SixteenRooms2": "16R2",
+    "Labyrinth": "Lab", "LabyrinthFlipped": "LabF",
+    "Labyrinth2": "Lab2", "StandardMaze": "SM",
+    "StandardMaze2": "SM2", "StandardMaze3": "SM3",
+}
+
+
+def get_eval_level_tokens():
+    """Get token arrays for the 8 eval benchmark levels."""
+    from jaxued.environments.maze.level import prefabs, Level
+    from vae_level_utils import level_to_tokens
+
+    tokens_list = []
+    for name in EVAL_LEVEL_NAMES:
+        level = Level.from_str(prefabs[name])
+        tok = np.asarray(level_to_tokens(level))
+        tokens_list.append(tok)
+    return np.stack(tokens_list)
 
 
 def compute_embeddings(tokens, checkpoint_dir, ckpt_step, batch_size=256, num_rollouts=5):
@@ -237,8 +266,19 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                         "embeddings": cached["embeddings"],
                         "origins": cached["origins"],
                         "scores": cached["scores"],
+                        "ancestor_ids": cached["ancestor_ids"] if "ancestor_ids" in cached else np.full(len(cached["origins"]), -1, dtype=np.int32),
                     }
-                    continue
+                    if "eval_embeddings" in cached:
+                        data[key]["eval_embeddings"] = cached["eval_embeddings"]
+                    elif args.show_eval_levels and not args.cache_only:
+                        # Eval embeddings not in cache — need to compute them
+                        # Fall through to computation path below
+                        print(f"    Eval embeddings not cached, will compute...")
+                        pass
+                    else:
+                        continue
+                    if "eval_embeddings" in data[key] or not args.show_eval_levels:
+                        continue
                 elif args.cache_only:
                     print(f"    SKIP: not cached (--cache_only)")
                     continue
@@ -294,18 +334,106 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
                 "embeddings": embeddings,
                 "origins": buf["origins"],
                 "scores": buf["scores"],
+                "ancestor_ids": buf["ancestor_ids"],
             }
 
+            # Compute eval level embeddings if requested (behavioral mode only)
+            if args.show_eval_levels and not is_structural:
+                eval_tokens = get_eval_level_tokens()
+                print(f"    Computing eval level embeddings ({len(eval_tokens)} levels)...")
+                eval_embeddings = compute_embeddings(
+                    eval_tokens, ckpt_run_dir, ckpt_step,
+                    batch_size=args.batch_size,
+                    num_rollouts=args.num_rollouts,
+                )
+                if eval_embeddings is not None:
+                    data[key]["eval_embeddings"] = eval_embeddings
+
             if args.cache_dir:
-                np.savez_compressed(cache_path,
-                                    embeddings=embeddings,
-                                    origins=buf["origins"],
-                                    scores=buf["scores"])
+                save_data = {
+                    "embeddings": embeddings,
+                    "origins": buf["origins"],
+                    "scores": buf["scores"],
+                    "ancestor_ids": buf["ancestor_ids"],
+                }
+                if "eval_embeddings" in data[key]:
+                    save_data["eval_embeddings"] = data[key]["eval_embeddings"]
+                np.savez_compressed(cache_path, **save_data)
                 print(f"    Cached")
 
     if not data:
         print(f"No data loaded for {inject_pct}. Skipping.")
         return None
+
+    # --- Step 1b: Collect seed (original) tokens and ensure embeddings at every timestep ---
+    # Extract raw tokens for each LLM seed from buffer dumps where they appear as originals
+    seed_tokens_by_ancestor = {}  # ancestor_id -> token array (1, seq_len)
+    for seed_run in seeds:
+        run_name = f"inject_llm_{inject_pct}_seed{seed_run}"
+        buffer_local = os.path.join(args.local_data_root, run_name, "buffer_dumps")
+        for ts in timesteps:
+            buf = load_buffer_dump(buffer_local, ts)
+            if buf is None:
+                continue
+            orig_mask = buf["origins"] == 1
+            for idx in np.where(orig_mask)[0]:
+                aid = int(buf["ancestor_ids"][idx])
+                if aid not in seed_tokens_by_ancestor:
+                    seed_tokens_by_ancestor[aid] = buf["tokens"][idx:idx+1]
+
+    if seed_tokens_by_ancestor:
+        # Stack all seed tokens into a single array for batch embedding
+        sorted_seed_aids = sorted(seed_tokens_by_ancestor.keys())
+        seed_tokens_all = np.concatenate([seed_tokens_by_ancestor[a] for a in sorted_seed_aids], axis=0)
+        print(f"\n  Found {len(sorted_seed_aids)} LLM seed originals: {sorted_seed_aids}")
+
+        # For each (seed_run, timestep), compute seed embeddings if not already in data
+        for seed_run in seeds:
+            run_name = f"inject_llm_{inject_pct}_seed{seed_run}"
+            ckpt_local = os.path.join(args.local_data_root, run_name, "checkpoints")
+
+            for ts in timesteps:
+                key = (seed_run, ts)
+                if key not in data:
+                    continue
+
+                # Check if seed embeddings already cached
+                if args.cache_dir:
+                    cache_path = os.path.join(args.cache_dir,
+                                              f"{cache_prefix}_{inject_pct}_s{seed_run}_t{ts}.npz")
+                    if os.path.exists(cache_path):
+                        cached = np.load(cache_path)
+                        if "seed_embeddings" in cached and "seed_ancestor_ids" in cached:
+                            data[key]["seed_embeddings"] = cached["seed_embeddings"]
+                            data[key]["seed_ancestor_ids"] = cached["seed_ancestor_ids"]
+                            continue
+
+                if is_structural:
+                    seed_emb = tokens_to_structural_features(seed_tokens_all, grid_size=args.grid_size)
+                else:
+                    ckpt_step = updates_to_ckpt_step(ts)
+                    ckpt_run_dir = os.path.join(ckpt_local, run_name, str(seed_run))
+                    if not os.path.exists(os.path.join(ckpt_run_dir, "config.json")):
+                        continue
+                    seed_rollouts = args.seed_num_rollouts
+                    print(f"    Computing seed embeddings at t={ts} (ckpt {ckpt_step}, {seed_rollouts} rollouts)...")
+                    seed_emb = compute_embeddings(
+                        seed_tokens_all, ckpt_run_dir, ckpt_step,
+                        batch_size=args.batch_size,
+                        num_rollouts=seed_rollouts,
+                    )
+                    if seed_emb is None:
+                        continue
+
+                data[key]["seed_embeddings"] = seed_emb
+                data[key]["seed_ancestor_ids"] = np.array(sorted_seed_aids, dtype=np.int32)
+
+                # Update cache
+                if args.cache_dir and os.path.exists(cache_path):
+                    cached = dict(np.load(cache_path))
+                    cached["seed_embeddings"] = seed_emb
+                    cached["seed_ancestor_ids"] = np.array(sorted_seed_aids, dtype=np.int32)
+                    np.savez_compressed(cache_path, **cached)
 
     # --- Step 2 + 3: Fit per-cell t-SNE and plot ---
     print(f"\n=== Step 2: Fitting per-cell t-SNE (perplexity={args.tsne_perplexity}) ===")
@@ -333,43 +461,206 @@ def run_single_pct(inject_pct, seeds, timesteps, args):
             n_done += 1
             emb = data[key]["embeddings"]
             origins = data[key]["origins"]
-            print(f"  t-SNE for seed {seed}, {ts} upd ({len(emb)} pts) [{n_done}/{n_total}]...")
 
-            tsne = TSNE(n_components=2, perplexity=min(args.tsne_perplexity, len(emb) - 1),
+            # Optionally include eval benchmark levels in the t-SNE
+            eval_emb = data[key].get("eval_embeddings", None)
+            n_eval = len(eval_emb) if eval_emb is not None else 0
+
+            # Include seed original embeddings (even if evicted from buffer)
+            seed_emb = data[key].get("seed_embeddings", None)
+            seed_aids = data[key].get("seed_ancestor_ids", None)
+            n_seeds = len(seed_emb) if seed_emb is not None else 0
+
+            parts = [emb]
+            extra_label = ""
+            if n_eval > 0:
+                parts.append(eval_emb)
+                extra_label += f"+{n_eval} eval"
+            if n_seeds > 0:
+                parts.append(seed_emb)
+                extra_label += f"+{n_seeds} seeds"
+            combined = np.concatenate(parts, axis=0) if len(parts) > 1 else emb
+            print(f"  t-SNE for seed {seed}, {ts} upd ({len(emb)}{extra_label} pts) [{n_done}/{n_total}]...")
+
+            tsne = TSNE(n_components=2, perplexity=min(args.tsne_perplexity, len(combined) - 1),
                         random_state=42, max_iter=1000, learning_rate='auto', init='pca')
-            coords = tsne.fit_transform(emb)
+            all_coords = tsne.fit_transform(combined)
+            coords = all_coords[:len(emb)]
+            offset = len(emb)
+            if n_eval > 0:
+                eval_coords = all_coords[offset:offset + n_eval]
+                offset += n_eval
+            else:
+                eval_coords = None
+            if n_seeds > 0:
+                seed_coords = all_coords[offset:offset + n_seeds]
+            else:
+                seed_coords = None
 
             is_organic = origins == 0
             is_original = origins == 1
             is_mutation = origins == 2
+            scores = data[key]["scores"]
 
-            # Organic background (grey)
-            if is_organic.sum() > 0:
-                ax.scatter(coords[is_organic, 0], coords[is_organic, 1],
-                           c='lightgrey', s=3, alpha=0.25, edgecolors='none',
-                           rasterized=True, label=f'Organic ({is_organic.sum()})')
+            if args.show_difficulty:
+                # Color by SFL learnability: yellow (0) -> red (0.25+)
+                cmap = mcolors.LinearSegmentedColormap.from_list(
+                    "sfl", ["yellow", "red"])
+                norm = mcolors.Normalize(vmin=0, vmax=0.25)
 
-            # LLM mutations (green)
-            if is_mutation.sum() > 0:
-                ax.scatter(coords[is_mutation, 0], coords[is_mutation, 1],
-                           c='green', s=8, alpha=0.5, edgecolors='none',
-                           rasterized=True, label=f'LLM mut ({is_mutation.sum()})')
+                # Organic (light/small)
+                if is_organic.sum() > 0:
+                    ax.scatter(coords[is_organic, 0], coords[is_organic, 1],
+                               c=scores[is_organic], cmap=cmap, norm=norm,
+                               s=3, alpha=0.25, edgecolors='none',
+                               rasterized=True)
 
-            # LLM originals (blue stars)
-            if is_original.sum() > 0:
-                ax.scatter(coords[is_original, 0], coords[is_original, 1],
-                           c='blue', s=35, marker='*', alpha=0.9,
-                           edgecolors='black', linewidths=0.3,
-                           label=f'LLM orig ({is_original.sum()})')
+                # LLM mutations (bold circles with green edge)
+                if is_mutation.sum() > 0:
+                    ax.scatter(coords[is_mutation, 0], coords[is_mutation, 1],
+                               c=scores[is_mutation], cmap=cmap, norm=norm,
+                               s=15, alpha=0.8, edgecolors='green', linewidths=0.5,
+                               rasterized=True, zorder=5)
+
+                # LLM originals (stars, larger with bright edge to stand out)
+                if is_original.sum() > 0:
+                    ax.scatter(coords[is_original, 0], coords[is_original, 1],
+                               c=scores[is_original], cmap=cmap, norm=norm,
+                               s=60, marker='*', alpha=0.95,
+                               edgecolors='blue', linewidths=0.6, zorder=8)
+
+                # Plot eval benchmark levels (small diamonds)
+                if eval_coords is not None:
+                    ax.scatter(eval_coords[:, 0], eval_coords[:, 1],
+                               c='cyan', s=20, marker='D', alpha=0.9,
+                               edgecolors='black', linewidths=0.5, zorder=10)
+                    for ei, name in enumerate(EVAL_LEVEL_NAMES[:n_eval]):
+                        ax.annotate(EVAL_LEVEL_SHORT.get(name, name),
+                                    (eval_coords[ei, 0], eval_coords[ei, 1]),
+                                    fontsize=3, ha='center', va='bottom',
+                                    xytext=(0, 3), textcoords='offset points')
+
+                # Add legend on first panel, colorbar on last panel
+                if i == 0 and j == 0:
+                    from matplotlib.lines import Line2D
+                    legend_els = [
+                        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+                               markersize=4, alpha=0.5, label='Organic'),
+                        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+                               markersize=6, markeredgecolor='green', markeredgewidth=0.5,
+                               label='LLM mutation'),
+                        Line2D([0], [0], marker='*', color='w', markerfacecolor='grey',
+                               markersize=10, markeredgecolor='blue', markeredgewidth=0.6,
+                               label='LLM original'),
+                    ]
+                    if eval_coords is not None:
+                        legend_els.append(
+                            Line2D([0], [0], marker='D', color='w', markerfacecolor='cyan',
+                                   markersize=5, markeredgecolor='black', markeredgewidth=0.5,
+                                   label='Eval benchmark'))
+                    ax.legend(handles=legend_els, fontsize=5, loc='upper left',
+                              framealpha=0.7)
+                if i == n_rows - 1 and j == n_cols - 1:
+                    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+                    sm.set_array([])
+                    cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+                    cb.set_label("SFL", fontsize=7)
+                    cb.ax.tick_params(labelsize=6)
+            else:
+                ancestor_ids = data[key]["ancestor_ids"]
+
+                # Organic background (grey)
+                if is_organic.sum() > 0:
+                    ax.scatter(coords[is_organic, 0], coords[is_organic, 1],
+                               c='lightgrey', s=3, alpha=0.25, edgecolors='none',
+                               rasterized=True, label=f'Organic ({is_organic.sum()})')
+
+                # Build a consistent color palette for ancestor IDs (once)
+                if not hasattr(run_single_pct, '_lineage_cmap'):
+                    all_anc = set()
+                    for dk in data.values():
+                        llm_m = dk["origins"] > 0
+                        all_anc.update(dk["ancestor_ids"][llm_m].tolist())
+                        if "seed_ancestor_ids" in dk:
+                            all_anc.update(dk["seed_ancestor_ids"].tolist())
+                    all_anc.discard(-1)
+                    sorted_anc = sorted(all_anc)
+                    cmap_name = 'tab10' if len(sorted_anc) <= 10 else 'tab20'
+                    cmap_obj = plt.get_cmap(cmap_name)
+                    run_single_pct._lineage_colors = {}
+                    for idx, aid in enumerate(sorted_anc):
+                        run_single_pct._lineage_colors[aid] = cmap_obj(idx % cmap_obj.N)
+                    run_single_pct._lineage_colors[-1] = (0.5, 0.5, 0.5, 1.0)
+                    run_single_pct._lineage_cmap = True
+
+                lineage_colors = run_single_pct._lineage_colors
+
+                # Color LLM levels by ancestor lineage
+                llm_mask = origins > 0
+                if llm_mask.sum() > 0:
+                    unique_ancestors = sorted(set(ancestor_ids[llm_mask].tolist()))
+
+                    for aid in unique_ancestors:
+                        color = lineage_colors.get(aid, (0.5, 0.5, 0.5, 1.0))
+                        anc_mask = (ancestor_ids == aid)
+
+                        # Mutations for this lineage (circles)
+                        mut_mask = anc_mask & is_mutation
+                        if mut_mask.sum() > 0:
+                            ax.scatter(coords[mut_mask, 0], coords[mut_mask, 1],
+                                       c=[color], s=8, alpha=0.6, edgecolors='none',
+                                       rasterized=True)
+
+                # Always plot seed originals from seed_coords (even if evicted)
+                if seed_coords is not None and seed_aids is not None:
+                    for si, aid in enumerate(seed_aids):
+                        color = lineage_colors.get(int(aid), (0.5, 0.5, 0.5, 1.0)) if hasattr(run_single_pct, '_lineage_colors') else 'blue'
+                        ax.scatter(seed_coords[si, 0], seed_coords[si, 1],
+                                   c=[color], s=50, marker='*', alpha=0.95,
+                                   edgecolors='black', linewidths=0.4, zorder=8)
+
+                # Plot eval benchmark levels
+                if eval_coords is not None:
+                    ax.scatter(eval_coords[:, 0], eval_coords[:, 1],
+                               c='cyan', s=60, marker='D', alpha=0.95,
+                               edgecolors='black', linewidths=0.8, zorder=10,
+                               label='Eval benchmark')
+                    for ei, name in enumerate(EVAL_LEVEL_NAMES[:n_eval]):
+                        ax.annotate(EVAL_LEVEL_SHORT.get(name, name),
+                                    (eval_coords[ei, 0], eval_coords[ei, 1]),
+                                    fontsize=4, ha='center', va='bottom',
+                                    xytext=(0, 4), textcoords='offset points')
+
+                if i == n_rows - 1 and j == n_cols - 1:
+                    from matplotlib.lines import Line2D
+                    legend_els = [
+                        Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgrey',
+                               markersize=4, alpha=0.5, label='Organic'),
+                    ]
+                    lineage_colors = run_single_pct._lineage_colors if hasattr(run_single_pct, '_lineage_colors') else {}
+                    for aid in sorted(lineage_colors.keys()):
+                        c = lineage_colors[aid]
+                        if aid == -1:
+                            legend_els.append(
+                                Line2D([0], [0], marker='o', color='w', markerfacecolor=c,
+                                       markersize=5, label='Unknown anc.'))
+                        else:
+                            legend_els.append(
+                                Line2D([0], [0], marker='o', color='w', markerfacecolor=c,
+                                       markersize=5, label=f'Seed {aid}'))
+                    legend_els.append(
+                        Line2D([0], [0], marker='*', color='w', markerfacecolor='grey',
+                               markersize=8, markeredgecolor='black', markeredgewidth=0.4,
+                               label='LLM original'))
+                    fig.legend(handles=legend_els, fontsize=6, loc='lower center',
+                               framealpha=0.7, ncol=len(legend_els),
+                               bbox_to_anchor=(0.5, -0.02))
 
             n_llm = is_original.sum() + is_mutation.sum()
             ax.set_title(f"Seed {seed}, {ts} upd\n"
                          f"({n_llm} LLM / {len(origins)} total)", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
-
-            if i == 0 and j == 0:
-                ax.legend(fontsize=6, loc='lower left', framealpha=0.7)
 
     pct_label = inject_pct.replace("pct", "%")
     if is_structural:
@@ -410,12 +701,20 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_rollouts", type=int, default=5,
                         help="Number of rollouts to average per level for stable embeddings")
+    parser.add_argument("--seed_num_rollouts", type=int, default=50,
+                        help="Number of rollouts for seed original embeddings (higher for stability)")
     parser.add_argument("--cache_only", action="store_true",
                         help="Only plot cached embeddings, skip GCS downloads and computation")
     parser.add_argument("--mode", type=str, default="behavioral", choices=["behavioral", "structural"],
                         help="behavioral: 257D agent rollout embeddings (GPU). structural: env features (CPU)")
     parser.add_argument("--grid_size", type=int, default=13,
                         help="Maze grid size for structural features (default 13)")
+    parser.add_argument("--show_difficulty", action="store_true",
+                        help="Color points by SFL learnability (yellow=0, red=0.25) "
+                             "instead of by origin type")
+    parser.add_argument("--show_eval_levels", action="store_true",
+                        help="Plot eval benchmark mazes (SixteenRooms, Labyrinth, etc.) "
+                             "as diamond markers on each panel")
     parser.add_argument("--upload_gcs", action="store_true",
                         help="Upload cache and plots to GCS after completion")
     args = parser.parse_args()

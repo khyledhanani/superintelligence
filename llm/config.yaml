@@ -1,86 +1,115 @@
 # LLM Maze Generator Configuration
 # ----------------------------------
-# Used by: python -m llm.test_generator [--config llm/config.yaml]
-# All values here can be overridden by CLI flags.
+# This file is the single source of truth for LLM generation parameters.
+# Both test_generator.py and injector.py read from this file.
+#
+# During training, CLI flags on maze_plr.py can override any value below.
+# If a CLI flag is not set, the value here is used as the default.
 
-# --- Provider & Model ---
-provider: claude-code        # "claude-code" (uses Max subscription), "anthropic" (direct SDK), "ollama", or "openrouter"
+# ============================================================================
+# Provider & Model
+# ============================================================================
+# CLI override: --llm_provider, --llm_model
+provider: claude-code        # "claude-code", "anthropic", "ollama", or "openrouter"
 model: sonnet                # Short alias (sonnet/opus/haiku) or full model ID
-temperature: 0.8
-timeout: 0                  # No timeout (0 = unlimited, matching diversity branch)
 
 # Provider-specific settings (auto-selected by provider field)
 anthropic:
-  api_key_env: ANTHROPIC_API_KEY    # env var name; SDK also reads this automatically
+  api_key_env: ANTHROPIC_API_KEY
 
 ollama:
   base_url: https://ollama.com
-  api_key_env: OLLAMA_API_KEY       # env var name for API key
+  api_key_env: OLLAMA_API_KEY
 
 openrouter:
   base_url: https://openrouter.ai/api/v1
   api_key_env: OPENROUTER_API_KEY
 
-# --- Generation ---
-n: 8                        # Number of mazes to generate
+# ============================================================================
+# LLM Generation Parameters
+# ============================================================================
+temperature: 0.8
+timeout: 0                  # No timeout (0 = unlimited)
+effort: medium                 # claude-code --effort flag: "low", "medium", "high"
 max_retries: 5              # Max LLM retries on invalid output
+thinking_in_output: true    # Ask LLM for reasoning section before the grid
 min_walls: 10               # Minimum wall cells for valid maze
 min_path_distance: 4        # Minimum Manhattan distance agent-to-goal
 validate_solvable: true     # BFS solvability check on generated mazes
 
-# --- Reference Mazes ---
-buffer_path: gcs_artifacts/buffer/buffer_dump_final.npz
-num_refs: 6                 # Number of reference mazes from buffer
-strategy: top_regret        # "top_regret", "random", or "diverse"
+# ============================================================================
+# Buffer Embeddings
+# ============================================================================
+# Controls whether 257D behavior embeddings are recomputed with the current
+# agent ("fresh") or use stale insertion-time values ("stale").
+# Affects: reference selection (kmedoid/diverse), diversity gate, and plots.
+# CLI override: --llm_buffer_state
+buffer_state: fresh               # "stale" or "fresh"
 
-# --- Metric Injection ---
-# Controls which metrics are computed from agent rollouts and shown to the LLM.
+# ============================================================================
+# Reference Mazes
+# ============================================================================
+# CLI override: --llm_ref_strategy, --llm_n_references, --llm_hybrid_difficulty_percentile
+strategy: hybrid-kmedoid   # "hardest", "random", "greedy", "hybrid-greedy", "kmedoid", or "hybrid-kmedoid"
+num_refs: 5                 # Number of reference mazes from buffer
+hybrid_difficulty_percentile: 50  # Percentile filter for hybrid-kmedoid
+
+# ============================================================================
+# Diversity Gate
+# ============================================================================
+# CLI override: --llm_gate, --llm_difficulty_threshold, --llm_difficulty_gate_mode,
+#   --llm_min_diversity, --llm_diversity_gate_mode, --llm_diversity_metric,
+#   --llm_max_diversity_retries, --llm_n_rollouts
+gate:
+  enabled: true
+  difficulty_threshold: 0.1
+  difficulty_gate_mode: buffer_mean   # "fixed", "buffer_min", "buffer_mean", "reference_mean", "competitive"
+  difficulty_metric: sfl              # "regret" or "sfl"
+  min_diversity: 1
+  diversity_gate_mode: fixed          # "fixed", "buffer_median", "disabled"
+  diversity_metric: embedding_l2     # "td_error_emd", "experience_divergence", "position_dtw", "cenie", "embedding_l2"
+  max_diversity_retries: 5
+  n_rollouts: 50                     # Rollouts per candidate for gate evaluation
+
+# ============================================================================
+# Metric Injection (which metrics appear in the LLM prompt)
+# ============================================================================
 inject_metrics: true        # Master switch: compute metrics from agent rollouts
-inject_regret: true         # Include regret scores in prompt (fallback when inject_metrics=false)
-inject_buffer_stats: true   # Include buffer-wide statistics
+inject_regret: false         # Include regret scores in prompt
+inject_buffer_stats: false   # Include buffer-wide statistics
+downsample_points: 250       # Max points when downsampling metric vectors
 
-# Per-maze metrics injected into the LLM prompt (standalone, computed per reference).
-# Set to true/false to include/exclude each metric.
+# Per-maze metrics shown to the LLM for each reference maze.
 prompt_metrics:
   per_step_entropy: true    # Policy uncertainty at each timestep
-  per_step_regret: false     # (max_return - V(s_t)) time series
-  scalar_regret: true       # Mean per-step regret (single number, MaxMC)
-  action_sequence: true     # Agent's discrete actions per step (behavioral fingerprint)
+  per_step_regret: false    # (max_return - V(s_t)) time series
+  scalar_regret: false      # Mean per-step regret (single number, MaxMC)
+  action_sequence: false    # Agent's discrete actions per step
   path_overlay: true        # ASCII visualization of agent trajectory on the grid
-  position_vector: true    # Agent (x,y) per step — lets LLM link regret/entropy spikes to grid locations
-  value_error: true        # Signed V(s_t) - G_t (positive=overconfident, negative=underconfident)
-  learnability: false       # SFL learnability p*(1-p) from multi-rollout solve rate (requires n_rollouts > 1)
+  position_vector: true     # Agent (x,y) per step
+  value_error: false        # Signed V(s_t) - G_t
+  learnability: true        # SFL learnability p*(1-p) from multi-rollout solve rate
 
-# Pairwise metrics injected into the LLM prompt (between all reference pairs).
+# Pairwise metrics between all reference pairs.
 pairwise_metrics:
-  position_dtw: false        # Spatial path similarity between two trajectories
-  mode_transition: true    # Experience mode transition divergence (experiential diversity)
-  td_error: true           # TD error distribution EMD (task-agnostic learning signal diversity)
+  position_dtw: false       # Spatial path similarity
+  mode_transition: false    # Experience mode transition divergence
+  td_error: false           # TD error distribution EMD
 
-# --- Agent & Feedback Loop ---
-agent_dir: gcs_artifacts/agent/39
-num_steps: 250              # Max rollout steps per episode
-n_rollouts: 50              # Agent rollouts per maze for robust regret
-feedback: true              # Enable diversity feedback loop
-max_diversity_retries: 3
-
-# --- Diversity Gate ---
-# Thresholds for accepting a generated maze. Set to null to disable a gate.
-# A maze must pass ALL enabled gates. On failure, LLM gets metric feedback and retries.
-gate:
-  difficulty_threshold: 0.1     # Min difficulty score to accept (null = disabled)
-  difficulty_metric: sfl        # "regret" (MaxMC regret, default) or "sfl" (SFL learnability p*(1-p))
-                                #   regret: rejects too-easy mazes (threshold ~0.6, buffer max 0.475)
-                                #   sfl: rejects too-easy AND too-hard mazes (threshold ~0.1, max at p=0.5 is 0.25)
-  min_diversity: null            # Min L2 distance to closest buffer embedding (null = log only, don't gate)
-  diversity_metric: embedding_l2    # "td_error_emd", "experience_divergence", "position_dtw", "cenie", or "embedding_l2"
+# ============================================================================
+# Test-only settings (not used during training injection)
+# ============================================================================
+n: 3                        # Number of mazes to generate in test mode
+buffer_path: buffer_dumps/accel_baseline/seed0/buffer_dumps/buffer_dump_2500.npz
+agent_dir: buffer_dumps/accel_baseline/seed0/checkpoints
+checkpoint_step: 10              # Agent checkpoint step (-1 for latest)
+num_steps: 250
+feedback: true
 
 # --- Visualization ---
-embedding_metric: td_error_emd    # Pairwise metric for t-SNE diversity embedding plot ("td_error_emd")
-
-# --- Metric Display ---
-downsample_points: 20       # Max points when downsampling metric vectors for LLM prompt
+embedding_metric: embedding_l2    # Pairwise metric for diversity embedding plot
+visualisation_plot: tsne          # "tsne" or "mds" — dimensionality reduction for diversity_embedding.png
 
 # --- Output ---
-# instruction: ""           # Optional custom generation instruction
-# dry_run: false             # Build prompts only, skip LLM calls
+# instruction: ""
+# dry_run: false

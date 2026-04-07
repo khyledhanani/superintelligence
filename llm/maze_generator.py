@@ -77,6 +77,7 @@ class GenerationConfig:
     min_walls: int = 0
     min_path_distance: int = 0
     validate_solvable: bool = True
+    effort: str = "low"           # claude-code --effort flag: "low", "medium", "high"
 
     # Provider defaults (used only as fallback when no config file is loaded)
     _PROVIDER_DEFAULTS = {
@@ -118,6 +119,7 @@ class RejectedCandidate:
     gate_summary: Dict                 # gate_result.summary
     issues: List[str]                  # gate_result.issues
     trajectory: Optional[Dict] = None  # agent trajectory (positions, values, dones, etc.)
+    thinking: Optional[str] = None     # LLM reasoning trace (if thinking_in_output)
     failed_difficulty: bool = False    # Failed difficulty gate (regret or SFL)
     failed_diversity: bool = False     # Failed diversity gate (td_error_emd etc.)
 
@@ -427,7 +429,7 @@ class MazeGenerator:
             claude_bin, "-p", "-",  # read prompt from stdin
             "--output-format", "json",
             "--max-turns", "1",
-            "--effort", "low",
+            "--effort", self.config.effort,
         ]
         if system:
             cmd.extend(["--system-prompt", system])
@@ -1030,14 +1032,15 @@ class MazeGenerator:
                 grid=result.grid,
                 gate_summary=dict(gate_result.summary),
                 issues=list(gate_result.issues),
+                thinking=result.thinking_logs[-1] if result.thinking_logs else None,
                 failed_difficulty=_failed_difficulty,
                 failed_diversity=_failed_diversity,
                 trajectory={
                     k: np.array(v) if isinstance(v, np.ndarray) else v
                     for k, v in candidate_traj.items()
                     if k in ("positions", "values", "dones", "rewards",
-                             "actions", "entropy", "solve_rate", "best_return",
-                             "all_returns")
+                             "actions", "entropy", "hstates", "solve_rate",
+                             "best_return", "all_returns")
                 },
             ))
 
