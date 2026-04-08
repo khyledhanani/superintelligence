@@ -4,6 +4,15 @@
 Zip file (shared link):
 https://drive.google.com/file/d/1_gqw6v4cNDxLm1BYmtfz2dLyt3_jG3n9/view?usp=drive_link
 
+``gdown`` often fails from Colab on Drive (quota, virus-scan page, permissions). This script
+tries several methods and falls back to a small ``requests``-based download with the usual
+``confirm`` cookie flow.
+
+Override the zip source (e.g. Hugging Face, GitHub raw, your own mirror):
+
+  export NOTEBOOK_ASSETS_ZIP_URL='https://.../assets.zip'
+  python notebooks/download_notebook_assets.py
+
 Usage:
   python notebooks/download_notebook_assets.py
   python notebooks/download_notebook_assets.py --force
@@ -14,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,9 +31,11 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-# Public assets.zip on Google Drive
+# Public assets.zip on Google Drive (file id from share link)
 DRIVE_FILE_ID = "1_gqw6v4cNDxLm1BYmtfz2dLyt3_jG3n9"
-DRIVE_ZIP_URL = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
+DRIVE_VIEW_URL = f"https://drive.google.com/file/d/{DRIVE_FILE_ID}/view?usp=sharing"
+DRIVE_UC_URL = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
+DRIVE_EXPORT_URL = f"https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}"
 
 
 def _run_stream(cmd: list[str]) -> None:
@@ -44,11 +56,163 @@ def _run_stream(cmd: list[str]) -> None:
         raise subprocess.CalledProcessError(rc, cmd)
 
 
-def _ensure_gdown() -> None:
+def _ensure_deps() -> None:
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "gdown"],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "-U",
+            "gdown",
+            "requests",
+        ],
         check=True,
     )
+
+
+def _gdown_try(url: str, zip_path: Path) -> bool:
+    """Return True if gdown wrote a non-trivial zip file."""
+    try:
+        import gdown
+
+        gdown.download(url, str(zip_path), quiet=False, fuzzy=True)
+    except Exception as exc:
+        print(f"gdown failed for {url!r}: {exc}", flush=True)
+        return False
+    if not zip_path.is_file() or zip_path.stat().st_size < 1024:
+        return False
+    # Drive sometimes saves an HTML error page with .zip name
+    with open(zip_path, "rb") as f:
+        head = f.read(4)
+    return head == b"PK\x03\x04"
+
+
+def _download_drive_via_requests(file_id: str, zip_path: Path) -> None:
+    """Download a Drive file by id; handles download_warning / confirm interstitials."""
+    import requests
+
+    session = requests.Session()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    base = "https://drive.google.com/uc"
+    params = {"export": "download", "id": file_id}
+
+    def _write_stream(resp: requests.Response, first_chunk: bytes) -> None:
+        total = len(first_chunk)
+        with open(zip_path, "wb") as f:
+            f.write(first_chunk)
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
+        if total < 1024:
+            raise RuntimeError("Downloaded file is too small; likely not the real zip.")
+        with open(zip_path, "rb") as f:
+            if f.read(4) != b"PK\x03\x04":
+                raise RuntimeError("Downloaded file is not a zip (PK header missing).")
+
+    r = session.get(base, params=params, headers=headers, stream=True, timeout=120)
+    r.raise_for_status()
+
+    token = None
+    for k, v in r.cookies.items():
+        if k.startswith("download_warning"):
+            token = v
+            break
+
+    if token:
+        r.close()
+        r = session.get(
+            base,
+            params={**params, "confirm": token},
+            headers=headers,
+            stream=True,
+            timeout=120,
+        )
+        r.raise_for_status()
+
+    first = next(r.iter_content(chunk_size=65536), b"") or b""
+    if first.startswith(b"PK\x03\x04"):
+        _write_stream(r, first)
+        r.close()
+        return
+
+    # HTML interstitial (virus scan / confirmation)
+    text = first.decode("utf-8", errors="replace")
+    for chunk in r.iter_content(chunk_size=65536, decode_unicode=False):
+        if not chunk:
+            break
+        text += chunk.decode("utf-8", errors="replace")
+        if len(text) > 2_000_000:
+            break
+    r.close()
+
+    m = re.search(r"confirm=([0-9A-Za-z_-]+)", text)
+    if not m:
+        raise RuntimeError(
+            "Drive returned HTML instead of the zip (permissions, quota, or virus-scan). "
+            "Set the file to 'Anyone with the link' as **Viewer**, wait if quota exceeded, "
+            "or set NOTEBOOK_ASSETS_ZIP_URL to a direct mirror (e.g. Hugging Face, S3)."
+        )
+    confirm = m.group(1)
+    r2 = session.get(
+        base,
+        params={"export": "download", "id": file_id, "confirm": confirm},
+        headers=headers,
+        stream=True,
+        timeout=120,
+    )
+    r2.raise_for_status()
+    first2 = next(r2.iter_content(chunk_size=65536), b"") or b""
+    _write_stream(r2, first2)
+    r2.close()
+
+
+def _download_zip(zip_path: Path) -> None:
+    override = os.environ.get("NOTEBOOK_ASSETS_ZIP_URL", "").strip()
+    if override:
+        print("Using NOTEBOOK_ASSETS_ZIP_URL override.", flush=True)
+        if _gdown_try(override, zip_path):
+            return
+        # Try as direct URL with requests
+        import requests
+
+        r = requests.get(override, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+        with open(zip_path, "rb") as f:
+            if f.read(4) != b"PK\x03\x04":
+                raise RuntimeError("Override URL did not yield a zip file.")
+        return
+
+    _ensure_deps()
+
+    for label, url in (
+        ("gdown view URL", DRIVE_VIEW_URL),
+        ("gdown uc export", DRIVE_EXPORT_URL),
+        ("gdown uc?id", DRIVE_UC_URL),
+    ):
+        print(f"Trying {label} …", flush=True)
+        if zip_path.exists():
+            zip_path.unlink()
+        if _gdown_try(url, zip_path):
+            print(f"OK via gdown ({label}).", flush=True)
+            return
+
+    print("gdown failed; trying requests + Drive confirm flow …", flush=True)
+    if zip_path.exists():
+        zip_path.unlink()
+    _download_drive_via_requests(DRIVE_FILE_ID, zip_path)
+    print("OK via requests.", flush=True)
 
 
 def _extract_zip_to_assets(zip_path: Path, asset_dir: Path) -> None:
@@ -69,7 +233,6 @@ def _extract_zip_to_assets(zip_path: Path, asset_dir: Path) -> None:
             raise RuntimeError("Zip archive is empty.")
 
         if len(top) == 1 and top[0].is_dir():
-            # e.g. a single top-level ``assets/`` folder or any one wrapper directory
             src_root = top[0]
         else:
             src_root = tmp_path
@@ -96,23 +259,10 @@ def download_assets(asset_dir: Path, *, force: bool = False) -> None:
         print("Use --force or NOTEBOOK_ASSETS_FORCE=1 to re-download.")
         return
 
-    _ensure_gdown()
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         zip_path = tmp_path / "assets.zip"
-        _run_stream(
-            [
-                sys.executable,
-                "-m",
-                "gdown",
-                "--fuzzy",
-                DRIVE_ZIP_URL,
-                "-O",
-                str(zip_path),
-            ]
-        )
-        if not zip_path.is_file():
-            raise FileNotFoundError(f"Expected downloaded zip at {zip_path}")
+        _download_zip(zip_path)
         _extract_zip_to_assets(zip_path, asset_dir)
 
     print("Done. Assets directory:", asset_dir.resolve())
