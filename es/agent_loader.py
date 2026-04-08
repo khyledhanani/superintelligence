@@ -95,12 +95,83 @@ class ActorCritic(nn.Module):
 # Checkpoint loading
 # ---------------------------------------------------------------------------
 
+def _orbax_restore_cross_device(mgr, step):
+    """Restore Orbax checkpoint when saved sharding references missing devices (GPU → CPU, etc.)."""
+    import orbax.checkpoint.type_handlers as ocp_th
+
+    def restore():
+        return mgr.restore(step)
+
+    try:
+        return restore()
+    except ValueError as exc:
+        msg = str(exc).lower()
+        if not any(
+            t in msg
+            for t in (
+                'topology mismatch',
+                'jax.local_devices',
+                'was not found',
+                'device cuda',
+                'device gpu',
+                'sharding',
+            )
+        ):
+            raise
+
+    print(
+        'Orbax: checkpoint was saved on a different device layout than this process '
+        '(e.g. CUDA while JAX only sees CPU). Retrying restore with local-device sharding…'
+    )
+
+    # Older orbax exposed this on type_handlers; newer versions moved / renamed internals.
+    orig_ds = None
+    if hasattr(ocp_th, '_deserialize_sharding_from_json_string'):
+        orig_ds = ocp_th._deserialize_sharding_from_json_string
+
+        def _deserialize_fallback(json_string: str):
+            try:
+                return orig_ds(json_string)
+            except (ValueError, KeyError):
+                return jax.sharding.SingleDeviceSharding(jax.local_devices()[0])
+
+        ocp_th._deserialize_sharding_from_json_string = _deserialize_fallback
+
+    mds_mod = None
+    orig_tj = None
+    try:
+        import orbax.checkpoint._src.metadata.sharding as mds_mod
+
+        orig_tj = mds_mod.SingleDeviceShardingMetadata.to_jax_sharding
+
+        def _to_jax_sharding_fallback(self):
+            try:
+                return orig_tj(self)
+            except ValueError:
+                # Any device / metadata mismatch → host all arrays on the first local device.
+                return jax.sharding.SingleDeviceSharding(jax.local_devices()[0])
+
+        mds_mod.SingleDeviceShardingMetadata.to_jax_sharding = _to_jax_sharding_fallback
+    except ImportError:
+        pass
+
+    try:
+        return restore()
+    finally:
+        if orig_ds is not None:
+            ocp_th._deserialize_sharding_from_json_string = orig_ds
+        if mds_mod is not None and orig_tj is not None:
+            mds_mod.SingleDeviceShardingMetadata.to_jax_sharding = orig_tj
+
+
 def load_agent_params(checkpoint_dir, step=None):
     """Load agent parameters from a pickle file or orbax checkpoint.
 
     Tries to load from a pickle file (agent_params.pkl) first for portability
-    across machines with different GLIBC versions. Falls back to orbax if no
-    pickle file is found.
+    across machines (no Orbax device metadata). Falls back to orbax if no pickle
+    is found; orbax restore automatically retries with a local-device sharding
+    fallback when the checkpoint was saved on GPU but this process only has CPU
+    (or another topology mismatch).
 
     Args:
         checkpoint_dir: Path to the checkpoint directory
@@ -135,7 +206,7 @@ def load_agent_params(checkpoint_dir, step=None):
     )
     step = step if step is not None else mgr.latest_step()
     print(f"Loading agent checkpoint from {checkpoint_dir} (step={step})")
-    loaded = mgr.restore(step)
+    loaded = _orbax_restore_cross_device(mgr, step)
 
     # Orbax restores the full TrainState dict. The 'params' key contains
     # the flax variable dict {'params': {actual network params}}.
