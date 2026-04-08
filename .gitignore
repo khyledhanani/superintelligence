@@ -177,3 +177,15 @@ gcs_artifacts/
 
 # LLM-generated maze levels
 llm/generated_levels/
+
+# Archive
+.archive/
+
+# Pip cache
+.pip_cache/
+
+# Analysis caches (generated embeddings/evals)
+analysis/**/cache*/
+
+# Buffer dumps (large binary data)
+buffer_dumps/
