@@ -56,6 +56,8 @@ def main():
     parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--buffer_cache_dir", type=str,
                         default="analysis/final_results_plotting/cache_solved")
+    parser.add_argument("--buffer_timestep", type=int, default=2250,
+                        help="Buffer timestep to use (default: 2250)")
     parser.add_argument("--mutations_cache", type=str,
                         default="analysis/final_results_plotting/mutation_migration/test_cache/mutations_embeddings.npz")
     parser.add_argument("--llm_orig_cache", type=str,
@@ -73,15 +75,16 @@ def main():
     if args.output is None:
         args.output = f"analysis/final_results_plotting/mutation_migration/llm_on_buffer_seed{args.seed}.png"
 
-    # Load buffer (t=2250, pre-injection)
-    buf_path = os.path.join(args.buffer_cache_dir, f"emb_solved_s{args.seed}_t2250.npz")
+    # Load buffer
+    bt = args.buffer_timestep
+    buf_path = os.path.join(args.buffer_cache_dir, f"emb_solved_s{args.seed}_t{bt}.npz")
     buf = np.load(buf_path, allow_pickle=True)
     buf_emb = buf["embeddings_solved"]
     n_buf = len(buf_emb)
-    print(f"Buffer: {n_buf} levels")
+    print(f"Buffer (t={bt}): {n_buf} levels")
 
     # Load eval levels
-    eval_path = os.path.join(args.buffer_cache_dir, f"eval_solved_s{args.seed}_t2250.npz")
+    eval_path = os.path.join(args.buffer_cache_dir, f"eval_solved_s{args.seed}_t{bt}.npz")
     eval_d = np.load(eval_path, allow_pickle=True)
     eval_emb = eval_d["embeddings_solved"]
     eval_solved = eval_d["solved"]
