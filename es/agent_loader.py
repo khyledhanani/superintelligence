@@ -174,8 +174,11 @@ def load_agent_params(checkpoint_dir, step=None):
     (or another topology mismatch).
 
     Args:
-        checkpoint_dir: Path to the checkpoint directory
-                        (e.g. "agent_folder" or "agent_folder/119/default").
+        checkpoint_dir: For Orbax, use the CheckpointManager root (the ``models``
+            folder that contains numeric step subdirs), e.g. ``.../checkpoints/run/0/models``.
+            Using ``.../models/119/default`` as the manager root often fails; pass
+            ``.../models`` and ``step=119`` instead. Pickle mode looks for
+            ``agent_params.pkl`` inside this directory.
         step: Specific checkpoint step to load (orbax only). None = latest.
 
     Returns:
