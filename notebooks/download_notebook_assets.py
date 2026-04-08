@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import re
 import shutil
@@ -89,8 +90,32 @@ def _gdown_try(url: str, zip_path: Path) -> bool:
     return head == b"PK\x03\x04"
 
 
+def _collect_confirm_tokens(page_html: str) -> list[str]:
+    """Extract possible ``confirm`` tokens from a Drive virus-scan / interstitial HTML page."""
+    t = html.unescape(page_html)
+    found: list[str] = []
+
+    for m in re.finditer(r"confirm=([0-9A-Za-z_-]+)", t):
+        found.append(m.group(1))
+    for m in re.finditer(r'"confirm"\s*:\s*"([^"]+)"', t):
+        found.append(m.group(1))
+    for m in re.finditer(r"name=\"confirm\"\s+value=\"([^\"]+)\"", t):
+        found.append(m.group(1))
+
+    # Prefer longer tokens (real confirms are usually long); keep stable order for ties.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for c in sorted(found, key=len, reverse=True):
+        c = c.strip()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        ordered.append(c)
+    return ordered
+
+
 def _download_drive_via_requests(file_id: str, zip_path: Path) -> None:
-    """Download a Drive file by id; handles download_warning / confirm interstitials."""
+    """Download a Drive file by id; handles virus-scan HTML and several ``confirm`` shapes."""
     import requests
 
     session = requests.Session()
@@ -100,8 +125,7 @@ def _download_drive_via_requests(file_id: str, zip_path: Path) -> None:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
-    base = "https://drive.google.com/uc"
-    params = {"export": "download", "id": file_id}
+    timeout = (60, 600)  # (connect, read) — large zips are slow
 
     def _write_stream(resp: requests.Response, first_chunk: bytes) -> None:
         total = len(first_chunk)
@@ -117,61 +141,115 @@ def _download_drive_via_requests(file_id: str, zip_path: Path) -> None:
             if f.read(4) != b"PK\x03\x04":
                 raise RuntimeError("Downloaded file is not a zip (PK header missing).")
 
-    r = session.get(base, params=params, headers=headers, stream=True, timeout=120)
-    r.raise_for_status()
+    def _finish_if_zip(resp: requests.Response) -> bool:
+        first = next(resp.iter_content(chunk_size=65536), b"") or b""
+        if first.startswith(b"PK\x03\x04"):
+            _write_stream(resp, first)
+            resp.close()
+            return True
+        for _ in resp.iter_content(chunk_size=65536):
+            pass
+        resp.close()
+        return False
 
-    token = None
-    for k, v in r.cookies.items():
-        if k.startswith("download_warning"):
-            token = v
-            break
+    def _read_html(resp: requests.Response, first: bytes) -> str:
+        parts = [first.decode("utf-8", errors="replace")]
+        for chunk in resp.iter_content(chunk_size=65536, decode_unicode=False):
+            if not chunk:
+                break
+            parts.append(chunk.decode("utf-8", errors="replace"))
+            if sum(len(p) for p in parts) > 3_000_000:
+                break
+        resp.close()
+        return "".join(parts)
 
-    if token:
-        r.close()
-        r = session.get(
-            base,
-            params={**params, "confirm": token},
+    base_hosts = (
+        "https://drive.google.com",
+        "https://docs.google.com",
+    )
+    params0 = {"export": "download", "id": file_id}
+
+    last_html: str | None = None
+
+    for host in base_hosts:
+        url = f"{host}/uc"
+        try:
+            r = session.get(url, params=params0, headers=headers, stream=True, timeout=timeout)
+            r.raise_for_status()
+
+            token = None
+            for k, v in r.cookies.items():
+                if k.startswith("download_warning"):
+                    token = v
+                    break
+
+            if token:
+                r.close()
+                r = session.get(
+                    url,
+                    params={**params0, "confirm": token},
+                    headers=headers,
+                    stream=True,
+                    timeout=timeout,
+                )
+                r.raise_for_status()
+
+            first = next(r.iter_content(chunk_size=65536), b"") or b""
+            if first.startswith(b"PK\x03\x04"):
+                _write_stream(r, first)
+                r.close()
+                return
+
+            page = _read_html(r, first)
+            last_html = page
+            candidates = _collect_confirm_tokens(page)
+            # Short fallbacks Google has used on interstitial pages
+            for extra in ("t", "yes", "1"):
+                if extra not in candidates:
+                    candidates.append(extra)
+
+            for confirm in candidates:
+                r2 = session.get(
+                    url,
+                    params={**params0, "confirm": confirm},
+                    headers=headers,
+                    stream=True,
+                    timeout=timeout,
+                )
+                r2.raise_for_status()
+                if _finish_if_zip(r2):
+                    print(
+                        f"OK: Drive download passed virus-scan interstitial (host={host.split('//')[1]}).",
+                        flush=True,
+                    )
+                    return
+        except requests.RequestException as exc:
+            print(f"Drive download attempt skipped for {host}: {exc}", flush=True)
+            continue
+
+    # usercontent host (sometimes used for large files)
+    uc_url = "https://drive.usercontent.google.com/download"
+    for confirm in _collect_confirm_tokens(last_html or "") + ["t", "yes", "1"]:
+        r3 = session.get(
+            uc_url,
+            params={"id": file_id, "export": "download", "confirm": confirm},
             headers=headers,
             stream=True,
-            timeout=120,
+            timeout=timeout,
         )
-        r.raise_for_status()
+        if r3.status_code != 200:
+            r3.close()
+            continue
+        if _finish_if_zip(r3):
+            print("OK: Drive usercontent download.", flush=True)
+            return
 
-    first = next(r.iter_content(chunk_size=65536), b"") or b""
-    if first.startswith(b"PK\x03\x04"):
-        _write_stream(r, first)
-        r.close()
-        return
-
-    # HTML interstitial (virus scan / confirmation)
-    text = first.decode("utf-8", errors="replace")
-    for chunk in r.iter_content(chunk_size=65536, decode_unicode=False):
-        if not chunk:
-            break
-        text += chunk.decode("utf-8", errors="replace")
-        if len(text) > 2_000_000:
-            break
-    r.close()
-
-    m = re.search(r"confirm=([0-9A-Za-z_-]+)", text)
-    if not m:
-        raise RuntimeError(
-            "Drive returned HTML instead of the zip (permissions, quota, or virus-scan). "
-            "Set the file to 'Anyone with the link' as **Viewer**, wait if quota exceeded, "
-            "or set NOTEBOOK_ASSETS_ZIP_URL to a direct mirror (e.g. Hugging Face, S3)."
-        )
-    confirm = m.group(1)
-    r2 = session.get(
-        base,
-        params={"export": "download", "id": file_id, "confirm": confirm},
-        headers=headers,
-        stream=True,
-        timeout=120,
+    raise RuntimeError(
+        "Google Drive still returned HTML (virus-scan / confirm page) after all retries. "
+        "Try: (1) open the zip link in a browser and confirm you can download without signing in; "
+        "(2) wait and retry if download quota is exceeded; "
+        "(3) host assets.zip elsewhere and set NOTEBOOK_ASSETS_ZIP_URL to a direct URL."
     )
-    r2.raise_for_status()
-    first2 = next(r2.iter_content(chunk_size=65536), b"") or b""
-    _write_stream(r2, first2)
-    r2.close()
 
 
 def _download_zip(zip_path: Path) -> None:
