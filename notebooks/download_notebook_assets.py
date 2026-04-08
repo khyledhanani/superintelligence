@@ -293,11 +293,46 @@ def _download_zip(zip_path: Path) -> None:
     print("OK via requests.", flush=True)
 
 
+_IGNORE_ZIP_NAMES = frozenset({"__MACOSX"})
+_IGNORE_FILE_NAMES = frozenset({".DS_Store"})
+
+
+def _meaningful_zip_entries(parent: Path) -> list[Path]:
+    """Skip macOS zip junk (``__MACOSX``, ``.DS_Store``, AppleDouble ``._*``)."""
+    out: list[Path] = []
+    for c in sorted(parent.iterdir()):
+        if c.name in _IGNORE_ZIP_NAMES:
+            continue
+        if c.is_file() and (
+            c.name in _IGNORE_FILE_NAMES or c.name.startswith("._")
+        ):
+            continue
+        out.append(c)
+    return out
+
+
+def _unwrap_double_assets_dir(root: Path) -> Path:
+    """If the tree is ``assets/assets/...`` (common when zipping a folder called ``assets``), use the inner one."""
+    p = root
+    while p.is_dir() and p.name == "assets":
+        kids = _meaningful_zip_entries(p)
+        if (
+            len(kids) == 1
+            and kids[0].is_dir()
+            and kids[0].name == "assets"
+        ):
+            p = kids[0]
+        else:
+            break
+    return p
+
+
 def _extract_zip_to_assets(zip_path: Path, asset_dir: Path) -> None:
     """Extract zip layout into asset_dir.
 
     Supports:
-    - zip with top-level ``assets/`` folder -> merge that folder's contents
+    - zip with top-level ``assets/`` (possibly nested ``assets/assets/`` from macOS) -> flattens into ``asset_dir``
+    - skips ``__MACOSX``, ``.DS_Store``, and ``._*`` files
     - zip with files/dirs at root -> merge into asset_dir
     """
     asset_dir.mkdir(parents=True, exist_ok=True)
@@ -306,16 +341,18 @@ def _extract_zip_to_assets(zip_path: Path, asset_dir: Path) -> None:
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(tmp_path)
 
-        top = list(tmp_path.iterdir())
+        top = _meaningful_zip_entries(tmp_path)
         if not top:
-            raise RuntimeError("Zip archive is empty.")
+            raise RuntimeError("Zip archive is empty (or only contained __MACOSX / junk).")
 
         if len(top) == 1 and top[0].is_dir():
             src_root = top[0]
         else:
             src_root = tmp_path
 
-        for item in src_root.iterdir():
+        src_root = _unwrap_double_assets_dir(src_root)
+
+        for item in _meaningful_zip_entries(src_root):
             dest = asset_dir / item.name
             if item.is_dir():
                 shutil.copytree(item, dest, dirs_exist_ok=True)
