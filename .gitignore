@@ -186,6 +186,7 @@ llm/generated_levels/
 
 # Analysis caches (generated embeddings/evals)
 analysis/**/cache*/
+analysis/**/test_cache*/
 
 # Buffer dumps (large binary data)
 buffer_dumps/

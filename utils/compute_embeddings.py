@@ -38,6 +38,11 @@ EVAL_LEVEL_NAMES = [
     "Labyrinth2", "StandardMaze", "StandardMaze2", "StandardMaze3",
 ]
 
+EVAL_LEVEL_NAMES_21 = [
+    "PerfectMaze21_1", "PerfectMaze21_2", "PerfectMaze21_3", "PerfectMaze21_4",
+    "Rooms21_1", "Rooms21_2", "Labyrinth21_1", "Labyrinth21_2",
+]
+
 
 def compute_embeddings_solved(tokens, checkpoint_dir, ckpt_step,
                                batch_size=256, num_rollouts=10):
@@ -137,6 +142,98 @@ def compute_embeddings_solved(tokens, checkpoint_dir, ckpt_step,
     return embeddings_solved, solved_mask, solve_rates, embeddings_all
 
 
+def compute_embeddings_from_levels(levels, n_levels, checkpoint_dir, ckpt_step,
+                                    maze_height, maze_width,
+                                    batch_size=256, num_rollouts=10):
+    """Compute 257D embeddings for pre-built Level objects on arbitrary grid sizes.
+
+    Like compute_embeddings_solved but takes Level pytree directly and uses a
+    custom maze size (needed for 21x21 eval levels with a 13x13-trained agent).
+
+    Returns:
+        embeddings: (N, 257) mean embedding (solved-only if any solved, else all)
+        solved: (N,) bool
+        solve_rates: (N,) float
+        embeddings_all: (N, 257) mean of ALL rollouts
+    """
+    from cross_evaluate import load_agent
+    from maze_plr import ActorCritic, sample_trajectories_rnn, compute_insertion_embeddings
+    from jaxued.environments import Maze
+    from jaxued.wrappers import AutoReplayWrapper
+    import jax
+    import jax.numpy as jnp
+
+    train_state, config, _, env_params = load_agent(
+        checkpoint_dir, checkpoint_step=ckpt_step)
+    if train_state is None:
+        return None, None, None, None
+
+    eval_env = Maze(max_height=maze_height, max_width=maze_width,
+                    agent_view_size=config["agent_view_size"], normalize_obs=True)
+    wrapped_env = AutoReplayWrapper(eval_env)
+    max_steps = env_params.max_steps_in_episode
+
+    all_rollout_embs = np.zeros((num_rollouts, n_levels, 257), dtype=np.float32)
+    all_rollout_solved = np.zeros((num_rollouts, n_levels), dtype=bool)
+
+    for rollout_idx in range(num_rollouts):
+        rollout_embs = []
+        rollout_solved = []
+
+        for start in range(0, n_levels, batch_size):
+            end = min(start + batch_size, n_levels)
+            chunk_levels = jax.tree_util.tree_map(lambda x: x[start:end], levels)
+            n_chunk = end - start
+
+            rng = jax.random.PRNGKey(rollout_idx * 1000 + start)
+            rng, rng_reset, rng_eval = jax.random.split(rng, 3)
+
+            init_obs, init_state = jax.vmap(
+                wrapped_env.reset_to_level, (0, 0, None)
+            )(jax.random.split(rng_reset, n_chunk), chunk_levels, env_params)
+
+            init_hstate = ActorCritic.initialize_carry((n_chunk,))
+
+            (_, _, _, _, _, _), traj = sample_trajectories_rnn(
+                rng_eval, wrapped_env, env_params, train_state,
+                init_hstate, init_obs, init_state,
+                n_chunk, max_steps,
+            )
+            _, actions, rewards, dones, _, _, _, _, hstates = traj
+
+            embeddings = compute_insertion_embeddings(hstates, actions, dones)
+            rollout_embs.append(np.array(embeddings))
+
+            episode_returns = np.array(jnp.sum(rewards * dones, axis=0))
+            solved_chunk = episode_returns > 0
+            rollout_solved.append(solved_chunk)
+
+        all_rollout_embs[rollout_idx] = np.concatenate(rollout_embs, axis=0)
+        all_rollout_solved[rollout_idx] = np.concatenate(rollout_solved, axis=0)
+
+        n_solved = all_rollout_solved[rollout_idx].sum()
+        print(f"  Rollout {rollout_idx+1}/{num_rollouts}: "
+              f"{n_solved}/{n_levels} solved", flush=True)
+
+    embeddings_all = all_rollout_embs.mean(axis=0)
+    solve_counts = all_rollout_solved.sum(axis=0)
+    solved_mask = solve_counts > 0
+    solve_rates = solve_counts / num_rollouts
+
+    embeddings_solved = np.zeros_like(embeddings_all)
+    for i in range(n_levels):
+        if solved_mask[i]:
+            rollout_mask = all_rollout_solved[:, i]
+            embeddings_solved[i] = all_rollout_embs[rollout_mask, i].mean(axis=0)
+        else:
+            embeddings_solved[i] = embeddings_all[i]
+
+    print(f"\nSummary: {solved_mask.sum()}/{n_levels} levels solved by >= 1 rollout")
+    print(f"  Mean solve rate: {solve_rates.mean():.3f}")
+
+    return embeddings_solved, solved_mask, solve_rates, embeddings_all
+
+
 def get_eval_level_tokens():
     """Get token arrays for the 8 eval benchmark levels."""
     from jaxued.environments.maze.level import prefabs, Level
@@ -147,6 +244,17 @@ def get_eval_level_tokens():
         tok = np.asarray(level_to_tokens(level))
         tokens_list.append(tok)
     return np.stack(tokens_list)
+
+
+def get_eval_21x21_levels():
+    """Get stacked Level pytree for the 8 21x21 eval levels (padded to 21x21)."""
+    from jaxued.environments.maze.level import prefabs, Level
+    level_objects = []
+    for name in EVAL_LEVEL_NAMES_21:
+        lvl = Level.from_str(prefabs[name])
+        lvl = lvl.pad_to_shape(21, 21)
+        level_objects.append(lvl)
+    return Level.stack(level_objects), len(level_objects)
 
 
 def main():
@@ -165,7 +273,37 @@ def main():
                         help="Output .npz path")
     parser.add_argument("--eval_only", action="store_true",
                         help="Only compute embeddings for 8 eval benchmark levels")
+    parser.add_argument("--eval_21x21", action="store_true",
+                        help="Compute embeddings for 8 21x21 eval levels")
     args = parser.parse_args()
+
+    if args.eval_21x21:
+        print("Computing 21x21 eval level embeddings...")
+        levels_21, n_levels_21 = get_eval_21x21_levels()
+        ckpt_dir = os.path.abspath(args.checkpoint_dir)
+        print(f"Checkpoint: {ckpt_dir}, step={args.checkpoint_step}")
+        print(f"Rollouts: {args.num_rollouts}")
+
+        emb_solved, solved, solve_rates, emb_all = compute_embeddings_from_levels(
+            levels_21, n_levels_21, ckpt_dir, args.checkpoint_step,
+            maze_height=21, maze_width=21,
+            batch_size=args.batch_size, num_rollouts=args.num_rollouts)
+
+        if emb_solved is None:
+            print("Failed to load agent.")
+            return
+
+        save_data = {
+            "embeddings_solved": emb_solved,
+            "embeddings_all": emb_all,
+            "solved": solved,
+            "solve_rates": solve_rates,
+            "level_names": np.array(EVAL_LEVEL_NAMES_21),
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        np.savez_compressed(args.output, **save_data)
+        print(f"\nSaved: {args.output}")
+        return
 
     if args.eval_only:
         print("Computing eval level embeddings...")
