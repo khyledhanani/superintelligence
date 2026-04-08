@@ -164,6 +164,117 @@ def _orbax_restore_cross_device(mgr, step):
             mds_mod.SingleDeviceShardingMetadata.to_jax_sharding = orig_tj
 
 
+def _latest_numeric_step_subdir(root: str):
+    """Largest numeric basename under ``root`` (Orbax step folder), or None."""
+    best = None
+    try:
+        for name in os.listdir(root):
+            if not name.isdigit():
+                continue
+            p = os.path.join(root, name)
+            if os.path.isdir(p):
+                n = int(name)
+                if best is None or n > best:
+                    best = n
+    except OSError:
+        return None
+    return best
+
+
+def _orbax_item_default_dir(checkpoint_dir: str, step):
+    """Directory Orbax uses for the ``default`` item (contains ``_METADATA``)."""
+    root = os.path.abspath(checkpoint_dir)
+    direct = os.path.join(root, 'default')
+    if os.path.isfile(os.path.join(direct, '_METADATA')):
+        return direct
+    st = step
+    if st is None:
+        st = _latest_numeric_step_subdir(root)
+    if st is None:
+        return None
+    leaf = os.path.join(root, str(st), 'default')
+    if os.path.isfile(os.path.join(leaf, '_METADATA')):
+        return leaf
+    return None
+
+
+def _maybe_write_synthetic_ocdbt_aggregate(leaf_dir: str) -> None:
+    """Orbax OCDBT restore expects a msgpack file named ``checkpoint`` next to ``_METADATA``.
+
+    Some distributed bundles (e.g. notebook assets) only include tensorstore data
+    and JSON metadata. Rebuild the aggregate tree from ``_METADATA`` so
+    ``StandardCheckpointHandler`` can restore.
+    """
+    import json
+
+    from etils import epath
+    from jax.tree_util import DictKey, SequenceKey
+    from orbax.checkpoint import msgpack_utils
+    from orbax.checkpoint import type_handlers as ocp_type_handlers
+    from orbax.checkpoint import utils as ocp_utils
+
+    leaf = os.path.abspath(leaf_dir)
+    meta_path = os.path.join(leaf, '_METADATA')
+    ckpt_path = os.path.join(leaf, 'checkpoint')
+    if not os.path.isfile(meta_path) or os.path.isfile(ckpt_path):
+        return
+
+    raw = json.loads(epath.Path(meta_path).read_text())
+    tree_metadata = raw.get('tree_metadata')
+    if not isinstance(tree_metadata, dict):
+        return
+
+    def _keypath_from_entry(key_metadata):
+        keys = []
+        for ent in key_metadata:
+            name = ent['key']
+            kt = int(ent['key_type'])
+            if kt == 1:
+                keys.append(SequenceKey(int(name)))
+            elif kt == 2:
+                keys.append(DictKey(name))
+            else:
+                raise ValueError(f'Unsupported key_type in _METADATA: {kt!r}')
+        return tuple(keys)
+
+    flat_with_keys = []
+    for _, entry in tree_metadata.items():
+        km = entry['key_metadata']
+        vm = entry['value_metadata']
+        keypath = _keypath_from_entry(km)
+        param_name = '.'.join(str(ocp_utils.get_key_name(k)) for k in keypath)
+        vtype = vm['value_type']
+        if ocp_type_handlers.is_empty_typestr(vtype):
+            value = ocp_type_handlers.get_empty_value_from_typestr(vtype)
+        elif vtype in ('jax.Array', 'np.ndarray', 'numpy.ndarray'):
+            value = ocp_utils.leaf_placeholder(param_name)
+        else:
+            value = ocp_utils.leaf_placeholder(param_name)
+        flat_with_keys.append((keypath, value))
+
+    tree = ocp_utils.from_flattened_with_keypath(flat_with_keys)
+    serialized = ocp_utils.serialize_tree(tree, keep_empty_nodes=True)
+    epath.Path(ckpt_path).write_bytes(msgpack_utils.msgpack_serialize(serialized))
+    print(
+        f'Wrote synthetic Orbax aggregate checkpoint (msgpack) for OCDBT leaf: {ckpt_path}'
+    )
+
+
+def _prepare_ocdbt_leaf_for_restore(checkpoint_dir: str, step) -> None:
+    """Merge per-process OCDBT shards if needed; synthesize msgpack aggregate if missing."""
+    from etils import epath
+    from orbax.checkpoint import type_handlers as ocp_type_handlers
+
+    leaf = _orbax_item_default_dir(checkpoint_dir, step)
+    if not leaf:
+        return
+    try:
+        ocp_type_handlers.merge_ocdbt_per_process_files(epath.Path(leaf))
+    except Exception:
+        pass
+    _maybe_write_synthetic_ocdbt_aggregate(leaf)
+
+
 def load_agent_params(checkpoint_dir, step=None):
     """Load agent parameters from a pickle file or orbax checkpoint.
 
@@ -202,6 +313,7 @@ def load_agent_params(checkpoint_dir, step=None):
         return params
 
     # Fall back to orbax checkpoint
+    _prepare_ocdbt_leaf_for_restore(checkpoint_dir, step)
     import orbax.checkpoint as ocp
     mgr = ocp.CheckpointManager(
         checkpoint_dir,
