@@ -425,7 +425,7 @@ def setup_checkpointing(config: dict, train_state: TrainState, env: Underspecifi
         print(f"[GCS] Config saved to {overall_save_dir}/config.json")
     else:
         if config.get("output_dir"):
-            overall_save_dir = os.path.join(config["output_dir"], "checkpoints")
+            overall_save_dir = os.path.join(config["output_dir"], "checkpoints", str(config['seed']))
         else:
             overall_save_dir = os.path.join(os.getcwd(), "checkpoints", f"{config['run_name']}", str(config['seed']))
         os.makedirs(overall_save_dir, exist_ok=True)
@@ -651,6 +651,18 @@ def main(config=None, project="JAXUED_TEST"):
                 # How many unique injected slots were replayed
                 unique_injected = len(set(valid_inds[replayed_origins > 0]))
                 log_dict["provenance/replay_unique_injected"] = unique_injected
+
+            # Buffer composition: how many LLM levels currently in buffer
+            buf_size = int(log_dict.get("level_sampler/size", 0))
+            if buf_size > 0:
+                origins_slice = _buffer_origins[:buf_size]
+                n_seeds_in_buf = int((origins_slice == 1).sum())
+                n_muts_in_buf = int((origins_slice == 2).sum())
+                n_injected_in_buf = n_seeds_in_buf + n_muts_in_buf
+                log_dict["provenance/buffer_injected"] = n_injected_in_buf
+                log_dict["provenance/buffer_injected_pct"] = n_injected_in_buf / buf_size
+                log_dict["provenance/buffer_seeds"] = n_seeds_in_buf
+                log_dict["provenance/buffer_mutations"] = n_muts_in_buf
 
         wandb.log(log_dict)
 
@@ -1223,9 +1235,10 @@ def main(config=None, project="JAXUED_TEST"):
     def dump_buffer(train_state, update_num):
         """Save PLR buffer as .npy (VAE token format) + .npz (full metadata).
 
-        If provenance tracking is active (_buffer_origin_ids is set), computes
-        which injected levels are still present by matching token hashes, and
-        saves origins/origin_ids + survival stats alongside the dump.
+        Provenance tracking: _buffer_origins[i] / _buffer_origin_ids[i] are
+        updated at injection time using wall_map md5. PLR's buffer is slot-
+        addressed (no shifting), so a slot is "still LLM" iff the wall_map at
+        that slot still hashes to the same id we recorded at injection.
         """
         import hashlib as _hl
         nonlocal _buffer_origins, _buffer_origin_ids
@@ -1247,36 +1260,41 @@ def main(config=None, project="JAXUED_TEST"):
             "update_num": update_num,
         }
 
-        # --- Provenance: match current buffer against injected origin_ids ---
+        # --- Provenance: detect survival via wall_map hash equality ---
         if _buffer_origin_ids is not None:
-            # Compute current token hashes
-            current_hashes = np.array([
-                int(_hl.md5(tokens_np[i].tobytes()).hexdigest()[:16], 16)
+            wall_map_now = np.asarray(buffer_levels.wall_map)  # (size, H, W)
+            current_wall_map_ids = np.array([
+                int(_hl.md5(wall_map_now[i].tobytes()).hexdigest()[:16], 16)
                 for i in range(size)
             ], dtype=np.uint64)
 
-            # Match: which current slots have an origin_id that was injected?
-            injected_ids = set(_buffer_origin_ids[_buffer_origins > 0])
-            current_origins = np.zeros(size, dtype=np.int32)
-            current_origin_ids = current_hashes.copy()
-            for i in range(size):
-                if current_hashes[i] in injected_ids:
-                    current_origins[i] = _buffer_origins[
-                        np.where(_buffer_origin_ids == current_hashes[i])[0][0]
-                    ] if current_hashes[i] in set(_buffer_origin_ids) else 0
+            origins_at_inject = _buffer_origins[:size].copy().astype(np.int32)
+            ids_at_inject = _buffer_origin_ids[:size].copy()
 
-            n_survived = int((current_origins > 0).sum())
-            n_original = int((_buffer_origins[:size] > 0).sum()) if _buffer_origins is not None else 0
+            # Slot still holds the injected level iff wall_map hash matches the
+            # one recorded at injection time. If PLR overwrote the slot the
+            # hashes will differ; we then clear the stale provenance.
+            survived_mask = (origins_at_inject > 0) & (current_wall_map_ids == ids_at_inject)
+            stale_idx = np.where((origins_at_inject > 0) & ~survived_mask)[0]
+            if stale_idx.size > 0:
+                _buffer_origins[stale_idx] = 0
+                _buffer_origin_ids[stale_idx] = 0
 
-            dump_data["origins"] = current_origins
-            dump_data["origin_ids"] = current_origin_ids
+            origins_alive = np.where(survived_mask, origins_at_inject, 0).astype(np.int32)
+
+            n_survived = int(survived_mask.sum())
+            n_original = int((origins_at_inject > 0).sum())
+
+            dump_data["origins"] = origins_alive
+            dump_data["origin_ids"] = np.where(survived_mask, ids_at_inject, 0)
+            dump_data["current_origin_ids"] = current_wall_map_ids
             dump_data["n_injected_survived"] = n_survived
             dump_data["n_injected_original"] = n_original
 
             print(f"  [Provenance] {n_survived}/{n_original} injected levels still in buffer")
 
         if config.get("output_dir"):
-            dump_dir = os.path.join(config["output_dir"], "buffer_dumps")
+            dump_dir = os.path.join(config["output_dir"], "buffer_dumps", str(config["seed"]))
         else:
             dump_dir = os.path.join("/tmp", "buffer_dumps", f"{config['run_name']}", str(config["seed"]))
         os.makedirs(dump_dir, exist_ok=True)
@@ -1322,6 +1340,13 @@ def main(config=None, project="JAXUED_TEST"):
         gate_status = "gate=ON" if llm_config.gate_enabled else "gate=OFF"
         print(f"[LLM] Injection enabled: interval={llm_config.injection_interval}, "
               f"n_raw={llm_config.n_raw}, start_step={llm_config.inject_start_step}, {gate_status}")
+
+        # Initialize provenance tracking for fresh LLM runs (not just preload)
+        if _buffer_origins is None:
+            capacity = runner_state[1].sampler["scores"].shape[0]
+            _buffer_origins = np.zeros(capacity, dtype=np.int32)
+            _buffer_origin_ids = np.zeros(capacity, dtype=np.uint64)
+            print(f"[Provenance] Initialized tracking arrays (capacity={capacity})")
         # Print injection schedule
         eval_freq = config["eval_freq"]
         num_updates = config["num_updates"]
@@ -1415,6 +1440,26 @@ def main(config=None, project="JAXUED_TEST"):
         # LLM injection hook
         if llm_injector is not None:
             runner_state = llm_injector.maybe_inject(runner_state, eval_step)
+
+            # Update provenance arrays with newly injected slot indices.
+            # We hash the wall_map (not VAE tokens) so that dump_buffer can
+            # check survival by re-hashing the wall_map at the same slot.
+            if _buffer_origins is not None:
+                import hashlib as _prov_hl
+                for origin_type, indices in [
+                    (1, llm_injector.last_seed_indices),
+                    (2, llm_injector.last_mut_indices),
+                ]:
+                    if indices is not None:
+                        for idx in np.asarray(indices):
+                            if idx >= 0:
+                                _buffer_origins[idx] = origin_type
+                                wall_map_np = np.asarray(
+                                    runner_state[1].sampler["levels"].wall_map[idx]
+                                )
+                                _buffer_origin_ids[idx] = int(
+                                    _prov_hl.md5(wall_map_np.tobytes()).hexdigest()[:16], 16
+                                )
 
         if config["checkpoint_save_interval"] > 0:
             checkpoint_manager.save(eval_step, args=ocp.args.StandardSave(runner_state[1]))
