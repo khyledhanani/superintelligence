@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Download the public COMP0258 notebook assets from Google Drive into notebooks/assets.
+"""Download the public COMP0258 notebook assets (zip on Google Drive) into notebooks/assets.
 
-Uses gdown (--folder) for the shared folder:
-https://drive.google.com/drive/folders/1e1T4aFZ7lMPcNxA-i_f8345DANUZANba
+Zip file (shared link):
+https://drive.google.com/file/d/1_gqw6v4cNDxLm1BYmtfz2dLyt3_jG3n9/view?usp=drive_link
 
 Usage:
   python notebooks/download_notebook_assets.py
@@ -18,11 +18,30 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
-DRIVE_FOLDER_URL = (
-    "https://drive.google.com/drive/folders/1e1T4aFZ7lMPcNxA-i_f8345DANUZANba"
-)
+# Public assets.zip on Google Drive
+DRIVE_FILE_ID = "1_gqw6v4cNDxLm1BYmtfz2dLyt3_jG3n9"
+DRIVE_ZIP_URL = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
+
+
+def _run_stream(cmd: list[str]) -> None:
+    """Run a command and stream combined stdout/stderr (works well in Colab notebooks)."""
+    print("$", " ".join(cmd), flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
 
 
 def _ensure_gdown() -> None:
@@ -32,26 +51,35 @@ def _ensure_gdown() -> None:
     )
 
 
-def _merge_into_assets(staging: Path, asset_dir: Path) -> None:
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    top = list(staging.iterdir())
-    if not top:
-        raise RuntimeError("gdown produced an empty download directory.")
-    # gdown --folder usually creates a single subdirectory named after the Drive folder.
-    if len(top) == 1 and top[0].is_dir():
-        root_dir = top[0]
-    else:
-        root_dir = staging
+def _extract_zip_to_assets(zip_path: Path, asset_dir: Path) -> None:
+    """Extract zip layout into asset_dir.
 
-    for item in root_dir.iterdir():
-        dest = asset_dir / item.name
-        if item.is_dir():
-            if dest.exists():
+    Supports:
+    - zip with top-level ``assets/`` folder -> merge that folder's contents
+    - zip with files/dirs at root -> merge into asset_dir
+    """
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmp_path)
+
+        top = list(tmp_path.iterdir())
+        if not top:
+            raise RuntimeError("Zip archive is empty.")
+
+        if len(top) == 1 and top[0].is_dir():
+            # e.g. a single top-level ``assets/`` folder or any one wrapper directory
+            src_root = top[0]
+        else:
+            src_root = tmp_path
+
+        for item in src_root.iterdir():
+            dest = asset_dir / item.name
+            if item.is_dir():
                 shutil.copytree(item, dest, dirs_exist_ok=True)
             else:
-                shutil.copytree(item, dest)
-        else:
-            shutil.copy2(item, dest)
+                shutil.copy2(item, dest)
 
 
 def download_assets(asset_dir: Path, *, force: bool = False) -> None:
@@ -71,19 +99,22 @@ def download_assets(asset_dir: Path, *, force: bool = False) -> None:
     _ensure_gdown()
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        cmd = [
-            sys.executable,
-            "-m",
-            "gdown",
-            "--folder",
-            "--remaining-ok",
-            "-O",
-            str(tmp_path),
-            DRIVE_FOLDER_URL,
-        ]
-        print("Running:", " ".join(cmd))
-        subprocess.run(cmd, check=True)
-        _merge_into_assets(tmp_path, asset_dir)
+        zip_path = tmp_path / "assets.zip"
+        _run_stream(
+            [
+                sys.executable,
+                "-m",
+                "gdown",
+                "--fuzzy",
+                DRIVE_ZIP_URL,
+                "-O",
+                str(zip_path),
+            ]
+        )
+        if not zip_path.is_file():
+            raise FileNotFoundError(f"Expected downloaded zip at {zip_path}")
+        _extract_zip_to_assets(zip_path, asset_dir)
+
     print("Done. Assets directory:", asset_dir.resolve())
 
 
