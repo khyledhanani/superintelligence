@@ -1,0 +1,1502 @@
+[
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-gpt41mini",
+    "seed": 0,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.16875,
+    "median_solve_rate": 0.030000000000000002,
+    "iqm_solve_rate": 0.018333333333333337,
+    "mean_return": 0.07823250442743301,
+    "mean_optimality_gap": 0.814616420439536,
+    "mean_path_ratio": 3.494626446557008,
+    "unsolved_count": 3,
+    "fully_solved_count": 0,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 97.28552746772766,
+    "per_level_solve_rates": [
+      0.0,
+      0.0,
+      0.0,
+      0.05,
+      0.53,
+      0.71,
+      0.01,
+      0.05
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.0,
+      0.0,
+      0.00607999786734581,
+      0.23904798924922943,
+      0.3591080605983734,
+      0.005967999808490276,
+      0.01565600000321865
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8517420880222247,
+      0.7098783911188687,
+      0.5898183197697248,
+      0.9305350676761723,
+      0.9249881717759224
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      null,
+      null,
+      244.0,
+      152.49056603773585,
+      137.28169014084506,
+      112.0,
+      190.8
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      null,
+      null,
+      2.392156862745098,
+      4.235849056603772,
+      3.81338028169014,
+      2.488888888888889,
+      4.542857142857143
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-gpt41mini",
+    "seed": 1,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.43875,
+    "median_solve_rate": 0.405,
+    "iqm_solve_rate": 0.27166666666666667,
+    "mean_return": 0.1536705046892166,
+    "mean_optimality_gap": 0.7391784180240689,
+    "mean_path_ratio": 2.752756144668474,
+    "unsolved_count": 3,
+    "fully_solved_count": 0,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 95.81059002876282,
+    "per_level_solve_rates": [
+      0.78,
+      0.98,
+      0.0,
+      0.03,
+      0.82,
+      0.9,
+      0.0,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.15460792183876038,
+      0.21770019829273224,
+      0.0,
+      0.004583999048918486,
+      0.5142518877983093,
+      0.3382200598716736,
+      0.0,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.6976926916581722,
+      0.601471580848372,
+      0.8384969325153374,
+      0.853238086840652,
+      0.43467449256978885,
+      0.6107063204964246,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      222.71794871794873,
+      216.07142857142858,
+      null,
+      235.33333333333334,
+      103.57317073170732,
+      173.38888888888889,
+      null,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      2.101112723754235,
+      1.6620879120879135,
+      null,
+      2.3071895424836604,
+      2.8770325203252063,
+      4.816358024691355,
+      null,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-gpt41mini",
+    "seed": 2,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.43125,
+    "median_solve_rate": 0.255,
+    "iqm_solve_rate": 0.245,
+    "mean_return": 0.15378445386886597,
+    "mean_optimality_gap": 0.7390644717548026,
+    "mean_path_ratio": 2.8748457634011455,
+    "unsolved_count": 3,
+    "fully_solved_count": 1,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 96.05287981033325,
+    "per_level_solve_rates": [
+      0.0,
+      0.0,
+      1.0,
+      0.98,
+      0.96,
+      0.5,
+      0.01,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.0,
+      0.19655199348926544,
+      0.35244765877723694,
+      0.4805520176887512,
+      0.194179967045784,
+      0.006544000003486872,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.641944939026072,
+      0.5053744271123336,
+      0.46837436267934696,
+      0.7547464133223142,
+      0.9299590674811757,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      null,
+      223.18,
+      177.87755102040816,
+      138.72916666666666,
+      169.9,
+      96.0,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      null,
+      1.9239655172413783,
+      1.7438975590236112,
+      3.8535879629629624,
+      4.719444444444443,
+      2.1333333333333333,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-gpt41mini",
+    "seed": 3,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.4425,
+    "median_solve_rate": 0.405,
+    "iqm_solve_rate": 0.2783333333333334,
+    "mean_return": 0.17656803131103516,
+    "mean_optimality_gap": 0.7162808977468854,
+    "mean_path_ratio": 3.0050154147732338,
+    "unsolved_count": 3,
+    "fully_solved_count": 1,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 95.9154577255249,
+    "per_level_solve_rates": [
+      0.0,
+      0.0,
+      0.8,
+      1.0,
+      0.87,
+      0.86,
+      0.01,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.0,
+      0.18915198743343353,
+      0.3831041753292084,
+      0.2920920252799988,
+      0.5439560413360596,
+      0.0042399996891617775,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.6493449450819039,
+      0.47471791056036217,
+      0.6568343550880994,
+      0.4049703390320386,
+      0.9322630677955008,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      null,
+      212.1,
+      171.36,
+      184.51724137931035,
+      102.0813953488372,
+      160.0,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      null,
+      1.8284482758620697,
+      1.679999999999999,
+      5.1254789272030665,
+      2.8355943152454786,
+      3.5555555555555554,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-gpt41mini",
+    "seed": 4,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.21625,
+    "median_solve_rate": 0.055,
+    "iqm_solve_rate": 0.06666666666666667,
+    "mean_return": 0.048206500709056854,
+    "mean_optimality_gap": 0.8446424270682952,
+    "mean_path_ratio": 3.7578990628089066,
+    "unsolved_count": 4,
+    "fully_solved_count": 0,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 94.61201691627502,
+    "per_level_solve_rates": [
+      0.29,
+      0.98,
+      0.0,
+      0.0,
+      0.35,
+      0.11,
+      0.0,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.0680600106716156,
+      0.1883239895105362,
+      0.0,
+      0.0,
+      0.10260799527168274,
+      0.026659999042749405,
+      0.0,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.7842406028253169,
+      0.6308477896305681,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.8463183850964154,
+      0.9222663813253488,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      212.58620689655172,
+      224.39795918367346,
+      null,
+      null,
+      196.34285714285716,
+      210.45454545454547,
+      null,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      2.005530253741055,
+      1.7261381475667197,
+      null,
+      null,
+      5.453968253968253,
+      5.845959595959598,
+      null,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-accel-baseline",
+    "seed": 0,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.30375,
+    "median_solve_rate": 0.0,
+    "iqm_solve_rate": 0.09166666666666667,
+    "mean_return": 0.10955248773097992,
+    "mean_optimality_gap": 0.7832964460999688,
+    "mean_path_ratio": 3.304282375032374,
+    "unsolved_count": 5,
+    "fully_solved_count": 1,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 95.58179473876953,
+    "per_level_solve_rates": [
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.88,
+      0.55,
+      0.0,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.19640788435935974,
+      0.0,
+      0.0,
+      0.43788397312164307,
+      0.24212798476219177,
+      0.0,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.8523006134969325,
+      0.6227638947817445,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.5110424072464551,
+      0.7067983956059064,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      223.22,
+      null,
+      null,
+      139.5568181818182,
+      155.4909090909091,
+      null,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      1.7170769230769207,
+      null,
+      null,
+      3.8765782828282838,
+      4.31919191919192,
+      null,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-accel-baseline",
+    "seed": 1,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.16125,
+    "median_solve_rate": 0.0,
+    "iqm_solve_rate": 0.011666666666666667,
+    "mean_return": 0.06393752992153168,
+    "mean_optimality_gap": 0.8289113983214816,
+    "mean_path_ratio": 3.551217483933532,
+    "unsolved_count": 5,
+    "fully_solved_count": 0,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 93.12218403816223,
+    "per_level_solve_rates": [
+      0.0,
+      0.41,
+      0.0,
+      0.0,
+      0.07,
+      0.81,
+      0.0,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.08823200315237045,
+      0.0,
+      0.0,
+      0.024063996970653534,
+      0.39920422434806824,
+      0.0,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.8523006134969325,
+      0.7309397759887338,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9248623833974446,
+      0.5497221560200299,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      218.0,
+      null,
+      null,
+      182.28571428571428,
+      140.87654320987653,
+      null,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      1.6769230769230759,
+      null,
+      null,
+      5.063492063492063,
+      3.9132373113854566,
+      null,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-accel-baseline",
+    "seed": 2,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.18625,
+    "median_solve_rate": 0.0,
+    "iqm_solve_rate": 0.018333333333333333,
+    "mean_return": 0.044018492102622986,
+    "mean_optimality_gap": 0.8488304338120839,
+    "mean_path_ratio": 4.349818699818699,
+    "unsolved_count": 5,
+    "fully_solved_count": 0,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 93.38387298583984,
+    "per_level_solve_rates": [
+      0.0,
+      0.88,
+      0.0,
+      0.0,
+      0.11,
+      0.5,
+      0.0,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.18404795229434967,
+      0.0,
+      0.0,
+      0.02701999619603157,
+      0.14107999205589294,
+      0.0,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.8523006134969325,
+      0.6351238268467546,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9219063841720666,
+      0.8078463883122052,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      219.6818181818182,
+      null,
+      null,
+      209.54545454545453,
+      199.4,
+      null,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      1.6898601398601374,
+      null,
+      null,
+      5.82070707070707,
+      5.5388888888888905,
+      null,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-accel-baseline",
+    "seed": 3,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.32125,
+    "median_solve_rate": 0.08,
+    "iqm_solve_rate": 0.14,
+    "mean_return": 0.12794798612594604,
+    "mean_optimality_gap": 0.7649009455513193,
+    "mean_path_ratio": 2.8751504383069304,
+    "unsolved_count": 3,
+    "fully_solved_count": 0,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 93.21609354019165,
+    "per_level_solve_rates": [
+      0.0,
+      0.0,
+      0.15,
+      0.76,
+      0.68,
+      0.97,
+      0.0,
+      0.01
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.0,
+      0.02399999089539051,
+      0.1693120002746582,
+      0.3259759247303009,
+      0.49803993105888367,
+      0.0,
+      0.00625599967315793
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8144969416199469,
+      0.6885100856149123,
+      0.6229504556377973,
+      0.4508864493092145,
+      0.9365030674846626,
+      0.9343881721059831
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      null,
+      233.33333333333334,
+      215.89473684210526,
+      144.61764705882354,
+      135.15463917525773,
+      null,
+      104.0
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      null,
+      2.011494252873563,
+      2.1166150670794637,
+      4.017156862745099,
+      3.754295532646049,
+      null,
+      2.4761904761904763
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "prefabs_21x21",
+    "maze_size": 21,
+    "condition": "final-accel-baseline",
+    "seed": 4,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.235,
+    "median_solve_rate": 0.085,
+    "iqm_solve_rate": 0.085,
+    "mean_return": 0.07696449756622314,
+    "mean_optimality_gap": 0.815884428814145,
+    "mean_path_ratio": 3.4594450524794134,
+    "unsolved_count": 4,
+    "fully_solved_count": 0,
+    "n_levels": 8,
+    "num_attempts": 100,
+    "elapsed_s": 93.4391462802887,
+    "per_level_solve_rates": [
+      0.65,
+      0.34,
+      0.0,
+      0.0,
+      0.17,
+      0.72,
+      0.0,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.15518002212047577,
+      0.07064798474311829,
+      0.0,
+      0.0,
+      0.03183199465274811,
+      0.358055979013443,
+      0.0,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.8523006134969325,
+      0.8191717791411043,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9489263803680982,
+      0.9489263803680982,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_optimality_gaps": [
+      0.6971205913764568,
+      0.748523794397986,
+      0.8384969325153374,
+      0.8578220858895705,
+      0.9170943857153501,
+      0.5908704013546552,
+      0.9365030674846626,
+      0.9406441717791411
+    ],
+    "per_level_shortest_paths": [
+      106.0,
+      130.0,
+      116.0,
+      102.0,
+      36.0,
+      36.0,
+      45.0,
+      42.0
+    ],
+    "per_level_ep_length_means": [
+      211.46153846153845,
+      220.05882352941177,
+      null,
+      null,
+      225.76470588235293,
+      139.63888888888889,
+      null,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      1.994920174165459,
+      1.6927601809954744,
+      null,
+      null,
+      6.27124183006536,
+      3.878858024691359,
+      null,
+      null
+    ],
+    "level_names": [
+      "PerfectMaze21_1",
+      "PerfectMaze21_2",
+      "PerfectMaze21_3",
+      "PerfectMaze21_4",
+      "Rooms21_1",
+      "Rooms21_2",
+      "Labyrinth21_1",
+      "Labyrinth21_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-gpt41mini",
+    "seed": 0,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.0,
+    "median_solve_rate": 0.0,
+    "iqm_solve_rate": 0.0,
+    "mean_return": 0.0,
+    "mean_optimality_gap": 0.7323185011709602,
+    "mean_path_ratio": NaN,
+    "unsolved_count": 2,
+    "fully_solved_count": 0,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 77.47398161888123,
+    "per_level_solve_rates": [
+      0.0,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.0,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      null,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      null,
+      null
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-gpt41mini",
+    "seed": 1,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.94,
+    "median_solve_rate": 0.94,
+    "iqm_solve_rate": 0.94,
+    "mean_return": 0.39026209712028503,
+    "mean_optimality_gap": 0.34205640405067517,
+    "mean_path_ratio": 1.2862518037518038,
+    "unsolved_count": 0,
+    "fully_solved_count": 1,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 77.39601445198059,
+    "per_level_solve_rates": [
+      1.0,
+      0.88
+    ],
+    "per_level_mean_returns": [
+      0.39487603306770325,
+      0.3856481611728668
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.33744246810325695,
+      0.3466703399980934
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      168.09,
+      156.04545454545453
+    ],
+    "per_level_path_ratio_means": [
+      1.3340476190476176,
+      1.23845598845599
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-gpt41mini",
+    "seed": 2,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.7250000000000001,
+    "median_solve_rate": 0.7250000000000001,
+    "iqm_solve_rate": 0.7250000000000001,
+    "mean_return": 0.2003718614578247,
+    "mean_optimality_gap": 0.5319466397131355,
+    "mean_path_ratio": 1.6235472346583455,
+    "unsolved_count": 0,
+    "fully_solved_count": 0,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 77.49788498878479,
+    "per_level_solve_rates": [
+      0.91,
+      0.54
+    ],
+    "per_level_mean_returns": [
+      0.2855437397956848,
+      0.1151999831199646
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.4467747613752754,
+      0.6171185180509956
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      190.6153846153846,
+      218.5185185185185
+    ],
+    "per_level_path_ratio_means": [
+      1.5128205128205137,
+      1.7342739564961775
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-gpt41mini",
+    "seed": 3,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.72,
+    "median_solve_rate": 0.72,
+    "iqm_solve_rate": 0.72,
+    "mean_return": 0.31572023034095764,
+    "mean_optimality_gap": 0.41659827828058316,
+    "mean_path_ratio": 1.252077922077922,
+    "unsolved_count": 0,
+    "fully_solved_count": 1,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 78.39812874794006,
+    "per_level_solve_rates": [
+      0.44,
+      1.0
+    ],
+    "per_level_mean_returns": [
+      0.1828160136938095,
+      0.4486244320869446
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.5495024874771507,
+      0.2836940690840156
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      162.36363636363637,
+      153.16
+    ],
+    "per_level_path_ratio_means": [
+      1.2886002886002894,
+      1.2155555555555542
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-gpt41mini",
+    "seed": 4,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.995,
+    "median_solve_rate": 0.995,
+    "iqm_solve_rate": 0.995,
+    "mean_return": 0.38352179527282715,
+    "mean_optimality_gap": 0.34879670589813305,
+    "mean_path_ratio": 1.35458633958634,
+    "unsolved_count": 0,
+    "fully_solved_count": 1,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 79.30024886131287,
+    "per_level_solve_rates": [
+      1.0,
+      0.99
+    ],
+    "per_level_mean_returns": [
+      0.3635917603969574,
+      0.4034518301486969
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.3687267407740028,
+      0.3288666710222633
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      176.78,
+      164.57575757575756
+    ],
+    "per_level_path_ratio_means": [
+      1.403015873015874,
+      1.306156806156806
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-accel-baseline",
+    "seed": 0,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.525,
+    "median_solve_rate": 0.525,
+    "iqm_solve_rate": 0.525,
+    "mean_return": 0.19819198548793793,
+    "mean_optimality_gap": 0.5341265194083126,
+    "mean_path_ratio": 1.3568253968253967,
+    "unsolved_count": 0,
+    "fully_solved_count": 1,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 79.52040386199951,
+    "per_level_solve_rates": [
+      1.0,
+      0.05
+    ],
+    "per_level_mean_returns": [
+      0.37676796317100525,
+      0.01961600035429001
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.35555053799995495,
+      0.7127025008166702
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      173.12,
+      168.8
+    ],
+    "per_level_path_ratio_means": [
+      1.3739682539682538,
+      1.3396825396825396
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-accel-baseline",
+    "seed": 1,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.99,
+    "median_solve_rate": 0.99,
+    "iqm_solve_rate": 0.99,
+    "mean_return": 0.40982407331466675,
+    "mean_optimality_gap": 0.32249441295513226,
+    "mean_path_ratio": 1.2914674441205056,
+    "unsolved_count": 0,
+    "fully_solved_count": 1,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 79.72677230834961,
+    "per_level_solve_rates": [
+      1.0,
+      0.98
+    ],
+    "per_level_mean_returns": [
+      0.3917440176010132,
+      0.4279041588306427
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.340574483569947,
+      0.3044143423403175
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      168.96,
+      156.48979591836735
+    ],
+    "per_level_path_ratio_means": [
+      1.3409523809523796,
+      1.2419825072886315
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-accel-baseline",
+    "seed": 2,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.995,
+    "median_solve_rate": 0.995,
+    "iqm_solve_rate": 0.995,
+    "mean_return": 0.3916040062904358,
+    "mean_optimality_gap": 0.3407144799793632,
+    "mean_path_ratio": 1.3371813371813381,
+    "unsolved_count": 0,
+    "fully_solved_count": 1,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 79.79755544662476,
+    "per_level_solve_rates": [
+      0.99,
+      1.0
+    ],
+    "per_level_mean_returns": [
+      0.36640796065330505,
+      0.4168000817298889
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.36591054051765515,
+      0.3155184194410713
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      174.96969696969697,
+      162.0
+    ],
+    "per_level_path_ratio_means": [
+      1.3886483886483876,
+      1.2857142857142885
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-accel-baseline",
+    "seed": 3,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.08,
+    "median_solve_rate": 0.08,
+    "iqm_solve_rate": 0.08,
+    "mean_return": 0.02542399801313877,
+    "mean_optimality_gap": 0.7068945031578214,
+    "mean_path_ratio": 1.503968253968254,
+    "unsolved_count": 1,
+    "fully_solved_count": 0,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 78.30090141296387,
+    "per_level_solve_rates": [
+      0.16,
+      0.0
+    ],
+    "per_level_mean_returns": [
+      0.05084799602627754,
+      0.0
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.6814705051446827,
+      0.7323185011709602
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      189.5,
+      null
+    ],
+    "per_level_path_ratio_means": [
+      1.503968253968254,
+      null
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  },
+  {
+    "eval_set": "labyrinth17_custom",
+    "maze_size": 17,
+    "condition": "final-accel-baseline",
+    "seed": 4,
+    "training_updates": 30000,
+    "orbax_step": 119,
+    "mean_solve_rate": 0.555,
+    "median_solve_rate": 0.555,
+    "iqm_solve_rate": 0.555,
+    "mean_return": 0.20907600224018097,
+    "mean_optimality_gap": 0.5232425007934244,
+    "mean_path_ratio": 1.3533838383838381,
+    "unsolved_count": 0,
+    "fully_solved_count": 1,
+    "n_levels": 2,
+    "num_attempts": 100,
+    "elapsed_s": 78.69471788406372,
+    "per_level_solve_rates": [
+      1.0,
+      0.11
+    ],
+    "per_level_mean_returns": [
+      0.37439200282096863,
+      0.04375999793410301
+    ],
+    "per_level_optimal_returns": [
+      0.7323185011709602,
+      0.7323185011709602
+    ],
+    "per_level_optimality_gaps": [
+      0.3579264983499916,
+      0.6885585032368572
+    ],
+    "per_level_shortest_paths": [
+      126.0,
+      126.0
+    ],
+    "per_level_ep_length_means": [
+      173.78,
+      167.27272727272728
+    ],
+    "per_level_path_ratio_means": [
+      1.3792063492063482,
+      1.327561327561328
+    ],
+    "level_names": [
+      "Labyrinth17_1",
+      "Labyrinth17_2"
+    ]
+  }
+]
