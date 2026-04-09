@@ -188,9 +188,9 @@ def _run_normalized(args, percentiles):
     plot_on_ax(ax, bin_flips, bin_mean, bin_bands, percentiles,
                baseline=1.0, baseline_label='Organic mean (1.0)')
 
-    ax.set_xlabel('Wall Flips from Original LLM Maze', fontsize=12)
+    ax.set_xlabel('Tile Flips from Original LLM Maze', fontsize=12)
     ax.set_ylabel('Neighbour Density Ratio', fontsize=12)
-    ax.set_title(f'Neighbours of LLM Maze Mutations — seed {args.seed}', fontsize=13)
+    ax.set_title('Neighbours of LLM Maze Mutations', fontsize=13)
     ax.legend(fontsize=9, framealpha=0.8)
     plt.tight_layout()
 
