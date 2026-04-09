@@ -1,0 +1,121 @@
+{
+  "timestamp": "2026-04-05T17:52:58.048013",
+  "model": "sonnet",
+  "num_requested": 1,
+  "num_successful": 1,
+  "success_rate": 1.0,
+  "total_latency_ms": 51349.14016723633,
+  "reference_mazes": [
+    {
+      "label": "Maze A",
+      "grid": ".............\n.............\n.......##....\n#.#........##\n##.###......#\n.##.####.G#.#\n#..####..#...\n...##..##....\n...##.##..##.\n....##...#...\n...#...##..#.\n#.#..#..##...\n.....##.>...."
+    },
+    {
+      "label": "Maze B",
+      "grid": ".............\n.............\n........#....\n#.#........##\n.#.###......#\n..#.####..#.#\n#..####..#...\n...###.##....\n...##.###.##.\n....##...#...\n...#..G##..##\n#.#..#..##...\n.....##.>...."
+    },
+    {
+      "label": "Maze C",
+      "grid": ".............\n.............\n........#.#..\n#.#........##\n.#.###G.....#\n..#.####..#.#\n#..####..#...\n...##..##..#.\n...##.##..##.\n....##...#...\n...#...##..##\n#.#..#..##...\n.....##.>...."
+    }
+  ],
+  "generated_mazes": [
+    {
+      "index": 1,
+      "grid": "..###########\n..#.........#\n#.#.#######.#\n#...#.....#.#\n#.###.###.#.#\n#.#...#.#...#\n#.#.###.#.###\n#.#.#...#.#.G\n#.#.#.###.#.#\n#...#...#.#.#\n#.#####.#.#.#\n#.......#...#\n####^########",
+      "attempts": 2,
+      "latency_ms": 51349.14016723633,
+      "errors": [
+        "Attempt 1: Maze is not solvable \u2014 agent cannot reach the goal"
+      ],
+      "user_prompt": "=== METRIC DEFINITIONS ===\nThe following metrics describe how the RL agent behaves on each maze. Use these to understand the data below and to guide your maze design.\nScalar Regret (MaxMC): Scalar Regret (MaxMC) is the mean per-step regret across the full episode: mean_t[max_return - V(s_t)]. It summarizes overall maze difficulty for the agent. Higher regret = more learning potential (the agent's value estimates are far from reality). Regret near zero means the maze is too easy or already mastered. Mazes in the buffer typically have regret between 0.1 and 1.5.\n\n=== REFERENCE MAZES FROM THE REPLAY BUFFER ===\nThese are mazes the RL agent is currently training on.\n\n--- Maze A ---\n.............\n.............\n.......##....\n#.#........##\n##.###......#\n.##.####.G#.#\n#..####..#...\n...##..##....\n...##.##..##.\n....##...#...\n...#...##..#.\n#.#..#..##...\n.....##.>....\n\nMetrics for Maze A:\n  - Regret Score: 0.2500  (Agent's learning potential)  [higher = more to learn]\n\n--- Maze B ---\n.............\n.............\n........#....\n#.#........##\n.#.###......#\n..#.####..#.#\n#..####..#...\n...###.##....\n...##.###.##.\n....##...#...\n...#..G##..##\n#.#..#..##...\n.....##.>....\n\nMetrics for Maze B:\n  - Regret Score: 0.2500  (Agent's learning potential)  [higher = more to learn]\n\n--- Maze C ---\n.............\n.............\n........#.#..\n#.#........##\n.#.###G.....#\n..#.####..#.#\n#..####..#...\n...##..##..#.\n...##.##..##.\n....##...#...\n...#...##..##\n#.#..#..##...\n.....##.>....\n\nMetrics for Maze C:\n  - Regret Score: 0.2500  (Agent's learning potential)  [higher = more to learn]\n\n=== BUFFER-WIDE METRICS ===\n  - Buffer Size: 4000  (Number of levels in the replay buffer)\n  - Mean Learnability (SFL): 0.0933  (Average learnability (sfl) across all buffer levels)\n  - Max Learnability (SFL): 0.2500  (Highest learnability (sfl) level in buffer)\n  - Learnability (SFL) Std Dev: 0.0972  (Spread of learnability (sfl) scores)\n\n=== INSTRUCTION ===\nGenerate a NEW 13x13 maze that is DIFFERENT from the reference mazes above. The new maze should provide a distinct navigation challenge \u2014 different path structure, different obstacle layout, different spatial regions explored. Make sure it is solvable (agent can reach the goal).",
+      "raw_responses": [
+        "#############\n#G..#.......#\n#.#.#.#####.#\n#.#...#...#.#\n#.#####.#.#.#\n#.......#.#.#\n#.#####.#.#.#\n#.#...#.#...#\n#.#.#.#.###.#\n#...#.#.....#\n###.#.#####.#\n#...#.......#\n#.#########>#",
+        "#.#..#.#.#.#.\n#.#..#.#.#.#.\n#....#...#...\n##.########.#\n#............\n#.##.######.#\n#.#..#....#.#\n#.#.##.##.#.#\n#.#.#..>#.#.#\n#.#.#.####.#.\n#...#......#.\n####.######.#\nG...........#",
+        ".............\n.##.###.##.#.\n.#....#....#.\n.#.##.#.##.#.\n.#.#..#..#.#.\n.#.#.###.#.#.\n.#.#.....#.#.\n.#.#####.#.#.\n.#.......#.#.\n.###.###.###.\n.#...#.....#.\n.#.#.#.###.#.\n>...G.......#",
+        "#.###.#.###.#\n#.#.#...#.#.#\n#...#.###.#.#\n###.#.#...###\n#.#...#.###.#\n#.#####.#...#\n#.......#.###\n#.#####.#.#.#\n#.#...#...#.#\n#.#.#.#####.#\n#...#.....#.#\n###.#######.#\n^.#.........G",
+        "#.###...#####\n#.#..##.....#\n#....#.###.##\n##.###.#...##\n#..#...#.##.#\n#.##.###.#..#\n#....#...#.##\n#.##.#.###..#\n#.#..#.#..#.#\n#.#.##.#.##.#\n#.#....#....#\n#.######.##.#\n^...........G",
+        ".#...#.#.#.#.\n##.#.#.#.#.#.\n#..#.#.#.#.#G\n#.##.#.#.#.##\n#....#.#.#...\n####.#.#.###.\n....##.#....#\n.###.####.##.\n.#...#....#..\n.#.###.##.#.#\n.#.#...#..#.#\n.#.#.###.##.#\n.#.#.......^.",
+        "..###########\n..#.........#\n#.#.#######.#\n#...#.....#.#\n#.###.###.#.#\n#.#...#.#...#\n#.#.###.#.###\n#.#.#...#.#.G\n#.#.#.###.#.#\n#...#...#.#.#\n#.#####.#.#.#\n#.......#...#\n####^########"
+      ],
+      "feedback_prompts": [
+        "Your maze is valid but too similar to existing buffer mazes:\n\n=== METRIC DEFINITIONS ===\nThe following metrics describe how the RL agent behaves on each maze. Use these to understand the data below and to guide your maze design.\nSFL Learnability: SFL Learnability is p \u00d7 (1-p) where p is the agent's solve rate across many rollouts. Maximum learnability (0.25) occurs at p=0.5, meaning the agent solves the maze half the time \u2014 it's right at its learning frontier. Learnability near zero means the maze is either too easy (p\u22481) or too hard (p\u22480). Aim for mazes with learnability > 0.1 (solve rate between ~13% and ~87%).\n\nPer-Step Entropy: Per-Step Entropy measures the RL agent's policy uncertainty at each timestep. High entropy (>0.5) means the agent is unsure which action to take \u2014 these are decision points or confusing junctions. Low entropy (<0.2) means the agent is confident about its path. To create higher entropy, design ambiguous branch points where multiple corridors look equally viable, or add deceptive openings near walls.\n\nPer-Step Regret: Per-Step Regret is (max_return - V(s_t)) at each timestep \u2014 how much the agent underestimates its potential from each state. This matches the ACCEL MaxMC formula but kept as a time series instead of averaged to a scalar. High regret at a step means the agent is confused about the maze's value at that point. To create high regret, add deceptive dead ends or long detours that mislead the agent's value estimate.\n\n#############\n#G..#.......#\n#.#.#.#####.#\n#.#...#...#.#\n#.#####.#.#.#\n#.......#.#.#\n#.#####.#.#.#\n#.#...#.#...#\n#.#.#.#.###.#\n#...#.#.....#\n###.#.#####.#\n#...#.......#\n#.#########>#\n\nAgent path on your maze:\n#############\n#GDB#qmlkjih#\n#.#x#r#####d#\n#.#wut#...#c#\n#.#####.#.#b#\n#.......#.#a#\n#.#####.#.#9#\n#.#...#.#..8#\n#.#.#.#.###7#\n#...#.#....6#\n###.#.#####5#\n#...#......4#\n#.#########3#\n\nSIMILARITY ISSUES:\n  - Maze is too easy for the agent (solve rate = 96%, learnability = 0.0384, need > 0.1000).\n  The agent solves this level almost every time across 50 rollouts.\n  Add more dead ends, deceptive branches, or hidden corridors to challenge the agent.\n\n=== PER-STEP POLICY ENTROPY ===\nCandidate policy entropy (episode length=40, mean=0.032, max=0.627 at step 8):\n  [0.003, 0.000, 0.000, 0.000, 0.015, 0.351, 0.627, 0.041, 0.017, 0.037, 0.023, 0.000, 0.011, 0.000, 0.000, 0.001, 0.000, 0.000, 0.000, 0.002, 0.001, 0.000, 0.000, 0.000, 0.000, 0.020, 0.000, 0.000, 0.000, 0.000]\n\nHigh entropy (>0.5) = agent unsure what to do. Low entropy (<0.2) = agent confident.\n\n=== PER-STEP REGRET CURVE ===\nCandidate per-step regret (episode length=40, max_return=1.716, mean regret=1.412, peak=1.577 at step 16):\n  [1.367, 1.444, 1.426, 1.481, 1.518, 1.486, 1.501, 1.529, 1.539, 1.542, 1.576, 1.568, 1.577, 1.546, 1.524, 1.503, 1.491, 1.499, 1.448, 1.468, 1.491, 1.482, 1.431, 1.261, 1.186, 1.152, 1.182, 1.246, 1.124, 0.992]\n\nHigh regret = agent undervalues the state (confused/lost). Low regret = agent's value estimate is close to actual return (confident).\n\nGenerate a MORE DIFFERENT maze. Use the analysis above to guide your wall placement \u2014 block the identified overlap regions and open paths through unused regions. Return ONLY the 13x13 grid.",
+        "Your maze is valid but too similar to existing buffer mazes:\n\n=== METRIC DEFINITIONS ===\nThe following metrics describe how the RL agent behaves on each maze. Use these to understand the data below and to guide your maze design.\nSFL Learnability: SFL Learnability is p \u00d7 (1-p) where p is the agent's solve rate across many rollouts. Maximum learnability (0.25) occurs at p=0.5, meaning the agent solves the maze half the time \u2014 it's right at its learning frontier. Learnability near zero means the maze is either too easy (p\u22481) or too hard (p\u22480). Aim for mazes with learnability > 0.1 (solve rate between ~13% and ~87%).\n\nPer-Step Entropy: Per-Step Entropy measures the RL agent's policy uncertainty at each timestep. High entropy (>0.5) means the agent is unsure which action to take \u2014 these are decision points or confusing junctions. Low entropy (<0.2) means the agent is confident about its path. To create higher entropy, design ambiguous branch points where multiple corridors look equally viable, or add deceptive openings near walls.\n\nPer-Step Regret: Per-Step Regret is (max_return - V(s_t)) at each timestep \u2014 how much the agent underestimates its potential from each state. This matches the ACCEL MaxMC formula but kept as a time series instead of averaged to a scalar. High regret at a step means the agent is confused about the maze's value at that point. To create high regret, add deceptive dead ends or long detours that mislead the agent's value estimate.\n\n.............\n.##.###.##.#.\n.#....#....#.\n.#.##.#.##.#.\n.#.#..#..#.#.\n.#.#.###.#.#.\n.#.#.....#.#.\n.#.#####.#.#.\n.#.......#.#.\n.###.###.###.\n.#...#.....#.\n.#.#.#.###.#.\n>...G.......#\n\nAgent path on your maze:\n.............\n.##.###.##.#.\n.#....#....#.\n.#.##.#.##.#.\n.#.#..#..#.#.\n.#.#.###.#.#.\n.#.#.....#.#.\n.#.#####.#.#.\n.#.......#.#.\n.###.###.###.\n.#...#.....#.\n.#.#.#.###.#.\n0124G.......#\n\nSIMILARITY ISSUES:\n  - Maze is too easy for the agent (solve rate = 100%, learnability = 0.0000, need > 0.1000).\n  The agent solves this level almost every time across 50 rollouts.\n  Add more dead ends, deceptive branches, or hidden corridors to challenge the agent.\n\n=== PER-STEP POLICY ENTROPY ===\nCandidate policy entropy (episode length=5, mean=0.000, max=0.001 at step 0):\n  [0.001, 0.000, 0.000, 0.000, 0.000]\n\nHigh entropy (>0.5) = agent unsure what to do. Low entropy (<0.2) = agent confident.\n\n=== PER-STEP REGRET CURVE ===\nCandidate per-step regret (episode length=5, max_return=1.968, mean regret=1.135, peak=1.255 at step 0):\n  [1.255, 1.162, 1.025, 1.044, 1.191]\n\nHigh regret = agent undervalues the state (confused/lost). Low regret = agent's value estimate is close to actual return (confident).\n\nGenerate a MORE DIFFERENT maze. Use the analysis above to guide your wall placement \u2014 block the identified overlap regions and open paths through unused regions. Return ONLY the 13x13 grid.",
+        "Your maze is valid but too similar to existing buffer mazes:\n\n=== METRIC DEFINITIONS ===\nThe following metrics describe how the RL agent behaves on each maze. Use these to understand the data below and to guide your maze design.\nSFL Learnability: SFL Learnability is p \u00d7 (1-p) where p is the agent's solve rate across many rollouts. Maximum learnability (0.25) occurs at p=0.5, meaning the agent solves the maze half the time \u2014 it's right at its learning frontier. Learnability near zero means the maze is either too easy (p\u22481) or too hard (p\u22480). Aim for mazes with learnability > 0.1 (solve rate between ~13% and ~87%).\n\nPer-Step Entropy: Per-Step Entropy measures the RL agent's policy uncertainty at each timestep. High entropy (>0.5) means the agent is unsure which action to take \u2014 these are decision points or confusing junctions. Low entropy (<0.2) means the agent is confident about its path. To create higher entropy, design ambiguous branch points where multiple corridors look equally viable, or add deceptive openings near walls.\n\nPer-Step Regret: Per-Step Regret is (max_return - V(s_t)) at each timestep \u2014 how much the agent underestimates its potential from each state. This matches the ACCEL MaxMC formula but kept as a time series instead of averaged to a scalar. High regret at a step means the agent is confused about the maze's value at that point. To create high regret, add deceptive dead ends or long detours that mislead the agent's value estimate.\n\n#.###...#####\n#.#..##.....#\n#....#.###.##\n##.###.#...##\n#..#...#.##.#\n#.##.###.#..#\n#....#...#.##\n#.##.#.###..#\n#.#..#.#..#.#\n#.#.##.#.##.#\n#.#....#....#\n#.######.##.#\n^...........G\n\nAgent path on your maze:\n#.###...#####\n#.#..##.....#\n#....#.###.##\n##.###.#...##\n#..#...#.##.#\n#.##.###.#..#\n#....#...#.##\n#.##.#.###..#\n#.#..#.#..#.#\n#.#.##.#.##.#\n#.#....#....#\n#.######.##.#\n123456789abdG\n\nSIMILARITY ISSUES:\n  - Maze is too easy for the agent (solve rate = 100%, learnability = 0.0000, need > 0.1000).\n  The agent solves this level almost every time across 50 rollouts.\n  Add more dead ends, deceptive branches, or hidden corridors to challenge the agent.\n\n=== PER-STEP POLICY ENTROPY ===\nCandidate policy entropy (episode length=14, mean=0.065, max=0.627 at step 1):\n  [0.001, 0.627, 0.003, 0.092, 0.090, 0.030, 0.044, 0.013, 0.003, 0.000, 0.000, 0.000, 0.000, 0.003]\n\nHigh entropy (>0.5) = agent unsure what to do. Low entropy (<0.2) = agent confident.\n\n=== PER-STEP REGRET CURVE ===\nCandidate per-step regret (episode length=14, max_return=1.903, mean regret=1.501, peak=1.698 at step 7):\n  [1.513, 1.526, 1.617, 1.693, 1.695, 1.690, 1.695, 1.698, 1.694, 1.501, 1.248, 1.146, 1.139, 1.160]\n\nHigh regret = agent undervalues the state (confused/lost). Low regret = agent's value estimate is close to actual return (confident).\n\nGenerate a MORE DIFFERENT maze. Use the analysis above to guide your wall placement \u2014 block the identified overlap regions and open paths through unused regions. Return ONLY the 13x13 grid."
+      ],
+      "gate_metrics": {
+        "min_diversity": 0.784702,
+        "mean_diversity": 1.161731,
+        "max_diversity": 1.38256,
+        "median_diversity": 1.317931,
+        "embedding_l2_n_compared": 3,
+        "diversity_metric": "embedding_l2",
+        "learnability": 0.1056,
+        "solve_rate": 0.88,
+        "difficulty_metric": "sfl"
+      },
+      "diversity_attempts": 4
+    }
+  ],
+  "system_prompt": "You are a maze designer for a reinforcement learning environment.\n\nMAZE FORMAT:\n- Grid: exactly 13 rows x 13 columns\n- Characters:\n  # = wall (impassable)\n  . = empty floor\n  > = agent start (facing right)\n  v = agent start (facing down)\n  < = agent start (facing left)\n  ^ = agent start (facing up)\n  G = goal position\n- Exactly ONE agent start and ONE goal position\n- The outer border does NOT need to be all walls \u2014 open borders are fine\n- The agent must be able to reach the goal (maze must be solvable)\n\nDESIGN PRINCIPLES:\n- Interesting mazes force the agent to navigate around obstacles\n- Variety in path structure: corridors, open rooms, chokepoints, dead ends\n- The agent start and goal should be separated by meaningful navigation\n- Avoid trivial mazes (no walls) or impossible mazes (goal unreachable)\nOUTPUT FORMAT:\nReturn ONLY the 13x13 grid, one row per line, with no extra text before or after.\nDo not wrap in code blocks or add any explanation.\nEach row must be exactly 13 characters. There must be exactly 13 rows.\nThe output will be saved directly to a .txt file, so it must be a clean grid only.\n\nExample of valid output format (this is deliberately trivial \u2014 generate something much more interesting):\n#############\n#>..........#\n#...........#\n#...........#\n#...........#\n#...........#\n#.####.####.#\n#...........#\n#...........#\n#...........#\n#...........#\n#..........G#\n#############",
+  "failed_mazes": [],
+  "rejected_candidates": [
+    {
+      "generation_index": 1,
+      "attempt": 1,
+      "grid": "#############\n#G..#.......#\n#.#.#.#####.#\n#.#...#...#.#\n#.#####.#.#.#\n#.......#.#.#\n#.#####.#.#.#\n#.#...#.#...#\n#.#.#.#.###.#\n#...#.#.....#\n###.#.#####.#\n#...#.......#\n#.#########>#",
+      "gate_summary": {
+        "min_diversity": 1.194447,
+        "mean_diversity": 1.539782,
+        "max_diversity": 1.765751,
+        "median_diversity": 1.659148,
+        "embedding_l2_n_compared": 3,
+        "diversity_metric": "embedding_l2",
+        "learnability": 0.0384,
+        "solve_rate": 0.96,
+        "difficulty_metric": "sfl"
+      },
+      "issues": [
+        "Maze is too easy for the agent (solve rate = 96%, learnability = 0.0384, need > 0.1000).\n  The agent solves this level almost every time across 50 rollouts.\n  Add more dead ends, deceptive branches, or hidden corridors to challenge the agent."
+      ]
+    },
+    {
+      "generation_index": 1,
+      "attempt": 2,
+      "grid": ".............\n.##.###.##.#.\n.#....#....#.\n.#.##.#.##.#.\n.#.#..#..#.#.\n.#.#.###.#.#.\n.#.#.....#.#.\n.#.#####.#.#.\n.#.......#.#.\n.###.###.###.\n.#...#.....#.\n.#.#.#.###.#.\n>...G.......#",
+      "gate_summary": {
+        "min_diversity": 4.147235,
+        "mean_diversity": 4.489883,
+        "max_diversity": 4.737651,
+        "median_diversity": 4.584764,
+        "embedding_l2_n_compared": 3,
+        "diversity_metric": "embedding_l2",
+        "learnability": 0.0,
+        "solve_rate": 1.0,
+        "difficulty_metric": "sfl"
+      },
+      "issues": [
+        "Maze is too easy for the agent (solve rate = 100%, learnability = 0.0000, need > 0.1000).\n  The agent solves this level almost every time across 50 rollouts.\n  Add more dead ends, deceptive branches, or hidden corridors to challenge the agent."
+      ]
+    },
+    {
+      "generation_index": 1,
+      "attempt": 3,
+      "grid": "#.###...#####\n#.#..##.....#\n#....#.###.##\n##.###.#...##\n#..#...#.##.#\n#.##.###.#..#\n#....#...#.##\n#.##.#.###..#\n#.#..#.#..#.#\n#.#.##.#.##.#\n#.#....#....#\n#.######.##.#\n^...........G",
+      "gate_summary": {
+        "min_diversity": 2.365863,
+        "mean_diversity": 2.762973,
+        "max_diversity": 3.020517,
+        "median_diversity": 2.902538,
+        "embedding_l2_n_compared": 3,
+        "diversity_metric": "embedding_l2",
+        "learnability": 0.0,
+        "solve_rate": 1.0,
+        "difficulty_metric": "sfl"
+      },
+      "issues": [
+        "Maze is too easy for the agent (solve rate = 100%, learnability = 0.0000, need > 0.1000).\n  The agent solves this level almost every time across 50 rollouts.\n  Add more dead ends, deceptive branches, or hidden corridors to challenge the agent."
+      ]
+    }
+  ]
+}
