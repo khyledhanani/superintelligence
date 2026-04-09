@@ -2,7 +2,7 @@
 """Download the LLM demo assets (zip on Google Drive) into notebooks/llm_assets.
 
 Zip file (shared link):
-<<<REPLACE_WITH_LLM_ASSETS_DRIVE_LINK>>>
+https://drive.google.com/file/d/1T0R-MOT9z-B01-7nH_qPdPtkqlIDElHi/view?usp=sharing
 
 Override the zip source:
   export LLM_ASSETS_ZIP_URL='https://.../llm_assets.zip'
@@ -25,7 +25,7 @@ import zipfile
 from pathlib import Path
 
 # ── UPDATE THIS after uploading to Google Drive ──
-DRIVE_FILE_ID = "<<<REPLACE_WITH_DRIVE_FILE_ID>>>"
+DRIVE_FILE_ID = "1T0R-MOT9z-B01-7nH_qPdPtkqlIDElHi"
 
 
 def _ensure_gdown() -> None:
